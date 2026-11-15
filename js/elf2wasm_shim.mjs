@@ -125,8 +125,10 @@ function parseElf64Deps(elfBytes) {
       loadSegments.push({ vaddr: pVaddr, offset: pOffset, filesz: pFilesz });
     } else if (pType === 3 && pFilesz > 0) {
       // PT_INTERP
-      const end = Math.min(pOffset + pFilesz, elfBytes.length);
-      interp = readCStringFromBytes(elfBytes, pOffset, end);
+      const end = pOffset + pFilesz;
+      if (pOffset >= 0 && pOffset < elfBytes.length && end <= elfBytes.length) {
+        interp = readCStringFromBytes(elfBytes, pOffset, end);
+      }
     } else if (pType === 2 && pFilesz > 0) {
       // PT_DYNAMIC
       dynOff = pOffset;
@@ -480,16 +482,55 @@ async function createNodeHostVfs(vfsRo, vfsRw) {
     },
     seedRw(writeFileFn) {
       for (const m of vfsRw || []) {
-        if (!fs.existsSync(m.hostPath)) continue;
+        let baseReal;
+        try {
+          baseReal = fs.realpathSync(m.hostPath);
+        } catch {
+          continue;
+        }
         const guestBase = normalizeGuestPath(m.guestPath);
         const walk = (hostP, guestP) => {
-          const st = fs.statSync(hostP);
+          let lst;
+          try {
+            lst = fs.lstatSync(hostP);
+          } catch {
+            return;
+          }
+          let st = lst;
+          let targetP = hostP;
+          if (lst.isSymbolicLink()) {
+            let real;
+            try {
+              real = fs.realpathSync(hostP);
+            } catch {
+              return;
+            }
+            if (real !== baseReal && !real.startsWith(baseReal + path.sep)) {
+              return;
+            }
+            try {
+              st = fs.statSync(real);
+            } catch {
+              return;
+            }
+            targetP = real;
+          }
           if (st.isDirectory()) {
-            for (const ent of fs.readdirSync(hostP)) {
-              walk(path.join(hostP, ent), guestP === "/" ? "/" + ent : guestP + "/" + ent);
+            let entries;
+            try {
+              entries = fs.readdirSync(targetP);
+            } catch {
+              return;
+            }
+            for (const ent of entries) {
+              walk(path.join(targetP, ent), guestP === "/" ? "/" + ent : guestP + "/" + ent);
             }
           } else if (st.isFile()) {
-            writeFileFn(guestP, new Uint8Array(fs.readFileSync(hostP)), st.mode & 0o7777);
+            try {
+              writeFileFn(guestP, new Uint8Array(fs.readFileSync(targetP)), st.mode & 0o7777);
+            } catch {
+              // ignore unreadable files
+            }
           }
         };
         walk(m.hostPath, guestBase);
@@ -668,7 +709,13 @@ export class Elf2WasmSystem {
   }
 
   _compileCached(elfBytes, soEntries, elfPath) {
-    const key = `${elfPath}:${elfBytes.length}:${fnv1a32(elfBytes)}`;
+    const soKey = (soEntries || [])
+      .map((s) => {
+        const b = toUint8Array(s.bytes);
+        return `${s.guestPath}:${b.length}:${fnv1a32(b)}`;
+      })
+      .join("|");
+    const key = `${elfPath}:${elfBytes.length}:${fnv1a32(elfBytes)}:${soKey}`;
     const cached = this.moduleCache.get(key);
     if (cached) return cached;
 
