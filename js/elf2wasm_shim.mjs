@@ -25,7 +25,7 @@ const I32_GLOBAL_IDS = new Set([5, 6, 7, 8]);
 const DEFAULT_RO_ALLOWLIST = [
   "/usr/lib/locale/C.utf8",
   "/usr/share/locale/locale.alias",
-  "/usr/lib/x86_64-linux-gnu/gconv",
+  "/usr/lib/x86_64-linux-gnu",
 ];
 
 const DEFAULT_SO_SEARCH_DIRS = [
@@ -50,15 +50,13 @@ async function compileWasmModule(input) {
   return await WebAssembly.compile(toUint8Array(input));
 }
 
-function fnv1a64(bytes) {
-  let h = 0xcbf29ce484222325n;
-  const prime = 0x0100000001b3n;
-  const mask = 0xffffffffffffffffn;
+function fnv1a32(bytes) {
+  let h = 0x811c9dc5;
   for (let i = 0; i < bytes.length; i++) {
-    h ^= BigInt(bytes[i]);
-    h = (h * prime) & mask;
+    h ^= bytes[i];
+    h = Math.imul(h, 0x01000193);
   }
-  return h.toString(16);
+  return (h >>> 0).toString(16);
 }
 
 function normalizeGuestPath(p) {
@@ -432,7 +430,7 @@ async function createNodeHostVfs(vfsRo, vfsRw) {
       if (!res) return null;
       try {
         const st = fs.statSync(res.canon);
-        const mode = st.isDirectory() ? 0o040755 : 0o100644;
+        const mode = st.isDirectory() ? 0o040755 : (0o100000 | (st.mode & 0o777));
         return { mode, size: st.isDirectory() ? 4096 : st.size };
       } catch {
         return null;
@@ -511,9 +509,13 @@ export class Elf2WasmSystem {
   }
 
   static async create({ compilerWasm, runtimeWasm, vfsRo = [], vfsRw = [] } = {}) {
+    const [cMod, rMod] = await Promise.all([
+      compilerWasm ? compileWasmModule(compilerWasm) : Promise.resolve(null),
+      runtimeWasm ? compileWasmModule(runtimeWasm) : Promise.resolve(null),
+    ]);
+
     let compilerInst = null;
-    if (compilerWasm) {
-      const cMod = await compileWasmModule(compilerWasm);
+    if (cMod) {
       compilerInst = await WebAssembly.instantiate(cMod, {});
     }
 
@@ -521,8 +523,7 @@ export class Elf2WasmSystem {
     let runtimeInst = null;
     const sys = new Elf2WasmSystem({ compilerInst, runtimeInst: null, hostVfs });
 
-    if (runtimeWasm) {
-      const rMod = await compileWasmModule(runtimeWasm);
+    if (rMod) {
       const env = sys._makeRuntimeEnv();
       runtimeInst = await WebAssembly.instantiate(rMod, { env });
       sys.runtimeInst = runtimeInst;
@@ -667,7 +668,7 @@ export class Elf2WasmSystem {
   }
 
   _compileCached(elfBytes, soEntries, elfPath) {
-    const key = `${elfPath}:${fnv1a64(elfBytes)}`;
+    const key = `${elfPath}:${elfBytes.length}:${fnv1a32(elfBytes)}`;
     const cached = this.moduleCache.get(key);
     if (cached) return cached;
 
@@ -718,7 +719,7 @@ export class Elf2WasmSystem {
     return copy;
   }
 
-  _resolveElfSos(elfBytes) {
+  _resolveElfSos(elfBytes, extraPaths = []) {
     const resolved = [];
     const seen = new Set();
     const queue = [];
@@ -732,6 +733,7 @@ export class Elf2WasmSystem {
     const { interp, needed } = parseElf64Deps(elfBytes);
     if (interp) enqueue(interp);
     for (const n of needed) enqueue(n);
+    for (const ep of extraPaths) enqueue(ep);
 
     while (queue.length > 0) {
       const target = queue.shift();
@@ -765,7 +767,15 @@ export class Elf2WasmSystem {
         }
       }
 
-      if (foundBytes) {
+      if (
+        foundBytes &&
+        foundBytes.length >= 64 &&
+        foundBytes[0] === 0x7f &&
+        foundBytes[1] === 0x45 &&
+        foundBytes[2] === 0x4c &&
+        foundBytes[3] === 0x46 &&
+        foundBytes[4] === 2
+      ) {
         resolved.push({ path: foundPath, name: basename(foundPath), bytes: foundBytes });
         const sub = parseElf64Deps(foundBytes);
         for (const n of sub.needed) enqueue(n);
@@ -921,7 +931,17 @@ export class Elf2WasmSystem {
         if (!execElf) {
           throw new Error(`execve target not found in VFS: ${execInfo.path}`);
         }
-        const execSos = this._resolveElfSos(execElf);
+        const extraSos = [];
+        for (const arg of execInfo.argv || []) {
+          if (
+            typeof arg === "string" &&
+            arg.startsWith("/") &&
+            (arg.endsWith(".so") || arg.includes(".so."))
+          ) {
+            extraSos.push(arg);
+          }
+        }
+        const execSos = this._resolveElfSos(execElf, extraSos);
         const compiled = this._compileCached(execElf, execSos, execInfo.path);
         const newInst = new WebAssembly.Instance(compiled.mod, guestImports);
 

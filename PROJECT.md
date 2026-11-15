@@ -6,7 +6,7 @@
 - **Translation Pipeline (`elf2wasm translate`)**:
   1. `elf_loader.rs`: Parses main ELF64 (`ET_DYN` PIE at `0x0010_0000` or `ET_EXEC` non-PIE at `0x0040_0000`+), `ld-linux-x86-64.so.2` (`LD_BASE = 0x0100_0000`), and `.so` libraries (`SO_BASE_START = 0x0200_0000`+, 1 MB aligned).
   2. `decoder.rs`: Decodes all `PF_X` segments using `iced-x86`, discovers function/block boundaries and indirect dispatch targets.
-  3. `lifter.rs` & `wasm_emit.rs`: Lifts x86-64 instructions (baseline GPRs, flags, `%fs:` TLS, SSE/SSE2, x87 subset if needed, masked `cpuid`/`xgetbv`, `rdtsc`, `syscall` import) into a valid `.wasm` module with 256 MB linear memory (`4096` pages), trampoline/`return_call_indirect` dispatch, initial `DataSection`, and `elf2wasm_meta` custom section (`meta.rs`).
+  3. `lifter.rs` & `wasm_emit.rs`: Lifts x86-64 instructions (baseline GPRs, flags, `%fs:` TLS, SSE/SSE2, x87 subset if needed, masked `cpuid`/`xgetbv`, `rdtsc`, `syscall` import) into a valid `.wasm` module with `>= 4096` pages (256 MB+ dynamically sized for `DISPATCH_HASH_ADDR = 0x0C00_0000` + dispatch hash table), trampoline dispatch, initial `DataSection`, and `elf2wasm_meta` custom section (`meta.rs`).
 - **Sandboxed Runtime (`elf2wasm run`)**:
   1. `runtime.rs`: Loads the `.wasm` module via `wasmtime 27`, decodes `elf2wasm_meta`, initializes `STACK_TOP` (`0x0BFF_0000`) with `argc`, `argv`, `envp`, and `auxv` (omitting `AT_SYSINFO_EHDR` so glibc uses `clock_gettime` syscall).
   2. `syscalls.rs` & `vfs.rs`: Emulates Linux x86-64 syscalls in a sandboxed virtual OS: `.so`-aware `mmap` returning `so.base_addr`, `brk`, `arch_prctl(ARCH_SET_FS)`, process/signal/time/futex stubs, and a read-only sandboxed VFS for embedded `.so` files and host-mapped read-only system/Python stdlib paths (zero host writes, zero network/process creation).
@@ -90,12 +90,12 @@ Every feature from the Survey phase is assigned a milestone below:
 ### `elf_loader` ↔ `decoder`
 - `elf_loader::load_elf_and_sos_bytes(main_path: &str, main_bytes: &[u8], sos: &[(&str, &[u8])]) -> Result<LoadedImage>` performs pure in-memory ELF64 + `.so` loading with dynamic `LD_BASE` / `SO_BASE_START` placement above `main_end` (zero `std::fs`).
 - `elf_loader::load_elf_and_sos(main_path: &Path, so_paths: &[PathBuf]) -> Result<LoadedImage>` (`std-fs` feature) wraps `load_elf_and_sos_bytes` with host file reading and symlink canonicalization.
-- `decoder::discover_code(image: &LoadedImage) -> Result<DecodedProgram>` and `decoder::split_indirect_targets(image: &LoadedImage, prog: &mut DecodedProgram)` discover basic blocks/functions and indirect jump/call targets.
+- `decoder::discover_code(image: &LoadedImage) -> Result<DecodedProgram>` and `decoder::split_indirect_targets(image: &LoadedImage, prog: &mut DecodedProgram)` discover basic blocks and indirect jump/call targets, seed `DT_INIT`/`DT_FINI` from `PT_DYNAMIC` of loaded `.so`s, and split blocks between non-stack memory reads and subsequent writes (`split_mem_read_write_blocks`).
 
 ### `decoder` ↔ `lifter` / `wasm_emit`
 - `wasm_emit::emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>>` produces a valid `.wasm` binary containing:
   - Import: `("env", "syscall", [i64, i64, i64, i64, i64, i64, i64] -> [i64])`
-  - Exports: `"memory"` (Memory, 4096 initial pages), `"_start"` (`[] -> [i32]`), `"save_ctx"` / `"load_ctx"` (`[i32] -> []`, 464-byte CPU context), `"yield_flag"` (`i32`), `"quantum"` (`i32`, default `128`), GPRs, `"rip"`, `"exit_flag"`, `"exit_code"`, `"fsbase"`, `"gsbase"`.
+  - Exports: `"memory"` (Memory, `>= 4096` pages dynamically sized to cover `DISPATCH_HASH_ADDR = 0x0C00_0000` + dispatch hash table), `"_start"` (`[] -> [i32]`), `"save_ctx"` / `"load_ctx"` (`[i32] -> []`, 464-byte CPU context), `"yield_flag"` (`i32`), `"quantum"` (`i32`, `DEFAULT_QUANTUM = 128`), GPRs, `"rip"`, `"exit_flag"`, `"exit_code"`, `"fsbase"`, `"gsbase"`.
   - Custom section: `"elf2wasm_meta"` encoded by `WasmMeta::encode()`.
 
 ### `elf2wasm-compiler-wasm` (WASM C-ABI)
@@ -114,9 +114,9 @@ Every feature from the Survey phase is assigned a milestone below:
 
 ### `js/elf2wasm_shim.mjs` & `js/cli.mjs` (F11 ESM JS Shim)
 - Zero-dependency pure ESM module (`Elf2WasmSystem`, `VirtualSystem`, `compileElfToWasm`, `compileBundle`, `runElf`, `compileAndRunInVfs`) compatible with Node.js and browsers via `WebAssembly.instantiate` (lazy dynamic `node:fs`/`node:path` import only when `vfsRo`/`vfsRw` mounts are passed).
-- Handles `NeedFork` (cloning guest `WebAssembly.Instance` memory and exported globals) and `NeedExec` (pure-JS ELF64 `PT_INTERP`/`DT_NEEDED` resolution from VFS, cached `compiler.wasm` compilation, and `runtime_complete_exec`).
+- Handles `NeedFork` (cloning guest `WebAssembly.Instance` memory and exported globals) and `NeedExec` (pure-JS ELF64 `PT_INTERP`/`DT_NEEDED` + `argv` `.so` plugin resolution from VFS, cached `compiler.wasm` compilation, and `runtime_complete_exec`). `DEFAULT_RO_ALLOWLIST` includes `/usr/lib/x86_64-linux-gnu`.
 - `js/cli.mjs`: Node CLI wrapper supporting `compile` and `run`.
 
 ### `wasm_emit` ↔ `runtime` / `syscalls` / `vfs`
-- `runtime::run_wasm(wasm_bytes: &[u8], config: RunConfig) -> Result<RunOutput>` decodes `"elf2wasm_meta"`, initializes `STACK_TOP` with `argc`/`argv`/`envp`/`auxv`, runs `_start` in a slice loop delegating yields to `Scheduler::on_yield` (cooperative thread switching + virtual-time fast-forward), and returns `RunOutput { exit_code: i32, stdout: Vec<u8>, stderr: Vec<u8> }`.
-- `syscalls::handle_syscall(ctx: &mut dyn GuestContext, state: &mut HostState, nr, a0..a5) -> i64` accesses guest linear memory and CPU state via `GuestContext`, `.so` payloads and RW overlay via `vfs::VirtualFs`, and virtual time / threads via `scheduler::Scheduler`.
+- `runtime::run_wasm(wasm_bytes: &[u8], config: RunConfig) -> Result<RunOutput>` decodes `"elf2wasm_meta"`, compiles/loads via `wasmtime` (`OptLevel::None` + `.cwasm` cache), initializes `STACK_TOP` with `argc`/`argv`/`envp`/`auxv`, runs `_start` in a slice loop delegating yields to `Scheduler::on_yield` (cooperative thread switching + virtual-time fast-forward), and returns `RunOutput { exit_code: i32, stdout: Vec<u8>, stderr: Vec<u8> }`.
+- `syscalls::handle_syscall(ctx: &mut dyn GuestContext, state: &mut HostState, nr, a0..a5) -> i64` accesses guest linear memory and CPU state via `GuestContext`, `.so` payloads (including `PROT_EXEC` `mmap` guard) and RW overlay via `vfs::VirtualFs`, and virtual time / threads via `scheduler::Scheduler`.
