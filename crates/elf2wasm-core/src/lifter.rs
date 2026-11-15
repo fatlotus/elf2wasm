@@ -40,6 +40,10 @@ pub const GLOBAL_XMM_BASE: u32 = 28; // 28..=43 (16 v128)
 pub const GLOBAL_MXCSR: u32 = 44; // i32, init 0x1F80
 pub const GLOBAL_TSC: u32 = 45; // i64, monotonic counter for rdtsc
 pub const GLOBAL_X87_CW: u32 = 46; // i32, init 0x037F
+pub const GLOBAL_YIELD_FLAG: u32 = 47; // i32, init 0 (0=running, 1=syscall yield, 2=quantum preempt)
+pub const GLOBAL_QUANTUM: u32 = 48; // i32, init DEFAULT_QUANTUM
+pub const DEFAULT_QUANTUM: i32 = 128;
+pub const CTX_SIZE: usize = 464;
 
 pub const GPR_NAMES: [&str; 16] = [
     "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
@@ -1749,6 +1753,13 @@ impl<'a> Lifter<'a> {
                 self.emit(WInst::GlobalSet(GLOBAL_RAX));
                 self.emit(WInst::GlobalGet(GLOBAL_EXIT_FLAG));
                 self.emit(WInst::If(BlockType::Empty));
+                self.emit(WInst::Return);
+                self.emit(WInst::End);
+
+                self.emit(WInst::GlobalGet(GLOBAL_YIELD_FLAG));
+                self.emit(WInst::If(BlockType::Empty));
+                self.emit(WInst::I64Const(instr.next_ip() as u32 as u64 as i64));
+                self.emit(WInst::GlobalSet(GLOBAL_RIP));
                 self.emit(WInst::Return);
                 self.emit(WInst::End);
             }

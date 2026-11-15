@@ -1,0 +1,17 @@
+[package]
+name = "elf2wasm-core"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["std-fs"]
+std-fs = []
+
+[dependencies]
+anyhow = "1.0"
+goblin = "0.9"
+iced-x86 = "1.21"
+wasm-encoder = "0.220"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+wasmtime = "27"

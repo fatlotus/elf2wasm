@@ -1,7 +1,9 @@
 use anyhow::{bail, Context, Result};
 use goblin::elf::{program_header, Elf};
 use std::collections::HashMap;
+#[cfg(feature = "std-fs")]
 use std::fs;
+#[cfg(feature = "std-fs")]
 use std::path::{Path, PathBuf};
 
 pub const MAIN_PIE_BASE: u32 = 0x0010_0000; // 1 MB
@@ -193,11 +195,13 @@ fn extract_segments(
     Ok(())
 }
 
-pub fn load_elf_and_sos(main_path: &Path, so_paths: &[PathBuf]) -> Result<LoadedImage> {
-    let main_bytes = fs::read(main_path)
-        .with_context(|| format!("Failed to read main ELF: {}", main_path.display()))?;
-    let main_elf = Elf::parse(&main_bytes)
-        .with_context(|| format!("Failed to parse main ELF: {}", main_path.display()))?;
+pub fn load_elf_and_sos_bytes(
+    main_path: &str,
+    main_bytes: &[u8],
+    sos: &[(&str, &[u8])],
+) -> Result<LoadedImage> {
+    let main_elf = Elf::parse(main_bytes)
+        .with_context(|| format!("Failed to parse main ELF: {}", main_path))?;
 
     if !main_elf.is_64 {
         bail!("Only ELF64 is supported");
@@ -223,14 +227,23 @@ pub fn load_elf_and_sos(main_path: &Path, so_paths: &[PathBuf]) -> Result<Loaded
     } else {
         0
     };
+    let main_span = elf_span(&main_elf)?;
+    let main_end = if main_base == 0 {
+        main_span
+    } else {
+        main_base
+            .checked_add(main_span)
+            .context("main ELF end overflow")?
+    };
 
     let mut exec_segments = Vec::new();
     let mut data_segments = Vec::new();
     let mut symbols = HashMap::new();
 
+    let main_name = main_path.rsplit('/').next().unwrap_or(main_path);
     extract_segments(
-        &main_path.file_name().unwrap_or_default().to_string_lossy(),
-        &main_bytes,
+        main_name,
+        main_bytes,
         &main_elf,
         main_base,
         true,
@@ -269,85 +282,85 @@ pub fn load_elf_and_sos(main_path: &Path, so_paths: &[PathBuf]) -> Result<Loaded
     let interp_path = main_elf.interpreter.map(|s| s.to_string());
     let interp_basename = interp_path
         .as_deref()
-        .and_then(|p| Path::new(p).file_name())
-        .map(|s| s.to_string_lossy().to_string());
+        .map(|p| p.rsplit('/').next().unwrap_or(p));
+
+    // Pre-parse all .so headers so we can compute dynamic ld_base and next_so_base
+    // regardless of the order in which ld.so and other .so files are provided.
+    struct ParsedSo<'a> {
+        so_str: &'a str,
+        so_base_name: &'a str,
+        bytes: &'a [u8],
+        elf: Elf<'a>,
+        is_interp: bool,
+    }
+
+    let mut parsed_sos = Vec::with_capacity(sos.len());
+    let mut interp_idx: Option<usize> = None;
+    for &(so_str, so_bytes) in sos {
+        let so_elf =
+            Elf::parse(so_bytes).with_context(|| format!("Failed to parse .so: {}", so_str))?;
+        if !so_elf.is_64 || so_elf.header.e_machine != goblin::elf::header::EM_X86_64 {
+            bail!("Shared object {} is not an ELF64 x86-64 binary", so_str);
+        }
+        let so_base_name = so_str.rsplit('/').next().unwrap_or(so_str);
+        let is_interp = interp_idx.is_none()
+            && interp_path.as_ref().map_or(false, |ip| {
+                ip == so_str
+                    || interp_basename == Some(so_base_name)
+                    || (so_base_name.starts_with("ld-linux") && ip.contains("ld-linux"))
+            });
+        if is_interp {
+            interp_idx = Some(parsed_sos.len());
+        }
+        parsed_sos.push(ParsedSo {
+            so_str,
+            so_base_name,
+            bytes: so_bytes,
+            elf: so_elf,
+            is_interp,
+        });
+    }
+
+    let ld_base = LD_BASE.max(main_end);
+    let mut next_so_base = if let Some(idx) = interp_idx {
+        let ld_span = elf_span(&parsed_sos[idx].elf)?.max(0x0010_0000);
+        let ld_end = ld_base
+            .checked_add(ld_span)
+            .filter(|&n| n <= BRK_START)
+            .ok_or_else(|| anyhow::anyhow!("ld.so exceeds reserved VA space (BRK_START)"))?;
+        SO_BASE_START.max(ld_end)
+    } else {
+        SO_BASE_START.max(main_end)
+    };
 
     let mut ld_loaded = false;
     let mut entry_rip = at_entry;
     let mut at_base = 0u32;
-    let mut next_so_base = SO_BASE_START;
     let mut so_files = Vec::new();
 
-    let mut effective_so_paths = so_paths.to_vec();
-    if main_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map_or(false, |n| n.starts_with("python3"))
-    {
-        let ctxvars = Path::new(
-            "/usr/lib/python3.11/lib-dynload/_contextvars.cpython-311-x86_64-linux-gnu.so",
-        );
-        if ctxvars.exists()
-            && !effective_so_paths
-                .iter()
-                .any(|p| p == ctxvars || p.file_name() == ctxvars.file_name())
-        {
-            effective_so_paths.push(ctxvars.to_path_buf());
-        }
-    }
-
-    for so_path in &effective_so_paths {
-        let so_bytes = fs::read(so_path)
-            .with_context(|| format!("Failed to read .so: {}", so_path.display()))?;
-        let so_elf = Elf::parse(&so_bytes)
-            .with_context(|| format!("Failed to parse .so: {}", so_path.display()))?;
-        if !so_elf.is_64 || so_elf.header.e_machine != goblin::elf::header::EM_X86_64 {
-            bail!(
-                "Shared object {} is not an ELF64 x86-64 binary",
-                so_path.display()
-            );
-        }
-
-        let so_str = so_path.to_string_lossy().to_string();
-        let so_base_name = so_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let canon_str = fs::canonicalize(so_path)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| so_str.clone());
-
-        let is_interp = !ld_loaded
-            && interp_path.as_ref().map_or(false, |ip| {
-                ip == &so_str
-                    || ip == &canon_str
-                    || interp_basename.as_deref() == Some(so_base_name.as_str())
-                    || (so_base_name.starts_with("ld-linux") && ip.contains("ld-linux"))
-            });
-
-        if is_interp {
+    for pso in parsed_sos {
+        if pso.is_interp {
             ld_loaded = true;
-            at_base = LD_BASE;
+            at_base = ld_base;
             entry_rip = u32::try_from(
-                (LD_BASE as u64)
-                    .checked_add(so_elf.header.e_entry)
+                (ld_base as u64)
+                    .checked_add(pso.elf.header.e_entry)
                     .context("ld.so e_entry overflow")?,
             )
             .context("ld.so e_entry exceeds 32-bit guest address space")?;
             extract_segments(
-                &so_base_name,
-                &so_bytes,
-                &so_elf,
-                LD_BASE,
+                pso.so_base_name,
+                pso.bytes,
+                &pso.elf,
+                ld_base,
                 true,
                 &mut exec_segments,
                 &mut data_segments,
             )?;
-            collect_symbols(&so_elf, LD_BASE, &mut symbols);
+            collect_symbols(&pso.elf, ld_base, &mut symbols);
         } else {
             let base = next_so_base;
-            let span = elf_span(&so_elf)?.max(0x0010_0000);
+            let span = elf_span(&pso.elf)?.max(0x0010_0000);
             next_so_base = next_so_base
                 .checked_add(span)
                 .filter(|&n| n <= BRK_START)
@@ -356,39 +369,32 @@ pub fn load_elf_and_sos(main_path: &Path, so_paths: &[PathBuf]) -> Result<Loaded
             // Lift its code at `base`, but do NOT preload its data segments:
             // ld.so will openat + mmap it into `base` at runtime!
             extract_segments(
-                &so_base_name,
-                &so_bytes,
-                &so_elf,
+                pso.so_base_name,
+                pso.bytes,
+                &pso.elf,
                 base,
                 false,
                 &mut exec_segments,
                 &mut data_segments,
             )?;
-            collect_symbols(&so_elf, base, &mut symbols);
+            collect_symbols(&pso.elf, base, &mut symbols);
 
             let mut guest_paths = vec![
-                so_str.clone(),
-                canon_str.clone(),
-                format!("/lib/x86_64-linux-gnu/{}", so_base_name),
-                format!("/usr/lib/x86_64-linux-gnu/{}", so_base_name),
-                format!("/lib64/{}", so_base_name),
-                format!("/lib/{}", so_base_name),
-                format!("/usr/lib/{}", so_base_name),
+                pso.so_str.to_string(),
+                format!("/lib/x86_64-linux-gnu/{}", pso.so_base_name),
+                format!("/usr/lib/x86_64-linux-gnu/{}", pso.so_base_name),
+                format!("/lib64/{}", pso.so_base_name),
+                format!("/lib/{}", pso.so_base_name),
+                format!("/usr/lib/{}", pso.so_base_name),
             ];
-            // Also add the basename of the canonical path (e.g. libc.so.6 -> libc.so.6)
-            if let Some(canon_base) = Path::new(&canon_str).file_name() {
-                let cb = canon_base.to_string_lossy();
-                guest_paths.push(format!("/lib/x86_64-linux-gnu/{}", cb));
-                guest_paths.push(format!("/lib64/{}", cb));
-            }
             guest_paths.sort();
             guest_paths.dedup();
 
             so_files.push(SoFile {
-                host_path: so_str,
+                host_path: pso.so_str.to_string(),
                 guest_paths,
                 base_addr: base,
-                bytes: so_bytes,
+                bytes: pso.bytes.to_vec(),
             });
         }
     }
@@ -414,6 +420,164 @@ pub fn load_elf_and_sos(main_path: &Path, so_paths: &[PathBuf]) -> Result<Loaded
         data_segments,
         so_files,
         symbols,
-        elf_path: main_path.to_string_lossy().to_string(),
+        elf_path: main_path.to_string(),
     })
+}
+
+#[cfg(feature = "std-fs")]
+pub fn load_elf_and_sos(main_path: &Path, so_paths: &[PathBuf]) -> Result<LoadedImage> {
+    let main_bytes = fs::read(main_path)
+        .with_context(|| format!("Failed to read main ELF: {}", main_path.display()))?;
+
+    let mut effective_so_paths = so_paths.to_vec();
+    if main_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map_or(false, |n| n.starts_with("python3"))
+    {
+        let ctxvars = Path::new(
+            "/usr/lib/python3.11/lib-dynload/_contextvars.cpython-311-x86_64-linux-gnu.so",
+        );
+        if ctxvars.exists()
+            && !effective_so_paths
+                .iter()
+                .any(|p| p == ctxvars || p.file_name() == ctxvars.file_name())
+        {
+            effective_so_paths.push(ctxvars.to_path_buf());
+        }
+    }
+
+    let mut so_owned = Vec::with_capacity(effective_so_paths.len());
+    for so_path in &effective_so_paths {
+        let so_bytes = fs::read(so_path)
+            .with_context(|| format!("Failed to read .so: {}", so_path.display()))?;
+        let so_str = so_path.to_string_lossy().to_string();
+        let canon_str = fs::canonicalize(so_path)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| so_str.clone());
+        so_owned.push((so_str, so_bytes, canon_str));
+    }
+
+    let so_slices: Vec<(&str, &[u8])> = so_owned
+        .iter()
+        .map(|(p, b, _)| (p.as_str(), b.as_slice()))
+        .collect();
+    let main_path_str = main_path.to_string_lossy();
+    let mut image = load_elf_and_sos_bytes(&main_path_str, &main_bytes, &so_slices)?;
+
+    // Preserve canonical symlink guest paths when loading from the host filesystem.
+    for so_file in &mut image.so_files {
+        if let Some((_, _, canon_str)) = so_owned
+            .iter()
+            .find(|(so_str, _, _)| so_str == &so_file.host_path)
+        {
+            if canon_str != &so_file.host_path {
+                so_file.guest_paths.push(canon_str.clone());
+                if let Some(canon_base) = Path::new(canon_str).file_name() {
+                    let cb = canon_base.to_string_lossy();
+                    so_file
+                        .guest_paths
+                        .push(format!("/lib/x86_64-linux-gnu/{}", cb));
+                    so_file.guest_paths.push(format!("/lib64/{}", cb));
+                }
+                so_file.guest_paths.sort();
+                so_file.guest_paths.dedup();
+            }
+        }
+    }
+
+    Ok(image)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_minimal_elf64(
+        e_type: u16,
+        e_entry: u64,
+        vaddr: u64,
+        memsz: u64,
+        interp: Option<&[u8]>,
+    ) -> Vec<u8> {
+        // ELF64 header (64 bytes) + 1 or 2 program headers (56 bytes each) + code/interp payload
+        let phnum: u16 = if interp.is_some() { 2 } else { 1 };
+        let phoff: u64 = 64;
+        let payload_off: u64 = 64 + (phnum as u64) * 56;
+        let code = [0xc3u8]; // ret
+        let interp_off = payload_off + code.len() as u64;
+        let total_len = interp_off as usize + interp.map_or(0, |s| s.len());
+        let mut buf = vec![0u8; total_len];
+
+        // e_ident
+        buf[0..4].copy_from_slice(b"\x7fELF");
+        buf[4] = 2; // ELFCLASS64
+        buf[5] = 1; // ELFDATA2LSB
+        buf[6] = 1; // EV_CURRENT
+        buf[16..18].copy_from_slice(&e_type.to_le_bytes());
+        buf[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+        buf[20..24].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
+        buf[24..32].copy_from_slice(&e_entry.to_le_bytes());
+        buf[32..40].copy_from_slice(&phoff.to_le_bytes());
+        buf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        buf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        buf[56..58].copy_from_slice(&phnum.to_le_bytes());
+
+        // PT_LOAD (p_type = 1, PF_R | PF_X = 5)
+        let ph0 = 64usize;
+        buf[ph0..ph0 + 4].copy_from_slice(&1u32.to_le_bytes());
+        buf[ph0 + 4..ph0 + 8].copy_from_slice(&5u32.to_le_bytes());
+        buf[ph0 + 8..ph0 + 16].copy_from_slice(&payload_off.to_le_bytes());
+        buf[ph0 + 16..ph0 + 24].copy_from_slice(&vaddr.to_le_bytes());
+        buf[ph0 + 24..ph0 + 32].copy_from_slice(&vaddr.to_le_bytes());
+        buf[ph0 + 32..ph0 + 40].copy_from_slice(&(code.len() as u64).to_le_bytes());
+        buf[ph0 + 40..ph0 + 48].copy_from_slice(&memsz.to_le_bytes());
+        buf[ph0 + 48..ph0 + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+
+        buf[payload_off as usize..payload_off as usize + code.len()].copy_from_slice(&code);
+
+        if let Some(ip) = interp {
+            let ph1 = 64 + 56;
+            buf[ph1..ph1 + 4].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+            buf[ph1 + 4..ph1 + 8].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+            buf[ph1 + 8..ph1 + 16].copy_from_slice(&interp_off.to_le_bytes());
+            buf[ph1 + 32..ph1 + 40].copy_from_slice(&(ip.len() as u64).to_le_bytes()); // p_filesz
+            buf[ph1 + 40..ph1 + 48].copy_from_slice(&(ip.len() as u64).to_le_bytes()); // p_memsz
+            buf[ph1 + 48..ph1 + 56].copy_from_slice(&1u64.to_le_bytes());
+            buf[interp_off as usize..interp_off as usize + ip.len()].copy_from_slice(ip);
+        }
+
+        buf
+    }
+
+    #[test]
+    fn test_large_et_exec_dynamic_bases() -> Result<()> {
+        // Large ET_EXEC ending at 0x0260_0000 (> LD_BASE 0x0100_0000 and > SO_BASE_START 0x0200_0000)
+        let main_bytes = make_minimal_elf64(
+            goblin::elf::header::ET_EXEC,
+            0x0040_0000,
+            0x0040_0000,
+            0x0220_0000,
+            Some(b"/lib64/ld-linux-x86-64.so.2\0"),
+        );
+        let ld_bytes = make_minimal_elf64(goblin::elf::header::ET_DYN, 0x1000, 0, 0x10_0000, None);
+        let libc_bytes =
+            make_minimal_elf64(goblin::elf::header::ET_DYN, 0x1000, 0, 0x20_0000, None);
+
+        // Pass libc BEFORE ld.so to verify order independence.
+        let image = load_elf_and_sos_bytes(
+            "/usr/bin/big_exec",
+            &main_bytes,
+            &[
+                ("/lib/x86_64-linux-gnu/libc.so.6", &libc_bytes),
+                ("/lib64/ld-linux-x86-64.so.2", &ld_bytes),
+            ],
+        )?;
+
+        assert_eq!(image.at_base, 0x0260_0000);
+        assert_eq!(image.so_files.len(), 1);
+        assert_eq!(image.so_files[0].base_addr, 0x0270_0000);
+        assert!(image.so_files[0].base_addr + 0x20_0000 <= BRK_START);
+        Ok(())
+    }
 }

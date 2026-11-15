@@ -438,6 +438,25 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "elf2wasm-core",
+ "goblin",
+ "iced-x86",
+ "wasm-encoder 0.220.1",
+ "wasmtime",
+]
+
+[[package]]
+name = "elf2wasm-compiler-wasm"
+version = "0.1.0"
+dependencies = [
+ "elf2wasm-core",
+]
+
+[[package]]
+name = "elf2wasm-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "goblin",
  "iced-x86",
  "wasm-encoder 0.220.1",

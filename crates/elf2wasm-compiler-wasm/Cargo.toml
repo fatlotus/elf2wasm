@@ -1,0 +1,10 @@
+[package]
+name = "elf2wasm-compiler-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+elf2wasm-core = { path = "../elf2wasm-core", default-features = false }

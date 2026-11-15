@@ -1,8 +1,9 @@
 use crate::decoder::{BlockTerminator, DecodedBlock, DecodedProgram};
 use crate::elf_loader::{LoadedImage, INITIAL_MEM_PAGES};
 use crate::lifter::{
-    Lifter, GLOBAL_EXIT_CODE, GLOBAL_EXIT_FLAG, GLOBAL_FSBASE, GLOBAL_GSBASE, GLOBAL_RAX,
-    GLOBAL_RIP, GLOBAL_RSP, GLOBAL_TSC, GLOBAL_X87_CW, GLOBAL_XMM_BASE, GPR_NAMES, LOCAL_I64_0,
+    Lifter, DEFAULT_QUANTUM, GLOBAL_CF, GLOBAL_DF, GLOBAL_EXIT_CODE, GLOBAL_EXIT_FLAG,
+    GLOBAL_FSBASE, GLOBAL_GSBASE, GLOBAL_MXCSR, GLOBAL_QUANTUM, GLOBAL_RAX, GLOBAL_RIP, GLOBAL_RSP,
+    GLOBAL_TSC, GLOBAL_X87_CW, GLOBAL_XMM_BASE, GLOBAL_YIELD_FLAG, GPR_NAMES, LOCAL_I64_0,
     LOCAL_PC_IDX,
 };
 use crate::meta::{MetaSoFile, WasmMeta};
@@ -40,6 +41,22 @@ fn emit_jump_target(
     dispatch_depth: u32,
 ) {
     if let Some(&local_idx) = chunk_block_map.get(&target_va) {
+        func.instruction(&WInst::GlobalGet(GLOBAL_QUANTUM));
+        func.instruction(&WInst::I32Const(1));
+        func.instruction(&WInst::I32Sub);
+        func.instruction(&WInst::GlobalSet(GLOBAL_QUANTUM));
+
+        func.instruction(&WInst::GlobalGet(GLOBAL_QUANTUM));
+        func.instruction(&WInst::I32Const(0));
+        func.instruction(&WInst::I32LeS);
+        func.instruction(&WInst::If(BlockType::Empty));
+        func.instruction(&WInst::I64Const(target_va as i64));
+        func.instruction(&WInst::GlobalSet(GLOBAL_RIP));
+        func.instruction(&WInst::I32Const(2));
+        func.instruction(&WInst::GlobalSet(GLOBAL_YIELD_FLAG));
+        func.instruction(&WInst::Return);
+        func.instruction(&WInst::End);
+
         func.instruction(&WInst::I32Const(local_idx as i32));
         func.instruction(&WInst::LocalSet(LOCAL_PC_IDX));
         func.instruction(&WInst::Br(dispatch_depth));
@@ -251,6 +268,13 @@ fn emit_start_function(num_chunks: u32, hash_mask: u32) -> Function {
         func.instruction(&WInst::Return);
         func.instruction(&WInst::End);
 
+        // if yield_flag != 0 { return exit_code }
+        func.instruction(&WInst::GlobalGet(GLOBAL_YIELD_FLAG));
+        func.instruction(&WInst::If(BlockType::Empty));
+        func.instruction(&WInst::GlobalGet(GLOBAL_EXIT_CODE));
+        func.instruction(&WInst::Return);
+        func.instruction(&WInst::End);
+
         // if rip == 0 { return exit_code }
         func.instruction(&WInst::GlobalGet(GLOBAL_RIP));
         func.instruction(&WInst::I64Eqz);
@@ -267,6 +291,17 @@ fn emit_start_function(num_chunks: u32, hash_mask: u32) -> Function {
         func.instruction(&WInst::I64Ne);
         func.instruction(&WInst::If(BlockType::Empty));
         func.instruction(&WInst::Unreachable);
+        func.instruction(&WInst::End);
+
+        // if quantum <= 0 { yield_flag = 2; return exit_code }
+        func.instruction(&WInst::GlobalGet(GLOBAL_QUANTUM));
+        func.instruction(&WInst::I32Const(0));
+        func.instruction(&WInst::I32LeS);
+        func.instruction(&WInst::If(BlockType::Empty));
+        func.instruction(&WInst::I32Const(2));
+        func.instruction(&WInst::GlobalSet(GLOBAL_YIELD_FLAG));
+        func.instruction(&WInst::GlobalGet(GLOBAL_EXIT_CODE));
+        func.instruction(&WInst::Return);
         func.instruction(&WInst::End);
 
         // va = rip as i32
@@ -300,6 +335,12 @@ fn emit_start_function(num_chunks: u32, hash_mask: u32) -> Function {
             func.instruction(&WInst::I32Eq);
             func.instruction(&WInst::If(BlockType::Empty));
             {
+                // Consume 1 quantum for this block dispatch
+                func.instruction(&WInst::GlobalGet(GLOBAL_QUANTUM));
+                func.instruction(&WInst::I32Const(1));
+                func.instruction(&WInst::I32Sub);
+                func.instruction(&WInst::GlobalSet(GLOBAL_QUANTUM));
+
                 // packed = i32.load(offset = DISPATCH_HASH_ADDR + 4)(slot << 3)
                 func.instruction(&WInst::LocalGet(1));
                 func.instruction(&WInst::I32Const(3));
@@ -351,6 +392,104 @@ fn emit_start_function(num_chunks: u32, hash_mask: u32) -> Function {
     func.instruction(&WInst::End); // end $trampoline
 
     func.instruction(&WInst::GlobalGet(GLOBAL_EXIT_CODE));
+    func.instruction(&WInst::End);
+    func
+}
+
+fn emit_save_ctx_function() -> Function {
+    let mut func = Function::new([]);
+    let store_i64 = |f: &mut Function, global_idx: u32, offset: u64| {
+        f.instruction(&WInst::LocalGet(0));
+        f.instruction(&WInst::GlobalGet(global_idx));
+        f.instruction(&WInst::I64Store(MemArg {
+            offset,
+            align: 3,
+            memory_index: 0,
+        }));
+    };
+    let store_i32 = |f: &mut Function, global_idx: u32, offset: u64| {
+        f.instruction(&WInst::LocalGet(0));
+        f.instruction(&WInst::GlobalGet(global_idx));
+        f.instruction(&WInst::I32Store(MemArg {
+            offset,
+            align: 2,
+            memory_index: 0,
+        }));
+    };
+
+    for i in 0..16u32 {
+        store_i64(&mut func, GLOBAL_RAX + i, (i as u64) * 8);
+    }
+    store_i64(&mut func, GLOBAL_RIP, 128);
+    store_i64(&mut func, GLOBAL_FSBASE, 136);
+    store_i64(&mut func, GLOBAL_GSBASE, 144);
+    store_i64(&mut func, GLOBAL_TSC, 152);
+
+    for (j, g) in (GLOBAL_CF..=GLOBAL_DF).enumerate() {
+        store_i32(&mut func, g, 160 + (j as u64) * 4);
+    }
+    store_i32(&mut func, GLOBAL_MXCSR, 188);
+    store_i32(&mut func, GLOBAL_X87_CW, 192);
+
+    for k in 0..16u32 {
+        func.instruction(&WInst::LocalGet(0));
+        func.instruction(&WInst::GlobalGet(GLOBAL_XMM_BASE + k));
+        func.instruction(&WInst::V128Store(MemArg {
+            offset: 208 + (k as u64) * 16,
+            align: 4,
+            memory_index: 0,
+        }));
+    }
+
+    func.instruction(&WInst::End);
+    func
+}
+
+fn emit_load_ctx_function() -> Function {
+    let mut func = Function::new([]);
+    let load_i64 = |f: &mut Function, global_idx: u32, offset: u64| {
+        f.instruction(&WInst::LocalGet(0));
+        f.instruction(&WInst::I64Load(MemArg {
+            offset,
+            align: 3,
+            memory_index: 0,
+        }));
+        f.instruction(&WInst::GlobalSet(global_idx));
+    };
+    let load_i32 = |f: &mut Function, global_idx: u32, offset: u64| {
+        f.instruction(&WInst::LocalGet(0));
+        f.instruction(&WInst::I32Load(MemArg {
+            offset,
+            align: 2,
+            memory_index: 0,
+        }));
+        f.instruction(&WInst::GlobalSet(global_idx));
+    };
+
+    for i in 0..16u32 {
+        load_i64(&mut func, GLOBAL_RAX + i, (i as u64) * 8);
+    }
+    load_i64(&mut func, GLOBAL_RIP, 128);
+    load_i64(&mut func, GLOBAL_FSBASE, 136);
+    load_i64(&mut func, GLOBAL_GSBASE, 144);
+    load_i64(&mut func, GLOBAL_TSC, 152);
+
+    for (j, g) in (GLOBAL_CF..=GLOBAL_DF).enumerate() {
+        load_i32(&mut func, g, 160 + (j as u64) * 4);
+    }
+    load_i32(&mut func, GLOBAL_MXCSR, 188);
+    load_i32(&mut func, GLOBAL_X87_CW, 192);
+
+    for k in 0..16u32 {
+        func.instruction(&WInst::LocalGet(0));
+        func.instruction(&WInst::V128Load(MemArg {
+            offset: 208 + (k as u64) * 16,
+            align: 4,
+            memory_index: 0,
+        }));
+        func.instruction(&WInst::GlobalSet(GLOBAL_XMM_BASE + k));
+    }
+
     func.instruction(&WInst::End);
     func
 }
@@ -440,6 +579,8 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
         functions.function(1);
     }
     functions.function(2); // _start
+    functions.function(1); // save_ctx
+    functions.function(1); // load_ctx
     module.section(&functions);
 
     // Table Section
@@ -558,13 +699,35 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
         &ConstExpr::i32_const(0x037F),
     );
     let _ = GLOBAL_X87_CW;
+    // 47: yield_flag
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i32_const(0),
+    );
+    // 48: quantum
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i32_const(DEFAULT_QUANTUM),
+    );
     module.section(&globals);
 
     // Export Section
     let start_func_idx = 1 + num_chunks;
+    let save_ctx_func_idx = 2 + num_chunks;
+    let load_ctx_func_idx = 3 + num_chunks;
     let mut exports = ExportSection::new();
     exports.export("memory", ExportKind::Memory, 0);
     exports.export("_start", ExportKind::Func, start_func_idx);
+    exports.export("save_ctx", ExportKind::Func, save_ctx_func_idx);
+    exports.export("load_ctx", ExportKind::Func, load_ctx_func_idx);
     for (i, name) in GPR_NAMES.iter().enumerate() {
         exports.export(name, ExportKind::Global, GLOBAL_RAX + i as u32);
     }
@@ -573,6 +736,8 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
     exports.export("exit_code", ExportKind::Global, GLOBAL_EXIT_CODE);
     exports.export("fsbase", ExportKind::Global, GLOBAL_FSBASE);
     exports.export("gsbase", ExportKind::Global, GLOBAL_GSBASE);
+    exports.export("yield_flag", ExportKind::Global, GLOBAL_YIELD_FLAG);
+    exports.export("quantum", ExportKind::Global, GLOBAL_QUANTUM);
     module.section(&exports);
 
     // Element Section
@@ -594,6 +759,8 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
         codes.function(&f);
     }
     codes.function(&emit_start_function(num_chunks, hash_mask));
+    codes.function(&emit_save_ctx_function());
+    codes.function(&emit_load_ctx_function());
     module.section(&codes);
 
     // Data Section
@@ -651,7 +818,7 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
     Ok(module.finish())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32"), feature = "std-fs"))]
 mod tests {
     use super::*;
     use crate::decoder::discover_code;
@@ -1228,5 +1395,441 @@ mod tests {
             .unwrap();
         let start = inst.get_typed_func::<(), i32>(&mut store, "_start").unwrap();
         assert!(start.call(&mut store, ()).is_err(), "0x1_0000_0000 indirect jump must trap!");
+    }
+
+    #[test]
+    fn test_syscall_yield_and_resume() {
+        // 0x100000: mov rax, 100   (48 c7 c0 64 00 00 00)
+        // 0x100007: syscall        (0f 05) -> host sets yield_flag = 1 and returns 42
+        // 0x100009: add rax, 5     (48 83 c0 05) -> 47
+        // 0x10000d: mov rdi, rax   (48 89 c7)
+        // 0x100010: mov rax, 60    (48 c7 c0 3c 00 00 00)
+        // 0x100017: syscall        (0f 05) -> exit(47)
+        let code = vec![
+            0x48, 0xc7, 0xc0, 0x64, 0x00, 0x00, 0x00, // mov rax, 100
+            0x0f, 0x05, // syscall
+            0x48, 0x83, 0xc0, 0x05, // add rax, 5
+            0x48, 0x89, 0xc7, // mov rdi, rax
+            0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, // mov rax, 60
+            0x0f, 0x05, // syscall
+        ];
+        let image = LoadedImage {
+            entry_rip: 0x0010_0000,
+            at_phdr: 0,
+            at_phent: 56,
+            at_phnum: 0,
+            at_entry: 0x0010_0000,
+            at_base: 0,
+            exec_segments: vec![ExecSegment {
+                name: "yield_test".to_string(),
+                vaddr: 0x0010_0000,
+                data: code,
+            }],
+            data_segments: vec![],
+            so_files: vec![],
+            symbols: std::collections::HashMap::new(),
+            elf_path: "test".to_string(),
+        };
+        let mut prog = crate::decoder::discover_code(&image).unwrap();
+        crate::decoder::split_indirect_targets(&image, &mut prog);
+        let wasm_bytes = emit_wasm(&image, &prog).unwrap();
+        let engine = Engine::default();
+        let module = WasmModule::new(&engine, &wasm_bytes).unwrap();
+        let mut linker: Linker<()> = Linker::new(&engine);
+        linker
+            .func_wrap(
+                "env",
+                "syscall",
+                |mut caller: Caller<'_, ()>,
+                 nr: i64,
+                 a0: i64,
+                 _: i64,
+                 _: i64,
+                 _: i64,
+                 _: i64,
+                 _: i64|
+                 -> i64 {
+                    if nr == 100 {
+                        caller
+                            .get_export("yield_flag")
+                            .unwrap()
+                            .into_global()
+                            .unwrap()
+                            .set(&mut caller, wasmtime::Val::I32(1))
+                            .unwrap();
+                        return 42;
+                    }
+                    if nr == 60 {
+                        caller
+                            .get_export("exit_code")
+                            .unwrap()
+                            .into_global()
+                            .unwrap()
+                            .set(&mut caller, wasmtime::Val::I32(a0 as i32))
+                            .unwrap();
+                        caller
+                            .get_export("exit_flag")
+                            .unwrap()
+                            .into_global()
+                            .unwrap()
+                            .set(&mut caller, wasmtime::Val::I32(1))
+                            .unwrap();
+                        return 0;
+                    }
+                    -38
+                },
+            )
+            .unwrap();
+        let mut store = Store::new(&engine, ());
+        let inst = linker.instantiate(&mut store, &module).unwrap();
+        inst.get_global(&mut store, "rsp")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I64(STACK_TOP as i64))
+            .unwrap();
+
+        let start = inst.get_typed_func::<(), i32>(&mut store, "_start").unwrap();
+        // First slice: yields on syscall 100
+        let _ = start.call(&mut store, ()).unwrap();
+        assert_eq!(
+            inst.get_global(&mut store, "yield_flag")
+                .unwrap()
+                .get(&mut store)
+                .i32(),
+            Some(1)
+        );
+        assert_eq!(
+            inst.get_global(&mut store, "exit_flag")
+                .unwrap()
+                .get(&mut store)
+                .i32(),
+            Some(0)
+        );
+        assert_eq!(
+            inst.get_global(&mut store, "rip")
+                .unwrap()
+                .get(&mut store)
+                .i64(),
+            Some(0x0010_0009)
+        );
+        assert_eq!(
+            inst.get_global(&mut store, "rax")
+                .unwrap()
+                .get(&mut store)
+                .i64(),
+            Some(42)
+        );
+
+        // Resume: clear yield_flag, reset quantum, call _start again
+        inst.get_global(&mut store, "yield_flag")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I32(0))
+            .unwrap();
+        inst.get_global(&mut store, "quantum")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I32(DEFAULT_QUANTUM))
+            .unwrap();
+        let code = start.call(&mut store, ()).unwrap();
+        assert_eq!(code, 47);
+        assert_eq!(
+            inst.get_global(&mut store, "exit_flag")
+                .unwrap()
+                .get(&mut store)
+                .i32(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_quantum_preemption_and_resume() {
+        // Loop 200 times (exceeds DEFAULT_QUANTUM = 128), then exit(rcx)
+        // 0x100000: mov rcx, 200   (48 c7 c1 c8 00 00 00)
+        // 0x100007: dec rcx        (48 ff c9)
+        // 0x10000a: jnz 0x100007   (75 fb)
+        // 0x10000c: mov rdi, 99    (48 c7 c7 63 00 00 00)
+        // 0x100013: mov rax, 60    (48 c7 c0 3c 00 00 00)
+        // 0x10001a: syscall        (0f 05)
+        let code = vec![
+            0x48, 0xc7, 0xc1, 0xc8, 0x00, 0x00, 0x00, // mov rcx, 200
+            0x48, 0xff, 0xc9, // dec rcx
+            0x75, 0xfb, // jnz -5 -> 0x100007
+            0x48, 0xc7, 0xc7, 0x63, 0x00, 0x00, 0x00, // mov rdi, 99
+            0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, // mov rax, 60
+            0x0f, 0x05, // syscall
+        ];
+        let image = LoadedImage {
+            entry_rip: 0x0010_0000,
+            at_phdr: 0,
+            at_phent: 56,
+            at_phnum: 0,
+            at_entry: 0x0010_0000,
+            at_base: 0,
+            exec_segments: vec![ExecSegment {
+                name: "quantum_test".to_string(),
+                vaddr: 0x0010_0000,
+                data: code,
+            }],
+            data_segments: vec![],
+            so_files: vec![],
+            symbols: std::collections::HashMap::new(),
+            elf_path: "test".to_string(),
+        };
+        let prog = crate::decoder::discover_code(&image).unwrap();
+        let wasm_bytes = emit_wasm(&image, &prog).unwrap();
+        let engine = Engine::default();
+        let module = WasmModule::new(&engine, &wasm_bytes).unwrap();
+        let mut linker: Linker<()> = Linker::new(&engine);
+        linker
+            .func_wrap(
+                "env",
+                "syscall",
+                |mut caller: Caller<'_, ()>,
+                 nr: i64,
+                 a0: i64,
+                 _: i64,
+                 _: i64,
+                 _: i64,
+                 _: i64,
+                 _: i64|
+                 -> i64 {
+                    if nr == 60 {
+                        caller
+                            .get_export("exit_code")
+                            .unwrap()
+                            .into_global()
+                            .unwrap()
+                            .set(&mut caller, wasmtime::Val::I32(a0 as i32))
+                            .unwrap();
+                        caller
+                            .get_export("exit_flag")
+                            .unwrap()
+                            .into_global()
+                            .unwrap()
+                            .set(&mut caller, wasmtime::Val::I32(1))
+                            .unwrap();
+                        return 0;
+                    }
+                    -38
+                },
+            )
+            .unwrap();
+        let mut store = Store::new(&engine, ());
+        let inst = linker.instantiate(&mut store, &module).unwrap();
+        inst.get_global(&mut store, "rsp")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I64(STACK_TOP as i64))
+            .unwrap();
+
+        let start = inst.get_typed_func::<(), i32>(&mut store, "_start").unwrap();
+        let _ = start.call(&mut store, ()).unwrap();
+        assert_eq!(
+            inst.get_global(&mut store, "yield_flag")
+                .unwrap()
+                .get(&mut store)
+                .i32(),
+            Some(2),
+            "tight loop must preempt with yield_flag == 2"
+        );
+        assert_eq!(
+            inst.get_global(&mut store, "exit_flag")
+                .unwrap()
+                .get(&mut store)
+                .i32(),
+            Some(0)
+        );
+
+        // Resume until completion
+        let mut slices = 1;
+        let mut exit_code = 0;
+        loop {
+            let ef = inst
+                .get_global(&mut store, "exit_flag")
+                .unwrap()
+                .get(&mut store)
+                .i32()
+                .unwrap();
+            if ef != 0 {
+                break;
+            }
+            inst.get_global(&mut store, "yield_flag")
+                .unwrap()
+                .set(&mut store, wasmtime::Val::I32(0))
+                .unwrap();
+            inst.get_global(&mut store, "quantum")
+                .unwrap()
+                .set(&mut store, wasmtime::Val::I32(DEFAULT_QUANTUM))
+                .unwrap();
+            exit_code = start.call(&mut store, ()).unwrap();
+            slices += 1;
+            assert!(slices < 10, "loop should finish in a few slices");
+        }
+        assert_eq!(exit_code, 99);
+    }
+
+    #[test]
+    fn test_save_ctx_load_ctx_round_trip() {
+        // Program that sets GPRs, flags, and XMM0, then calls syscall to exit.
+        // 0x100000: mov rax, 0x1122334455667788 (48 b8 88 77 66 55 44 33 22 11)
+        // 0x10000a: mov rbx, 0x0102030405060708 (48 bb 08 07 06 05 04 03 02 01)
+        // 0x100014: movq xmm0, rax              (66 48 0f 6e c0)
+        // 0x100019: cmp rbx, rax                (48 39 c3) -> sets CF=1, SF=1
+        // 0x10001c: mov rdi, 0                  (48 c7 c7 00 00 00 00)
+        // 0x100023: mov rax, 60                 (48 c7 c0 3c 00 00 00)
+        // 0x10002a: syscall                     (0f 05)
+        let code = vec![
+            0x48, 0xb8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mov rax, imm64
+            0x48, 0xbb, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // mov rbx, imm64
+            0x66, 0x48, 0x0f, 0x6e, 0xc0, // movq xmm0, rax
+            0x48, 0x39, 0xc3, // cmp rbx, rax
+            0x48, 0xc7, 0xc7, 0x00, 0x00, 0x00, 0x00, // mov rdi, 0
+            0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, // mov rax, 60
+            0x0f, 0x05, // syscall
+        ];
+        let image = LoadedImage {
+            entry_rip: 0x0010_0000,
+            at_phdr: 0,
+            at_phent: 56,
+            at_phnum: 0,
+            at_entry: 0x0010_0000,
+            at_base: 0,
+            exec_segments: vec![ExecSegment {
+                name: "ctx_test".to_string(),
+                vaddr: 0x0010_0000,
+                data: code,
+            }],
+            data_segments: vec![],
+            so_files: vec![],
+            symbols: std::collections::HashMap::new(),
+            elf_path: "test".to_string(),
+        };
+        let prog = crate::decoder::discover_code(&image).unwrap();
+        let wasm_bytes = emit_wasm(&image, &prog).unwrap();
+        let engine = Engine::default();
+        let module = WasmModule::new(&engine, &wasm_bytes).unwrap();
+        let mut linker: Linker<()> = Linker::new(&engine);
+        linker
+            .func_wrap(
+                "env",
+                "syscall",
+                |mut caller: Caller<'_, ()>,
+                 nr: i64,
+                 a0: i64,
+                 _: i64,
+                 _: i64,
+                 _: i64,
+                 _: i64,
+                 _: i64|
+                 -> i64 {
+                    if nr == 60 {
+                        caller
+                            .get_export("exit_code")
+                            .unwrap()
+                            .into_global()
+                            .unwrap()
+                            .set(&mut caller, wasmtime::Val::I32(a0 as i32))
+                            .unwrap();
+                        caller
+                            .get_export("exit_flag")
+                            .unwrap()
+                            .into_global()
+                            .unwrap()
+                            .set(&mut caller, wasmtime::Val::I32(1))
+                            .unwrap();
+                        return 0;
+                    }
+                    -38
+                },
+            )
+            .unwrap();
+        let mut store = Store::new(&engine, ());
+        let inst = linker.instantiate(&mut store, &module).unwrap();
+        inst.get_global(&mut store, "fsbase")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I64(0x1234_5678))
+            .unwrap();
+        inst.get_global(&mut store, "gsbase")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I64(0x9abc_def0))
+            .unwrap();
+        inst.get_global(&mut store, "rsp")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I64(STACK_TOP as i64))
+            .unwrap();
+
+        let start = inst.get_typed_func::<(), i32>(&mut store, "_start").unwrap();
+        let _ = start.call(&mut store, ()).unwrap();
+
+        let save_ctx = inst
+            .get_typed_func::<i32, ()>(&mut store, "save_ctx")
+            .unwrap();
+        let load_ctx = inst
+            .get_typed_func::<i32, ()>(&mut store, "load_ctx")
+            .unwrap();
+
+        let ctx_ptr = 0x0020_0000i32;
+        save_ctx.call(&mut store, ctx_ptr).unwrap();
+
+        // Check XMM0 was saved at offset 208 (0x1122334455667788 in low 64 bits)
+        let mem = inst.get_memory(&mut store, "memory").unwrap();
+        let mut xmm0_saved = [0u8; 16];
+        mem.read(&store, (ctx_ptr + 208) as usize, &mut xmm0_saved)
+            .unwrap();
+        assert_eq!(
+            u64::from_le_bytes(xmm0_saved[0..8].try_into().unwrap()),
+            0x1122_3344_5566_7788
+        );
+
+        // Clobber globals
+        inst.get_global(&mut store, "rax")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I64(0))
+            .unwrap();
+        inst.get_global(&mut store, "rbx")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I64(0))
+            .unwrap();
+        inst.get_global(&mut store, "fsbase")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I64(0))
+            .unwrap();
+        inst.get_global(&mut store, "gsbase")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I64(0))
+            .unwrap();
+        inst.get_global(&mut store, "rip")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I64(0))
+            .unwrap();
+
+        // Restore via load_ctx
+        load_ctx.call(&mut store, ctx_ptr).unwrap();
+        assert_eq!(
+            inst.get_global(&mut store, "rbx")
+                .unwrap()
+                .get(&mut store)
+                .i64(),
+            Some(0x0102_0304_0506_0708)
+        );
+        assert_eq!(
+            inst.get_global(&mut store, "fsbase")
+                .unwrap()
+                .get(&mut store)
+                .i64(),
+            Some(0x1234_5678)
+        );
+        assert_eq!(
+            inst.get_global(&mut store, "gsbase")
+                .unwrap()
+                .get(&mut store)
+                .i64(),
+            Some(0x9abc_def0)
+        );
+
+        // Save again to another slot and verify XMM0 was restored too
+        let ctx_ptr2 = 0x0020_1000i32;
+        save_ctx.call(&mut store, ctx_ptr2).unwrap();
+        let mut xmm0_re_saved = [0u8; 16];
+        mem.read(&store, (ctx_ptr2 + 208) as usize, &mut xmm0_re_saved)
+            .unwrap();
+        assert_eq!(xmm0_re_saved, xmm0_saved);
     }
 }

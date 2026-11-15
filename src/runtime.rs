@@ -255,33 +255,53 @@ pub fn run_wasm(wasm_bytes: &[u8], config: RunConfig) -> Result<RunOutput> {
         .set(&mut store, Val::I64(meta.entry_rip as i64))?;
 
     let start = instance.get_typed_func::<(), i32>(&mut store, "_start")?;
-    let exit_code = match start.call(&mut store, ()) {
-        Ok(code) => code,
-        Err(err) => {
-            let rip = instance
-                .get_global(&mut store, "rip")
-                .and_then(|g| g.get(&mut store).i64())
-                .unwrap_or(-1) as u64;
-            let rsp = instance
-                .get_global(&mut store, "rsp")
-                .and_then(|g| g.get(&mut store).i64())
-                .unwrap_or(-1) as u64;
-            let rax = instance
-                .get_global(&mut store, "rax")
-                .and_then(|g| g.get(&mut store).i64())
-                .unwrap_or(-1) as u64;
-            let sym = meta
-                .symbols
-                .iter()
-                .rev()
-                .find(|(addr, _)| (*addr as u64) <= rip)
-                .map(|(addr, name)| format!("{}+0x{:x}", name, rip - *addr as u64))
-                .unwrap_or_else(|| "unknown".to_string());
-            return Err(err).context(format!(
-                "WASM trap at rip=0x{:x} ({}), rsp=0x{:x}, rax=0x{:x}",
-                rip, sym, rsp, rax
-            ));
+    let exit_code = loop {
+        let code = match start.call(&mut store, ()) {
+            Ok(code) => code,
+            Err(err) => {
+                let rip = instance
+                    .get_global(&mut store, "rip")
+                    .and_then(|g| g.get(&mut store).i64())
+                    .unwrap_or(-1) as u64;
+                let rsp = instance
+                    .get_global(&mut store, "rsp")
+                    .and_then(|g| g.get(&mut store).i64())
+                    .unwrap_or(-1) as u64;
+                let rax = instance
+                    .get_global(&mut store, "rax")
+                    .and_then(|g| g.get(&mut store).i64())
+                    .unwrap_or(-1) as u64;
+                let sym = meta
+                    .symbols
+                    .iter()
+                    .rev()
+                    .find(|(addr, _)| (*addr as u64) <= rip)
+                    .map(|(addr, name)| format!("{}+0x{:x}", name, rip - *addr as u64))
+                    .unwrap_or_else(|| "unknown".to_string());
+                return Err(err).context(format!(
+                    "WASM trap at rip=0x{:x} ({}), rsp=0x{:x}, rax=0x{:x}",
+                    rip, sym, rsp, rax
+                ));
+            }
+        };
+        let yield_flag = instance
+            .get_global(&mut store, "yield_flag")
+            .and_then(|g| g.get(&mut store).i32())
+            .unwrap_or(0);
+        let exit_flag = instance
+            .get_global(&mut store, "exit_flag")
+            .and_then(|g| g.get(&mut store).i32())
+            .unwrap_or(0);
+        if yield_flag != 0 && exit_flag == 0 {
+            if let Some(g) = instance.get_global(&mut store, "yield_flag") {
+                g.set(&mut store, Val::I32(0))?;
+            }
+            if let Some(g) = instance.get_global(&mut store, "quantum") {
+                g.set(&mut store, Val::I32(crate::lifter::DEFAULT_QUANTUM))?;
+            }
+            continue;
         }
+        break code;
     };
 
     let state = store.data();

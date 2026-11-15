@@ -1,9 +1,14 @@
+[workspace]
+members = [".", "crates/elf2wasm-core", "crates/elf2wasm-compiler-wasm"]
+resolver = "2"
+
 [package]
 name = "elf2wasm"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+elf2wasm-core = { path = "crates/elf2wasm-core" }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 goblin = "0.9"
