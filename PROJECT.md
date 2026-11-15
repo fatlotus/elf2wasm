@@ -27,15 +27,28 @@
 │   │       ├── decoder.rs             # iced-x86 code discovery, CFG, split_indirect_targets
 │   │       ├── lifter.rs              # x86-64 -> WASM instruction lifting & CPU state
 │   │       └── wasm_emit.rs           # wasm-encoder module assembly, quantum/yield, save/load_ctx
-│   └── elf2wasm-compiler-wasm/        # wasm32-unknown-unknown cdylib compiler
+│   ├── elf2wasm-compiler-wasm/        # wasm32-unknown-unknown cdylib compiler
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       └── lib.rs                 # C-ABI alloc, dealloc, compile_bundle (E2WB format)
+│   ├── elf2wasm-runtime-core/         # Pure runtime library (writable VFS, virtual time, scheduler)
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── context.rs             # GuestContext & HostFsProvider traits (StdHostFs / NoopHostFs)
+│   │       ├── vfs.rs                 # Writable in-memory VFS overlay + RO host/so mounts
+│   │       ├── scheduler.rs           # Deterministic virtual time & cooperative thread scheduler
+│   │       ├── syscalls.rs            # Platform-agnostic Linux x86-64 syscall emulator
+│   │       └── stack.rs               # RunConfig, RunOutput, extract_elf2wasm_meta, guest stack init
+│   └── elf2wasm-runtime-wasm/         # wasm32-unknown-unknown cdylib runtime
 │       ├── Cargo.toml
 │       └── src/
-│           └── lib.rs                 # C-ABI alloc, dealloc, compile_bundle (E2WB format)
+│           └── lib.rs                 # C-ABI runtime_* exports + env.host_* imports
 ├── src/
 │   ├── main.rs                        # CLI entry point (translate, run)
-│   ├── runtime.rs                     # wasmtime 27 host, stack/auxv setup, slice execution loop
-│   ├── syscalls.rs                    # Linux x86-64 sandboxed syscall emulator
-│   └── vfs.rs                         # Sandboxed virtual filesystem & fd table
+│   ├── runtime.rs                     # wasmtime 27 host, WasmtimeGuestContext, slice execution loop
+│   ├── syscalls.rs                    # Re-export of elf2wasm_runtime_core::syscalls
+│   └── vfs.rs                         # Re-export of elf2wasm_runtime_core::vfs
 └── tests/                             # E2E & integration test suite
 ```
 
@@ -87,6 +100,10 @@ Every feature from the Survey phase is assigned a milestone below:
 - Input bundle: `b"E2WB"` magic + `u32 main_path_len` + `main_path` + `u32 main_bytes_len` + `main_bytes` + `u32 num_sos` + `[u32 path_len + path + u32 bytes_len + bytes]...` (little-endian `u32`).
 - Output buffer: byte `0` == `0x00` + `.wasm` bytes on success, or `0x01` + UTF-8 error message on failure.
 
+### `elf2wasm-runtime-wasm` (WASM C-ABI)
+- Imports from `"env"`: `host_mem_size`, `host_read_guest`, `host_write_guest`, `host_zero_guest`, `host_get_global`, `host_set_global`, `host_save_ctx`, `host_load_ctx`.
+- Exports: `alloc`, `dealloc`, `runtime_new`, `runtime_add_vfs_file`, `runtime_read_vfs_file`, `runtime_init_guest_stack`, `runtime_handle_syscall`, `runtime_on_yield`, `runtime_get_stdout`, `runtime_get_stderr`, `runtime_get_exit_code`, `runtime_get_virtual_time_ns`.
+
 ### `wasm_emit` ↔ `runtime` / `syscalls` / `vfs`
-- `runtime::run_wasm(wasm_bytes: &[u8], config: RunConfig) -> Result<RunOutput>` decodes `"elf2wasm_meta"`, initializes `STACK_TOP` with `argc`/`argv`/`envp`/`auxv`, runs `_start` in a slice loop while `yield_flag != 0 && exit_flag == 0` (resetting `yield_flag = 0` and `quantum = DEFAULT_QUANTUM`), and returns `RunOutput { exit_code: i32, stdout: Vec<u8>, stderr: Vec<u8> }`.
-- `syscalls::handle_syscall(caller, nr, a0..a5) -> i64` accesses guest linear memory via `wasmtime::Memory`, `.so` payloads via `WasmMeta.so_files`, and sandboxed files via `vfs::VirtualFs`.
+- `runtime::run_wasm(wasm_bytes: &[u8], config: RunConfig) -> Result<RunOutput>` decodes `"elf2wasm_meta"`, initializes `STACK_TOP` with `argc`/`argv`/`envp`/`auxv`, runs `_start` in a slice loop delegating yields to `Scheduler::on_yield` (cooperative thread switching + virtual-time fast-forward), and returns `RunOutput { exit_code: i32, stdout: Vec<u8>, stderr: Vec<u8> }`.
+- `syscalls::handle_syscall(ctx: &mut dyn GuestContext, state: &mut HostState, nr, a0..a5) -> i64` accesses guest linear memory and CPU state via `GuestContext`, `.so` payloads and RW overlay via `vfs::VirtualFs`, and virtual time / threads via `scheduler::Scheduler`.
