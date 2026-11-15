@@ -1,0 +1,12 @@
+[package]
+name = "elf2wasm-runtime-core"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["std-fs"]
+std-fs = ["elf2wasm-core/std-fs"]
+
+[dependencies]
+anyhow = "1.0"
+elf2wasm-core = { path = "../elf2wasm-core", default-features = false }

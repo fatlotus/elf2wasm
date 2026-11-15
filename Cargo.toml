@@ -1,5 +1,11 @@
 [workspace]
-members = [".", "crates/elf2wasm-core", "crates/elf2wasm-compiler-wasm"]
+members = [
+    ".",
+    "crates/elf2wasm-core",
+    "crates/elf2wasm-compiler-wasm",
+    "crates/elf2wasm-runtime-core",
+    "crates/elf2wasm-runtime-wasm",
+]
 resolver = "2"
 
 [package]
@@ -9,6 +15,7 @@ edition = "2021"
 
 [dependencies]
 elf2wasm-core = { path = "crates/elf2wasm-core" }
+elf2wasm-runtime-core = { path = "crates/elf2wasm-runtime-core" }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 goblin = "0.9"
