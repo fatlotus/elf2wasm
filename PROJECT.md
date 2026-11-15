@@ -31,19 +31,22 @@
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       └── lib.rs                 # C-ABI alloc, dealloc, compile_bundle (E2WB format)
-│   ├── elf2wasm-runtime-core/         # Pure runtime library (writable VFS, virtual time, scheduler)
+│   ├── elf2wasm-runtime-core/         # Pure runtime library (writable VFS, virtual time, scheduler, multi-process)
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── context.rs             # GuestContext & HostFsProvider traits (StdHostFs / NoopHostFs)
-│   │       ├── vfs.rs                 # Writable in-memory VFS overlay + RO host/so mounts
-│   │       ├── scheduler.rs           # Deterministic virtual time & cooperative thread scheduler
-│   │       ├── syscalls.rs            # Platform-agnostic Linux x86-64 syscall emulator
+│   │       ├── vfs.rs                 # Writable in-memory VFS overlay + RO host/so mounts + PipeBuffer
+│   │       ├── scheduler.rs           # Deterministic virtual time, cooperative thread & multi-proc scheduler
+│   │       ├── syscalls.rs            # Platform-agnostic Linux x86-64 syscall emulator (ProcessState, F10)
 │   │       └── stack.rs               # RunConfig, RunOutput, extract_elf2wasm_meta, guest stack init
 │   └── elf2wasm-runtime-wasm/         # wasm32-unknown-unknown cdylib runtime
 │       ├── Cargo.toml
 │       └── src/
-│           └── lib.rs                 # C-ABI runtime_* exports + env.host_* imports
+│           └── lib.rs                 # C-ABI runtime_* & multi-proc exports + env.host_* / host_vfs_* imports
+├── js/
+│   ├── elf2wasm_shim.mjs              # Zero-dependency ESM JS shim (Node & browser) for compiler/runtime/guest WASM
+│   └── cli.mjs                        # Node CLI wrapper (compile, run)
 ├── src/
 │   ├── main.rs                        # CLI entry point (translate, run)
 │   ├── runtime.rs                     # wasmtime 27 host, WasmtimeGuestContext, slice execution loop
@@ -101,8 +104,18 @@ Every feature from the Survey phase is assigned a milestone below:
 - Output buffer: byte `0` == `0x00` + `.wasm` bytes on success, or `0x01` + UTF-8 error message on failure.
 
 ### `elf2wasm-runtime-wasm` (WASM C-ABI)
-- Imports from `"env"`: `host_mem_size`, `host_read_guest`, `host_write_guest`, `host_zero_guest`, `host_get_global`, `host_set_global`, `host_save_ctx`, `host_load_ctx`.
-- Exports: `alloc`, `dealloc`, `runtime_new`, `runtime_add_vfs_file`, `runtime_read_vfs_file`, `runtime_init_guest_stack`, `runtime_handle_syscall`, `runtime_on_yield`, `runtime_get_stdout`, `runtime_get_stderr`, `runtime_get_exit_code`, `runtime_get_virtual_time_ns`.
+- Imports from `"env"`: `host_mem_size`, `host_read_guest`, `host_write_guest`, `host_zero_guest`, `host_get_global`, `host_set_global`, `host_save_ctx`, `host_load_ctx`, `host_vfs_is_ro_mount`, `host_vfs_stat_ro`, `host_vfs_read_ro`, `host_vfs_list_dir_ro`, `host_vfs_is_virtual_parent`.
+- Exports: `alloc`, `dealloc`, `runtime_new`, `runtime_add_vfs_file`, `runtime_read_vfs_file`, `runtime_init_guest_stack`, `runtime_handle_syscall`, `runtime_on_yield` (`0`=done, `1`=continue, `2`=switch pid, `3`=NeedFork, `4`=NeedExec), `runtime_get_active_pid`, `runtime_get_pending_child_pid`, `runtime_get_pending_scratch_addr`, `runtime_ack_fork`, `runtime_resume_active`, `runtime_get_exec_info`, `runtime_complete_exec`, `runtime_is_exited`, `runtime_get_stdout`, `runtime_get_stderr`, `runtime_get_exit_code`, `runtime_get_virtual_time_ns`.
+
+### `elf2wasm-runtime-core` Multi-Process Support (F10)
+- `ProcessState` & `HostState` manage per-process FD tables, `cwd`, `elf_path`, `so_entries`, `brk_curr`, `mmap_cursor`, and `Scheduler`, alongside shared `PipeBuffer`s (`64 KiB` capacity, reader/writer refcounting across `dup`/`dup2`/`dup3`/`close`/`fork`) and shared writable VFS overlay.
+- F10 syscalls: `fork`, `vfork`, `clone` (process & thread modes), `execve`, `execveat`, `wait4`, `waitid`, `pipe`, `pipe2`, `dup3`, `fcntl` (`F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL`), `poll`, `ppoll`, `select`, `pselect6`, `getpid`, `getppid`, `getpgid`, `setpgid`, `getpgrp`.
+- `HostState::multiproc_enabled` gates `fork`/`vfork`/`execve`/`wait4`/`waitid` (defaults to `false` so native `wasmtime` continues returning `-ENOSYS` for `fork` under `tier5_adversarial`; enabled in `elf2wasm-runtime-wasm::runtime_new`).
+
+### `js/elf2wasm_shim.mjs` & `js/cli.mjs` (F11 ESM JS Shim)
+- Zero-dependency pure ESM module (`Elf2WasmSystem`, `VirtualSystem`, `compileElfToWasm`, `compileBundle`, `runElf`, `compileAndRunInVfs`) compatible with Node.js and browsers via `WebAssembly.instantiate` (lazy dynamic `node:fs`/`node:path` import only when `vfsRo`/`vfsRw` mounts are passed).
+- Handles `NeedFork` (cloning guest `WebAssembly.Instance` memory and exported globals) and `NeedExec` (pure-JS ELF64 `PT_INTERP`/`DT_NEEDED` resolution from VFS, cached `compiler.wasm` compilation, and `runtime_complete_exec`).
+- `js/cli.mjs`: Node CLI wrapper supporting `compile` and `run`.
 
 ### `wasm_emit` ↔ `runtime` / `syscalls` / `vfs`
 - `runtime::run_wasm(wasm_bytes: &[u8], config: RunConfig) -> Result<RunOutput>` decodes `"elf2wasm_meta"`, initializes `STACK_TOP` with `argc`/`argv`/`envp`/`auxv`, runs `_start` in a slice loop delegating yields to `Scheduler::on_yield` (cooperative thread switching + virtual-time fast-forward), and returns `RunOutput { exit_code: i32, stdout: Vec<u8>, stderr: Vec<u8> }`.
