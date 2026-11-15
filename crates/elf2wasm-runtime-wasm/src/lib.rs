@@ -6,10 +6,12 @@
 use core::cell::UnsafeCell;
 use elf2wasm_core::lifter::CTX_SIZE;
 use elf2wasm_core::meta::WasmMeta;
-use elf2wasm_runtime_core::context::GuestContext;
+use elf2wasm_runtime_core::context::{GuestContext, HostFsProvider};
 use elf2wasm_runtime_core::stack::setup_guest_stack_ctx;
-use elf2wasm_runtime_core::syscalls::{handle_syscall, HostState};
-use elf2wasm_runtime_core::vfs::{VirtualFs, EFAULT, EINVAL, ENOMEM};
+use elf2wasm_runtime_core::syscalls::{handle_syscall, HostState, PendingHostAction};
+use elf2wasm_runtime_core::vfs::{
+    path_hash, DirEntry, FileStat, VirtualFs, EFAULT, EINVAL, ENOMEM,
+};
 
 const GLOBAL_ID_FSBASE: u32 = 0;
 const GLOBAL_ID_GSBASE: u32 = 1;
@@ -31,6 +33,113 @@ extern "C" {
     fn host_set_global(id: u32, val: i64);
     fn host_save_ctx(scratch_addr: u32);
     fn host_load_ctx(scratch_addr: u32);
+    fn host_vfs_is_ro_mount(path_ptr: *const u8, path_len: usize) -> i32;
+    fn host_vfs_stat_ro(
+        path_ptr: *const u8,
+        path_len: usize,
+        out_mode_ptr: *mut u32,
+        out_size_ptr: *mut i64,
+    ) -> i32;
+    fn host_vfs_read_ro(path_ptr: *const u8, path_len: usize, out_len_ptr: *mut usize) -> *mut u8;
+    fn host_vfs_list_dir_ro(
+        path_ptr: *const u8,
+        path_len: usize,
+        out_len_ptr: *mut usize,
+    ) -> *mut u8;
+    fn host_vfs_is_virtual_parent(path_ptr: *const u8, path_len: usize) -> i32;
+}
+
+struct WasmHostFs;
+
+impl HostFsProvider for WasmHostFs {
+    fn is_under_ro_mount(&self, norm_path: &str) -> bool {
+        let b = norm_path.as_bytes();
+        unsafe { host_vfs_is_ro_mount(b.as_ptr(), b.len()) != 0 }
+    }
+
+    fn stat_host_ro(&self, norm_path: &str) -> Option<FileStat> {
+        let b = norm_path.as_bytes();
+        let mut mode = 0u32;
+        let mut size = 0i64;
+        let rc = unsafe { host_vfs_stat_ro(b.as_ptr(), b.len(), &mut mode, &mut size) };
+        if rc != 0 {
+            return None;
+        }
+        let is_dir = (mode & 0o170000) == 0o040000;
+        Some(FileStat {
+            st_ino: path_hash(norm_path),
+            st_mode: mode,
+            st_nlink: if is_dir { 2 } else { 1 },
+            st_size: size,
+            mtime_ns: 0,
+        })
+    }
+
+    fn read_host_ro(&self, norm_path: &str) -> Option<Vec<u8>> {
+        let b = norm_path.as_bytes();
+        let mut len = 0usize;
+        let ptr = unsafe { host_vfs_read_ro(b.as_ptr(), b.len(), &mut len) };
+        if ptr.is_null() {
+            return None;
+        }
+        let vec = unsafe { Vec::from_raw_parts(ptr, len, len) };
+        Some(vec)
+    }
+
+    fn list_host_ro_dir(&self, norm_path: &str) -> Option<Vec<DirEntry>> {
+        let b = norm_path.as_bytes();
+        let mut len = 0usize;
+        let ptr = unsafe { host_vfs_list_dir_ro(b.as_ptr(), b.len(), &mut len) };
+        if ptr.is_null() {
+            return None;
+        }
+        let buf = unsafe { Vec::from_raw_parts(ptr, len, len) };
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos + 3 <= buf.len() {
+            let d_type = buf[pos];
+            let name_len = u16::from_le_bytes([buf[pos + 1], buf[pos + 2]]) as usize;
+            pos += 3;
+            if pos + name_len > buf.len() {
+                break;
+            }
+            if let Ok(name) = core::str::from_utf8(&buf[pos..pos + name_len]) {
+                let child = if norm_path == "/" {
+                    format!("/{}", name)
+                } else {
+                    format!("{}/{}", norm_path, name)
+                };
+                out.push(DirEntry {
+                    d_ino: path_hash(&child),
+                    d_type,
+                    name: name.to_string(),
+                });
+            }
+            pos += name_len;
+        }
+        Some(out)
+    }
+
+    fn is_virtual_allowlist_parent(&self, norm_path: &str) -> bool {
+        let b = norm_path.as_bytes();
+        unsafe { host_vfs_is_virtual_parent(b.as_ptr(), b.len()) != 0 }
+    }
+
+    fn host_file_size(&self, host_path: &str) -> Option<u64> {
+        self.stat_host_ro(host_path).map(|s| s.st_size as u64)
+    }
+
+    fn read_inherited_stdin(&mut self, _max_bytes: usize) -> Result<Vec<u8>, i64> {
+        Ok(Vec::new())
+    }
+
+    fn mount_guest_prefixes(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn allowlist_entries(&self) -> Vec<(String, bool)> {
+        Vec::new()
+    }
 }
 
 struct RuntimeSlot(UnsafeCell<Option<HostState>>);
@@ -191,8 +300,9 @@ pub extern "C" fn dealloc(ptr: *mut u8, len: usize) {
 
 #[no_mangle]
 pub extern "C" fn runtime_new() -> i32 {
-    let vfs = VirtualFs::new_in_memory(&[]);
-    let state = HostState::new(vfs);
+    let vfs = VirtualFs::with_provider(&[], Box::new(WasmHostFs));
+    let mut state = HostState::new(vfs);
+    state.multiproc_enabled = true;
     unsafe {
         *RUNTIME.0.get() = Some(state);
     }
@@ -370,6 +480,7 @@ pub extern "C" fn runtime_init_guest_stack(
     };
     let (args, env) = decode_args_and_env(args_bytes, &meta.elf_path);
 
+    state.reset_for_new_run();
     state.vfs.set_so_files(&meta.so_files);
     state.vfs.elf_path = meta.elf_path.clone();
 
@@ -404,18 +515,164 @@ pub extern "C" fn runtime_on_yield() -> i32 {
     let Some(state) = state_mut() else {
         return 0;
     };
-    let exit_flag = unsafe { host_get_global(GLOBAL_ID_EXIT_FLAG) } as i32;
-    if exit_flag != 0 {
+    if state.is_main_exited() {
         return 0;
     }
     let yield_flag = unsafe { host_get_global(GLOBAL_ID_YIELD_FLAG) } as i32;
-    if yield_flag == 0 {
+    let exit_flag = unsafe { host_get_global(GLOBAL_ID_EXIT_FLAG) } as i32;
+    if exit_flag != 0 && state.pending_action.is_none() {
+        return 0;
+    }
+    if yield_flag == 0 && state.pending_action.is_none() {
         return 0;
     }
     let mut ctx = WasmGuestContext;
-    match state.scheduler.on_yield(&mut ctx, yield_flag) {
+    state
+        .on_yield_multiproc(&mut ctx, yield_flag)
+        .unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_get_active_pid() -> i32 {
+    state_ref().map(|s| s.active_pid).unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_get_pending_child_pid() -> i32 {
+    let Some(state) = state_ref() else {
+        return -1;
+    };
+    match state.pending_action {
+        Some(PendingHostAction::Fork { child_pid, .. }) => child_pid,
+        _ => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_get_pending_scratch_addr() -> u32 {
+    let Some(state) = state_ref() else {
+        return 0;
+    };
+    match state.pending_action {
+        Some(PendingHostAction::Fork { scratch_addr, .. }) => scratch_addr,
+        _ => state.scheduler.scratch_addr,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_ack_fork(child_pid: i32) -> i32 {
+    let Some(state) = state_mut() else {
+        return -1;
+    };
+    if state.ack_fork(child_pid) {
+        0
+    } else {
+        -1
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_resume_active() -> i32 {
+    let Some(state) = state_mut() else {
+        return -1;
+    };
+    let mut ctx = WasmGuestContext;
+    match state.resume_active(&mut ctx) {
         Ok(true) => 1,
-        _ => 0,
+        Ok(false) => 0,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_get_exec_info(out_len_ptr: *mut usize) -> *mut u8 {
+    if out_len_ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    let Some(state) = state_ref() else {
+        unsafe { *out_len_ptr = 0 };
+        return core::ptr::null_mut();
+    };
+    let Some(PendingHostAction::Exec {
+        pid,
+        ref path,
+        ref argv,
+        ref envp,
+    }) = state.pending_action
+    else {
+        unsafe { *out_len_ptr = 0 };
+        return core::ptr::null_mut();
+    };
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"E2WE");
+    out.extend_from_slice(&pid.to_le_bytes());
+    let pb = path.as_bytes();
+    out.extend_from_slice(&(pb.len() as u32).to_le_bytes());
+    out.extend_from_slice(pb);
+    out.extend_from_slice(&(argv.len() as u32).to_le_bytes());
+    for a in argv {
+        let ab = a.as_bytes();
+        out.extend_from_slice(&(ab.len() as u32).to_le_bytes());
+        out.extend_from_slice(ab);
+    }
+    out.extend_from_slice(&(envp.len() as u32).to_le_bytes());
+    for e in envp {
+        let eb = e.as_bytes();
+        out.extend_from_slice(&(eb.len() as u32).to_le_bytes());
+        out.extend_from_slice(eb);
+    }
+    out.shrink_to_fit();
+    let len = out.len();
+    let ptr = out.as_mut_ptr();
+    core::mem::forget(out);
+    unsafe { *out_len_ptr = len };
+    ptr
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_complete_exec(
+    pid: i32,
+    meta_ptr: *const u8,
+    meta_len: usize,
+    args_ptr: *const u8,
+    args_len: usize,
+) -> i32 {
+    let Some(state) = state_mut() else {
+        return -1;
+    };
+    if meta_ptr.is_null() || meta_len == 0 {
+        return -1;
+    }
+    let meta_bytes = unsafe { core::slice::from_raw_parts(meta_ptr, meta_len) };
+    let Ok(meta) = WasmMeta::decode(meta_bytes) else {
+        return -2;
+    };
+    let args_bytes = if args_ptr.is_null() || args_len == 0 {
+        &[][..]
+    } else {
+        unsafe { core::slice::from_raw_parts(args_ptr, args_len) }
+    };
+    let (args, env) = decode_args_and_env(args_bytes, &meta.elf_path);
+    let mut ctx = WasmGuestContext;
+    if state
+        .complete_exec(&mut ctx, pid, &meta, &args, &env)
+        .is_err()
+    {
+        return -3;
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_is_exited() -> i32 {
+    let Some(state) = state_ref() else {
+        return 1;
+    };
+    if state.is_main_exited() {
+        1
+    } else {
+        0
     }
 }
 

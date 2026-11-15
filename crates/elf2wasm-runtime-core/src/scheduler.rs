@@ -5,6 +5,7 @@ use elf2wasm_core::lifter::{CTX_SIZE, DEFAULT_QUANTUM};
 use std::collections::{BTreeMap, VecDeque};
 
 pub const MAIN_TID: i32 = 1000;
+pub const MAIN_PID: i32 = 1000;
 pub const INITIAL_REALTIME_BASE_NS: u64 = 1_700_000_000_000_000_000;
 pub const SYSCALL_TIME_STEP_NS: u64 = 100;
 pub const QUANTUM_TIME_STEP_NS: u64 = 1_000;
@@ -17,6 +18,56 @@ pub const CTX_OFF_FSBASE: usize = 136;
 pub const CTX_OFF_GSBASE: usize = 144;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollFdSpec {
+    pub fd: i32,
+    pub events: i16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollKind {
+    Poll {
+        fds_addr: u64,
+        fds: Vec<PollFdSpec>,
+    },
+    Select {
+        nfds: i32,
+        readfds_addr: u64,
+        writefds_addr: u64,
+        exceptfds_addr: u64,
+        orig_read_mask: Vec<u8>,
+        orig_write_mask: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingWakeup {
+    PipeRead {
+        pipe_id: u64,
+        buf_addr: u64,
+        count: usize,
+    },
+    PipeWrite {
+        pipe_id: u64,
+        data: Vec<u8>,
+        written: usize,
+    },
+    Wait4 {
+        target_pid: i32,
+        wstatus_addr: u64,
+        options: i32,
+        rusage_addr: u64,
+    },
+    Poll {
+        kind: PollKind,
+        timed_out: bool,
+    },
+    SetChildTid {
+        addr: u64,
+        tid: i32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadState {
     Runnable,
     Sleeping {
@@ -25,6 +76,29 @@ pub enum ThreadState {
     FutexWait {
         uaddr: u32,
         bitset: u32,
+        wake_ns: Option<u64>,
+    },
+    PipeReadWait {
+        pipe_id: u64,
+        buf_addr: u64,
+        count: usize,
+    },
+    PipeWriteWait {
+        pipe_id: u64,
+        data: Vec<u8>,
+        written: usize,
+    },
+    VforkWait {
+        child_pid: i32,
+    },
+    Wait4Wait {
+        target_pid: i32,
+        wstatus_addr: u64,
+        options: i32,
+        rusage_addr: u64,
+    },
+    PollWait {
+        kind: PollKind,
         wake_ns: Option<u64>,
     },
     Exited,
@@ -37,6 +111,7 @@ pub struct ThreadContext {
     pub regs: [u8; CTX_SIZE],
     pub clear_child_tid: u32,
     pub robust_list_head: u32,
+    pub pending_wakeup: Option<PendingWakeup>,
 }
 
 impl ThreadContext {
@@ -47,6 +122,7 @@ impl ThreadContext {
             regs: [0u8; CTX_SIZE],
             clear_child_tid: 0,
             robust_list_head: 0,
+            pending_wakeup: None,
         }
     }
 
@@ -93,16 +169,87 @@ impl Default for Scheduler {
 
 impl Scheduler {
     pub fn new() -> Self {
+        Self::new_with_tid(MAIN_TID, 0, INITIAL_REALTIME_BASE_NS)
+    }
+
+    pub fn new_with_tid(tid: i32, virtual_mono_ns: u64, realtime_base_ns: u64) -> Self {
         let mut threads = BTreeMap::new();
-        threads.insert(MAIN_TID, ThreadContext::new(MAIN_TID));
+        threads.insert(tid, ThreadContext::new(tid));
         Self {
             threads,
-            current_tid: MAIN_TID,
-            next_tid: MAIN_TID + 1,
+            current_tid: tid,
+            next_tid: tid + 1,
             run_queue: VecDeque::new(),
-            virtual_mono_ns: 0,
-            realtime_base_ns: INITIAL_REALTIME_BASE_NS,
+            virtual_mono_ns,
+            realtime_base_ns,
             scratch_addr: MMAP_ALLOC_END,
+        }
+    }
+
+    pub fn pop_next_runnable(&mut self) -> Option<i32> {
+        while let Some(tid) = self.run_queue.pop_front() {
+            if self
+                .threads
+                .get(&tid)
+                .map_or(false, |t| t.state == ThreadState::Runnable)
+            {
+                return Some(tid);
+            }
+        }
+        None
+    }
+
+    pub fn min_wake_ns(&self) -> Option<u64> {
+        self.threads
+            .values()
+            .filter_map(|t| match t.state {
+                ThreadState::Sleeping { wake_ns } => Some(wake_ns),
+                ThreadState::FutexWait {
+                    wake_ns: Some(wake_ns),
+                    ..
+                } => Some(wake_ns),
+                ThreadState::PollWait {
+                    wake_ns: Some(wake_ns),
+                    ..
+                } => Some(wake_ns),
+                _ => None,
+            })
+            .min()
+    }
+
+    pub fn wake_timed_waiters(&mut self, now_ns: u64) {
+        self.virtual_mono_ns = now_ns;
+        let tids: Vec<i32> = self.threads.keys().copied().collect();
+        for tid in tids {
+            if let Some(t) = self.threads.get_mut(&tid) {
+                match t.state.clone() {
+                    ThreadState::Sleeping { wake_ns } if wake_ns <= now_ns => {
+                        t.state = ThreadState::Runnable;
+                        t.set_rax(0);
+                        self.run_queue.push_back(tid);
+                    }
+                    ThreadState::FutexWait {
+                        wake_ns: Some(wake_ns),
+                        ..
+                    } if wake_ns <= now_ns => {
+                        t.state = ThreadState::Runnable;
+                        t.set_rax(-ETIMEDOUT);
+                        self.run_queue.push_back(tid);
+                    }
+                    ThreadState::PollWait {
+                        kind,
+                        wake_ns: Some(wake_ns),
+                    } if wake_ns <= now_ns => {
+                        t.state = ThreadState::Runnable;
+                        t.pending_wakeup = Some(PendingWakeup::Poll {
+                            kind,
+                            timed_out: true,
+                        });
+                        self.run_queue.push_back(tid);
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 

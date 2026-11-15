@@ -1,6 +1,6 @@
 use crate::context::{HostFsProvider, NoopHostFs};
 use elf2wasm_core::meta::MetaSoFile;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 #[cfg(feature = "std-fs")]
@@ -9,8 +9,10 @@ use crate::context::StdHostFs;
 use std::path::PathBuf;
 
 pub const ENOENT: i64 = 2;
+pub const ESRCH: i64 = 3;
 pub const EIO: i64 = 5;
 pub const EBADF: i64 = 9;
+pub const ECHILD: i64 = 10;
 pub const EAGAIN: i64 = 11;
 pub const ENOMEM: i64 = 12;
 pub const EACCES: i64 = 13;
@@ -25,12 +27,14 @@ pub const EMFILE: i64 = 24;
 pub const ENOTTY: i64 = 25;
 pub const ESPIPE: i64 = 29;
 pub const EROFS: i64 = 30;
+pub const EPIPE: i64 = 32;
 pub const ERANGE: i64 = 34;
 pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
 pub const ETIMEDOUT: i64 = 110;
 
 pub const MAX_FDS: i32 = 4096;
+pub const PIPE_CAPACITY: usize = 65536;
 
 pub const AT_FDCWD: i32 = -100;
 pub const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
@@ -45,7 +49,9 @@ pub const O_CREAT: i32 = 0x40;
 pub const O_EXCL: i32 = 0x80;
 pub const O_TRUNC: i32 = 0x200;
 pub const O_APPEND: i32 = 0x400;
+pub const O_NONBLOCK: i32 = 0x800;
 pub const O_DIRECTORY: i32 = 0x10000;
+pub const O_CLOEXEC: i32 = 0x80000;
 
 pub const S_IFLNK: u32 = 0o120000;
 pub const S_IFREG: u32 = 0o100000;
@@ -104,6 +110,25 @@ pub enum OverlayNode {
 }
 
 #[derive(Debug, Clone)]
+pub struct PipeBuffer {
+    pub buf: VecDeque<u8>,
+    pub readers: usize,
+    pub writers: usize,
+    pub capacity: usize,
+}
+
+impl PipeBuffer {
+    pub fn new() -> Self {
+        Self {
+            buf: VecDeque::new(),
+            readers: 1,
+            writers: 1,
+            capacity: PIPE_CAPACITY,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct OpenFile {
     pub data: Arc<Vec<u8>>,
     pub cursor: usize,
@@ -113,8 +138,11 @@ pub struct OpenFile {
     pub is_dir: bool,
     pub is_std: Option<u8>,
     pub is_pipe: bool,
+    pub pipe_id: Option<u64>,
     pub writable: bool,
     pub append: bool,
+    pub cloexec: bool,
+    pub nonblock: bool,
     pub dir_entries: Vec<DirEntry>,
 }
 
@@ -156,11 +184,13 @@ pub fn path_hash(s: &str) -> u64 {
 }
 
 pub struct VirtualFs {
-    so_entries: Vec<SoEntry>,
+    pub so_entries: Vec<SoEntry>,
     host_fs: Box<dyn HostFsProvider>,
     overlay: BTreeMap<String, OverlayNode>,
-    fds: BTreeMap<i32, OpenFile>,
-    next_fd: i32,
+    pub fds: BTreeMap<i32, OpenFile>,
+    pub next_fd: i32,
+    pub pipes: BTreeMap<u64, PipeBuffer>,
+    pub next_pipe_id: u64,
     pub cwd: String,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -227,8 +257,11 @@ impl VirtualFs {
                 is_dir: false,
                 is_std: Some(0),
                 is_pipe: false,
+                pipe_id: None,
                 writable: false,
                 append: false,
+                cloexec: false,
+                nonblock: false,
                 dir_entries: Vec::new(),
             },
         );
@@ -243,8 +276,11 @@ impl VirtualFs {
                 is_dir: false,
                 is_std: Some(1),
                 is_pipe: false,
+                pipe_id: None,
                 writable: true,
                 append: false,
+                cloexec: false,
+                nonblock: false,
                 dir_entries: Vec::new(),
             },
         );
@@ -259,8 +295,11 @@ impl VirtualFs {
                 is_dir: false,
                 is_std: Some(2),
                 is_pipe: false,
+                pipe_id: None,
                 writable: true,
                 append: false,
+                cloexec: false,
+                nonblock: false,
                 dir_entries: Vec::new(),
             },
         );
@@ -271,6 +310,8 @@ impl VirtualFs {
             overlay,
             fds,
             next_fd: 3,
+            pipes: BTreeMap::new(),
+            next_pipe_id: 1,
             cwd: "/".to_string(),
             stdout: Vec::new(),
             stderr: Vec::new(),
@@ -279,6 +320,47 @@ impl VirtualFs {
             inherit_stdin: false,
             elf_path: String::new(),
         }
+    }
+
+    pub fn stdin_cursor_val(&self) -> usize {
+        self.stdin_cursor
+    }
+
+    pub fn reset_fds_and_stdio(&mut self) {
+        self.pipes.clear();
+        self.next_pipe_id = 1;
+        self.fds.clear();
+        let empty = Arc::new(Vec::new());
+        for (fd, path, writable) in [
+            (0, "/dev/stdin", false),
+            (1, "/dev/stdout", true),
+            (2, "/dev/stderr", true),
+        ] {
+            self.fds.insert(
+                fd,
+                OpenFile {
+                    data: Arc::clone(&empty),
+                    cursor: 0,
+                    so_index: None,
+                    so_base_addr: None,
+                    guest_path: path.to_string(),
+                    is_dir: false,
+                    is_std: Some(fd as u8),
+                    is_pipe: false,
+                    pipe_id: None,
+                    writable,
+                    append: false,
+                    cloexec: false,
+                    nonblock: false,
+                    dir_entries: Vec::new(),
+                },
+            );
+        }
+        self.next_fd = 3;
+        self.cwd = "/".to_string();
+        self.stdout.clear();
+        self.stderr.clear();
+        self.stdin_cursor = 0;
     }
 
     pub fn set_so_files(&mut self, so_files: &[MetaSoFile]) {
@@ -571,6 +653,8 @@ impl VirtualFs {
                 Ok(fd) => fd,
                 Err(e) => return e,
             };
+            let cloexec = (flags & O_CLOEXEC) != 0;
+            let nonblock = (flags & O_NONBLOCK) != 0;
             self.fds.insert(
                 fd,
                 OpenFile {
@@ -582,8 +666,11 @@ impl VirtualFs {
                     is_dir: false,
                     is_std: None,
                     is_pipe: false,
+                    pipe_id: None,
                     writable: false,
                     append: false,
+                    cloexec,
+                    nonblock,
                     dir_entries: Vec::new(),
                 },
             );
@@ -609,6 +696,8 @@ impl VirtualFs {
                         Ok(fd) => fd,
                         Err(e) => return e,
                     };
+                    let cloexec = (flags & O_CLOEXEC) != 0;
+                    let nonblock = (flags & O_NONBLOCK) != 0;
                     self.fds.insert(
                         fd,
                         OpenFile {
@@ -620,8 +709,11 @@ impl VirtualFs {
                             is_dir: true,
                             is_std: None,
                             is_pipe: false,
+                            pipe_id: None,
                             writable: false,
                             append: false,
+                            cloexec,
+                            nonblock,
                             dir_entries,
                         },
                     );
@@ -655,6 +747,8 @@ impl VirtualFs {
                         Ok(fd) => fd,
                         Err(e) => return e,
                     };
+                    let cloexec = (flags & O_CLOEXEC) != 0;
+                    let nonblock = (flags & O_NONBLOCK) != 0;
                     self.fds.insert(
                         fd,
                         OpenFile {
@@ -666,8 +760,11 @@ impl VirtualFs {
                             is_dir: false,
                             is_std: None,
                             is_pipe: false,
+                            pipe_id: None,
                             writable,
                             append,
+                            cloexec,
+                            nonblock,
                             dir_entries: Vec::new(),
                         },
                     );
@@ -690,6 +787,8 @@ impl VirtualFs {
                     Ok(fd) => fd,
                     Err(e) => return e,
                 };
+                let cloexec = (flags & O_CLOEXEC) != 0;
+                let nonblock = (flags & O_NONBLOCK) != 0;
                 self.fds.insert(
                     fd,
                     OpenFile {
@@ -701,8 +800,11 @@ impl VirtualFs {
                         is_dir: true,
                         is_std: None,
                         is_pipe: false,
+                        pipe_id: None,
                         writable: false,
                         append: false,
+                        cloexec,
+                        nonblock,
                         dir_entries,
                     },
                 );
@@ -723,6 +825,8 @@ impl VirtualFs {
                         Ok(fd) => fd,
                         Err(e) => return e,
                     };
+                    let cloexec = (flags & O_CLOEXEC) != 0;
+                    let nonblock = (flags & O_NONBLOCK) != 0;
                     self.fds.insert(
                         fd,
                         OpenFile {
@@ -734,8 +838,11 @@ impl VirtualFs {
                             is_dir: false,
                             is_std: None,
                             is_pipe: false,
+                            pipe_id: None,
                             writable: false,
                             append: false,
+                            cloexec,
+                            nonblock,
                             dir_entries: Vec::new(),
                         },
                     );
@@ -758,6 +865,8 @@ impl VirtualFs {
                 Ok(fd) => fd,
                 Err(e) => return e,
             };
+            let cloexec = (flags & O_CLOEXEC) != 0;
+            let nonblock = (flags & O_NONBLOCK) != 0;
             self.fds.insert(
                 fd,
                 OpenFile {
@@ -769,8 +878,11 @@ impl VirtualFs {
                     is_dir: true,
                     is_std: None,
                     is_pipe: false,
+                    pipe_id: None,
                     writable: false,
                     append: false,
+                    cloexec,
+                    nonblock,
                     dir_entries,
                 },
             );
@@ -801,6 +913,8 @@ impl VirtualFs {
             };
             let writable = acc == O_WRONLY || acc == O_RDWR;
             let append = (flags & O_APPEND) != 0;
+            let cloexec = (flags & O_CLOEXEC) != 0;
+            let nonblock = (flags & O_NONBLOCK) != 0;
             self.fds.insert(
                 fd,
                 OpenFile {
@@ -812,8 +926,11 @@ impl VirtualFs {
                     is_dir: false,
                     is_std: None,
                     is_pipe: false,
+                    pipe_id: None,
                     writable,
                     append,
+                    cloexec,
+                    nonblock,
                     dir_entries: Vec::new(),
                 },
             );
@@ -824,15 +941,76 @@ impl VirtualFs {
     }
 
     pub fn close(&mut self, fd: i32) -> i64 {
-        if self.fds.remove(&fd).is_some() {
-            0
-        } else {
-            -EBADF
+        let Some(file) = self.fds.remove(&fd) else {
+            return -EBADF;
+        };
+        self.dec_pipe_ref(&file);
+        0
+    }
+
+    fn inc_pipe_ref(&mut self, file: &OpenFile) {
+        if let Some(pid) = file.pipe_id {
+            if let Some(p) = self.pipes.get_mut(&pid) {
+                if file.writable {
+                    p.writers += 1;
+                } else {
+                    p.readers += 1;
+                }
+            }
+        }
+    }
+
+    fn dec_pipe_ref(&mut self, file: &OpenFile) {
+        if let Some(pid) = file.pipe_id {
+            let mut remove_pipe = false;
+            if let Some(p) = self.pipes.get_mut(&pid) {
+                if file.writable {
+                    p.writers = p.writers.saturating_sub(1);
+                } else {
+                    p.readers = p.readers.saturating_sub(1);
+                }
+                if p.readers == 0 && p.writers == 0 {
+                    remove_pipe = true;
+                }
+            }
+            if remove_pipe {
+                self.pipes.remove(&pid);
+            }
+        }
+    }
+
+    pub fn clone_fds_for_fork(&mut self) -> BTreeMap<i32, OpenFile> {
+        let cloned: BTreeMap<i32, OpenFile> = self.fds.clone();
+        for file in cloned.values() {
+            self.inc_pipe_ref(file);
+        }
+        cloned
+    }
+
+    pub fn close_cloexec_fds(&mut self) {
+        let cloexec_fds: Vec<i32> = self
+            .fds
+            .iter()
+            .filter_map(|(&fd, f)| if f.cloexec { Some(fd) } else { None })
+            .collect();
+        for fd in cloexec_fds {
+            self.close(fd);
+        }
+    }
+
+    pub fn close_all_fds(&mut self) {
+        let all_fds: Vec<i32> = self.fds.keys().copied().collect();
+        for fd in all_fds {
+            self.close(fd);
         }
     }
 
     pub fn get_fd(&self, fd: i32) -> Option<&OpenFile> {
         self.fds.get(&fd)
+    }
+
+    pub fn get_fd_mut(&mut self, fd: i32) -> Option<&mut OpenFile> {
+        self.fds.get_mut(&fd)
     }
 
     fn current_file_data<'a>(&'a self, file: &'a OpenFile) -> &'a [u8] {
@@ -1234,13 +1412,15 @@ impl VirtualFs {
     }
 
     pub fn dup(&mut self, oldfd: i32) -> i64 {
-        let Some(file) = self.fds.get(&oldfd).cloned() else {
+        let Some(mut file) = self.fds.get(&oldfd).cloned() else {
             return -EBADF;
         };
+        file.cloexec = false;
         let newfd = match self.alloc_fd() {
             Ok(fd) => fd,
             Err(e) => return e,
         };
+        self.inc_pipe_ref(&file);
         self.fds.insert(newfd, file);
         newfd as i64
     }
@@ -1249,12 +1429,17 @@ impl VirtualFs {
         if newfd < 0 || newfd >= MAX_FDS {
             return -EBADF;
         }
-        let Some(file) = self.fds.get(&oldfd).cloned() else {
+        let Some(mut file) = self.fds.get(&oldfd).cloned() else {
             return -EBADF;
         };
         if oldfd == newfd {
             return newfd as i64;
         }
+        if self.fds.contains_key(&newfd) {
+            self.close(newfd);
+        }
+        file.cloexec = false;
+        self.inc_pipe_ref(&file);
         self.fds.insert(newfd, file);
         if newfd >= self.next_fd {
             self.next_fd = newfd + 1;
@@ -1262,11 +1447,36 @@ impl VirtualFs {
         newfd as i64
     }
 
-    pub fn dup_from(&mut self, oldfd: i32, min_fd: i32) -> i64 {
+    pub fn dup3(&mut self, oldfd: i32, newfd: i32, flags: i32) -> i64 {
+        if (flags & !O_CLOEXEC) != 0 {
+            return -EINVAL;
+        }
+        if oldfd == newfd {
+            return -EINVAL;
+        }
+        if newfd < 0 || newfd >= MAX_FDS {
+            return -EBADF;
+        }
+        let Some(mut file) = self.fds.get(&oldfd).cloned() else {
+            return -EBADF;
+        };
+        if self.fds.contains_key(&newfd) {
+            self.close(newfd);
+        }
+        file.cloexec = (flags & O_CLOEXEC) != 0;
+        self.inc_pipe_ref(&file);
+        self.fds.insert(newfd, file);
+        if newfd >= self.next_fd {
+            self.next_fd = newfd + 1;
+        }
+        newfd as i64
+    }
+
+    pub fn dup_from(&mut self, oldfd: i32, min_fd: i32, cloexec: bool) -> i64 {
         if min_fd < 0 || min_fd >= MAX_FDS {
             return -EINVAL;
         }
-        let Some(file) = self.fds.get(&oldfd).cloned() else {
+        let Some(mut file) = self.fds.get(&oldfd).cloned() else {
             return -EBADF;
         };
         let mut fd = min_fd;
@@ -1276,6 +1486,8 @@ impl VirtualFs {
                 return -EMFILE;
             }
         }
+        file.cloexec = cloexec;
+        self.inc_pipe_ref(&file);
         self.fds.insert(fd, file);
         if fd >= self.next_fd {
             self.next_fd = fd + 1;
@@ -1284,6 +1496,19 @@ impl VirtualFs {
     }
 
     pub fn create_pipe(&mut self) -> Result<(i32, i32), i64> {
+        self.create_pipe_with_flags(0)
+    }
+
+    pub fn create_pipe_with_flags(&mut self, flags: i32) -> Result<(i32, i32), i64> {
+        if (flags & !(O_CLOEXEC | O_NONBLOCK)) != 0 {
+            return Err(-EINVAL);
+        }
+        let cloexec = (flags & O_CLOEXEC) != 0;
+        let nonblock = (flags & O_NONBLOCK) != 0;
+
+        let pipe_id = self.next_pipe_id;
+        self.next_pipe_id += 1;
+
         let rfd = self.alloc_fd()?;
         let empty = Arc::new(Vec::new());
         self.fds.insert(
@@ -1293,12 +1518,15 @@ impl VirtualFs {
                 cursor: 0,
                 so_index: None,
                 so_base_addr: None,
-                guest_path: "pipe:[0]".to_string(),
+                guest_path: format!("pipe:[{}]", pipe_id),
                 is_dir: false,
                 is_std: None,
                 is_pipe: true,
+                pipe_id: Some(pipe_id),
                 writable: false,
                 append: false,
+                cloexec,
+                nonblock,
                 dir_entries: Vec::new(),
             },
         );
@@ -1316,15 +1544,19 @@ impl VirtualFs {
                 cursor: 0,
                 so_index: None,
                 so_base_addr: None,
-                guest_path: "pipe:[1]".to_string(),
+                guest_path: format!("pipe:[{}]", pipe_id),
                 is_dir: false,
                 is_std: None,
                 is_pipe: true,
+                pipe_id: Some(pipe_id),
                 writable: true,
                 append: false,
+                cloexec,
+                nonblock,
                 dir_entries: Vec::new(),
             },
         );
+        self.pipes.insert(pipe_id, PipeBuffer::new());
         Ok((rfd, wfd))
     }
 
