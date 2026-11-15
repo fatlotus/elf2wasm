@@ -108,7 +108,7 @@ fn is_near_branch(instr: &Instruction) -> bool {
 /// Split an existing block at `split_va` (which must be a valid instruction boundary
 /// strictly inside `(owner_va, owner_block.end_va)`).
 fn split_block(
-    blocks: &mut BTreeMap<u32, DecodedBlock>,
+    blocks: &mut FastHashMap<u32, DecodedBlock>,
     instr_to_block: &mut FastHashMap<u32, u32>,
     owner_va: u32,
     split_va: u32,
@@ -178,35 +178,77 @@ fn is_non_stack_mem_write(instr: &Instruction) -> bool {
 }
 
 fn split_mem_read_write_blocks(
-    blocks: &mut BTreeMap<u32, DecodedBlock>,
+    blocks: FastHashMap<u32, DecodedBlock>,
     instr_to_block: &mut FastHashMap<u32, u32>,
-) {
-    let mut splits: Vec<(u32, u32)> = Vec::new();
-    for (&start_va, block) in blocks.iter() {
-        let mut cur_owner = start_va;
+) -> BTreeMap<u32, DecodedBlock> {
+    let mut sorted: Vec<(u32, DecodedBlock)> = blocks.into_iter().collect();
+    sorted.sort_unstable_by_key(|(va, _)| *va);
+
+    let mut out: Vec<(u32, DecodedBlock)> = Vec::with_capacity(sorted.len() + sorted.len() / 16);
+    for (start_va, mut block) in sorted {
+        let mut split_indices: Vec<usize> = Vec::new();
         let mut seen_read = false;
         for (idx, instr) in block.instructions.iter().enumerate() {
             let write = is_non_stack_mem_write(instr);
             if write && seen_read && idx > 0 {
-                let split_va = instr.ip() as u32;
-                splits.push((cur_owner, split_va));
-                cur_owner = split_va;
+                split_indices.push(idx);
                 seen_read = false;
             }
             if is_non_stack_mem_read(instr) {
                 seen_read = true;
             }
         }
+        if split_indices.is_empty() {
+            out.push((start_va, block));
+            continue;
+        }
+
+        let orig_end_va = block.end_va;
+        let orig_succs = std::mem::take(&mut block.succs);
+        let orig_term = block.terminator;
+
+        let mut tail_blocks: Vec<(u32, DecodedBlock)> = Vec::with_capacity(split_indices.len());
+        let mut cur_end_va = orig_end_va;
+        let mut cur_succs = orig_succs;
+        let mut cur_term = orig_term;
+
+        for &idx in split_indices.iter().rev() {
+            let tail_instrs = block.instructions.split_off(idx);
+            let split_va = tail_instrs[0].ip() as u32;
+            for instr in &tail_instrs {
+                instr_to_block.insert(instr.ip() as u32, split_va);
+            }
+            tail_blocks.push((
+                split_va,
+                DecodedBlock {
+                    start_va: split_va,
+                    end_va: cur_end_va,
+                    instructions: tail_instrs,
+                    succs: cur_succs,
+                    terminator: cur_term,
+                },
+            ));
+            cur_end_va = split_va;
+            cur_succs = vec![split_va];
+            cur_term = BlockTerminator::Fallthrough(split_va);
+        }
+
+        block.end_va = cur_end_va;
+        block.succs = cur_succs;
+        block.terminator = cur_term;
+        out.push((start_va, block));
+        for tb in tail_blocks.into_iter().rev() {
+            out.push(tb);
+        }
     }
-    for (owner_va, split_va) in splits {
-        split_block(blocks, instr_to_block, owner_va, split_va);
-    }
+
+    out.into_iter().collect()
 }
 
 fn decode_single_block_recursive(
     seg: &ExecSegment,
     start_va: u32,
-    blocks: &mut BTreeMap<u32, DecodedBlock>,
+    _blocks: &mut FastHashMap<u32, DecodedBlock>,
     instr_to_block: &mut FastHashMap<u32, u32>,
     worklist: &mut VecDeque<u32>,
     queued: &mut FastHashSet<u32>,
@@ -227,7 +269,10 @@ fn decode_single_block_recursive(
             function_entries.insert(va);
         }
         #[cfg(not(test))]
-        let _ = is_func;
+        {
+            let _ = is_func;
+            let _ = &function_entries;
+        }
         if queued.insert(va) {
             worklist.push_back(va);
         }
@@ -357,7 +402,7 @@ fn decode_single_block_recursive(
         instr_to_block.insert(instr.ip() as u32, start_va);
     }
 
-    blocks.insert(
+    _blocks.insert(
         start_va,
         DecodedBlock {
             start_va,
@@ -373,7 +418,7 @@ fn linear_sweep_gap(
     seg: &ExecSegment,
     gap_start: u32,
     gap_end: u32,
-    blocks: &mut BTreeMap<u32, DecodedBlock>,
+    blocks: &mut FastHashMap<u32, DecodedBlock>,
     instr_to_block: &mut FastHashMap<u32, u32>,
 ) {
     let mut pos_va = gap_start;
@@ -562,7 +607,8 @@ fn linear_sweep_gap(
 
 pub fn discover_code(image: &LoadedImage) -> Result<DecodedProgram> {
     let total_exec_bytes: usize = image.exec_segments.iter().map(|s| s.data.len()).sum();
-    let mut blocks: BTreeMap<u32, DecodedBlock> = BTreeMap::new();
+    let mut blocks: FastHashMap<u32, DecodedBlock> =
+        FastHashMap::with_capacity_and_hasher(total_exec_bytes / 12, Default::default());
     let mut instr_to_block: FastHashMap<u32, u32> =
         FastHashMap::with_capacity_and_hasher(total_exec_bytes / 3, Default::default());
     let mut worklist: VecDeque<u32> = VecDeque::with_capacity(total_exec_bytes / 16);
@@ -663,10 +709,12 @@ pub fn discover_code(image: &LoadedImage) -> Result<DecodedProgram> {
         let seg_start = seg.vaddr;
         let seg_end = seg.vaddr.saturating_add(seg.data.len() as u32);
 
-        let covered_ranges: Vec<(u32, u32)> = blocks
-            .range(seg_start..seg_end)
-            .map(|(&s, b)| (s, b.end_va.min(seg_end)))
+        let mut covered_ranges: Vec<(u32, u32)> = blocks
+            .values()
+            .filter(|b| b.start_va >= seg_start && b.start_va < seg_end)
+            .map(|b| (b.start_va, b.end_va.min(seg_end)))
             .collect();
+        covered_ranges.sort_unstable_by_key(|&(s, _)| s);
 
         let mut cursor = seg_start;
         for (cov_start, cov_end) in covered_ranges {
@@ -708,7 +756,7 @@ pub fn discover_code(image: &LoadedImage) -> Result<DecodedProgram> {
         }
     }
 
-    split_mem_read_write_blocks(&mut blocks, &mut instr_to_block);
+    let blocks = split_mem_read_write_blocks(blocks, &mut instr_to_block);
 
     // 3. Build functions map (only used by decoder unit tests).
     #[allow(unused_mut)]
