@@ -117,6 +117,7 @@ const SYS_RSEQ: i64 = 334;
 const SYS_CLONE3: i64 = 435;
 const SYS_FACCESSAT2: i64 = 439;
 
+const PROT_EXEC: i32 = 0x4;
 const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_FIXED_NOREPLACE: i32 = 0x100000;
@@ -1592,6 +1593,7 @@ fn handle_syscall_inner(
         SYS_MMAP => {
             let addr = a0 as u64;
             let len_u64 = a1 as u64;
+            let prot = a2 as i32;
             let flags = a3 as i32;
             let fd = a4 as i32;
             let offset_u64 = a5 as u64;
@@ -1658,6 +1660,9 @@ fn handle_syscall_inner(
                 None => return -EBADF,
             };
             if is_dir || is_std_or_pipe {
+                return -EACCES;
+            }
+            if (prot & PROT_EXEC) != 0 && so_base.is_none() {
                 return -EACCES;
             }
             let Ok(offset) = usize::try_from(offset_u64) else {

@@ -677,10 +677,6 @@ impl VirtualFs {
             return fd as i64;
         }
 
-        if self.is_untranslated_so(&norm_path) {
-            return -ENOENT;
-        }
-
         // Check overlay first
         if let Some(node) = self.overlay.get(&norm_path).cloned() {
             match node {
@@ -1036,7 +1032,10 @@ impl VirtualFs {
                     let out = self.host_fs.read_inherited_stdin(count)?;
                     return Ok((out, true));
                 }
-                let avail = self.stdin_data.len().saturating_sub(self.stdin_cursor);
+                if self.stdin_cursor >= self.stdin_data.len() {
+                    return Ok((Vec::new(), false));
+                }
+                let avail = self.stdin_data.len() - self.stdin_cursor;
                 let n = avail.min(count);
                 let out = self.stdin_data[self.stdin_cursor..self.stdin_cursor + n].to_vec();
                 return Ok((out, false));
@@ -1047,7 +1046,10 @@ impl VirtualFs {
             return Err(-EISDIR);
         }
         let data = self.current_file_data(file);
-        let avail = data.len().saturating_sub(file.cursor);
+        if file.cursor >= data.len() {
+            return Ok((Vec::new(), false));
+        }
+        let avail = data.len() - file.cursor;
         let n = avail.min(count);
         let out = data[file.cursor..file.cursor + n].to_vec();
         Ok((out, false))
@@ -1318,9 +1320,6 @@ impl VirtualFs {
                 st_size: so.bytes.len() as i64,
                 mtime_ns: 0,
             });
-        }
-        if self.is_untranslated_so(&norm_path) {
-            return Err(-ENOENT);
         }
         if let Some(node) = self.overlay.get(&norm_path) {
             return match node {

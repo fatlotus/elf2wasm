@@ -464,10 +464,67 @@ impl<'a> GuestContext for StoreCtx<'a> {
     }
 }
 
+pub fn create_engine() -> Result<Engine> {
+    let mut engine_config = wasmtime::Config::new();
+    engine_config.cranelift_opt_level(wasmtime::OptLevel::None);
+    Engine::new(&engine_config)
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+fn cwasm_cache_path(wasm_bytes: &[u8]) -> std::path::PathBuf {
+    let hash = fnv1a_64(wasm_bytes);
+    std::env::temp_dir()
+        .join("elf2wasm_cwasm_cache")
+        .join(format!("{:016x}_{}.cwasm", hash, wasm_bytes.len()))
+}
+
+pub fn prewarm_cwasm_cache(wasm_bytes: &[u8]) -> Result<()> {
+    let cache_path = cwasm_cache_path(wasm_bytes);
+    if cache_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let engine = create_engine()?;
+    let module = Module::new(&engine, wasm_bytes)?;
+    let serialized = module.serialize()?;
+    let tmp_path = cache_path.with_extension("cwasm.tmp");
+    std::fs::write(&tmp_path, &serialized)?;
+    std::fs::rename(&tmp_path, &cache_path)?;
+    Ok(())
+}
+
 pub fn run_wasm(wasm_bytes: &[u8], config: RunConfig) -> Result<RunOutput> {
     let meta = extract_elf2wasm_meta(wasm_bytes)?;
-    let engine = Engine::default();
-    let module = Module::new(&engine, wasm_bytes)?;
+    let engine = create_engine()?;
+    let cache_path = cwasm_cache_path(wasm_bytes);
+    let module = if cache_path.exists() {
+        match unsafe { Module::deserialize_file(&engine, &cache_path) } {
+            Ok(m) => m,
+            Err(_) => Module::new(&engine, wasm_bytes)?,
+        }
+    } else {
+        let m = Module::new(&engine, wasm_bytes)?;
+        if let Some(parent) = cache_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(serialized) = m.serialize() {
+            let tmp_path = cache_path.with_extension("cwasm.tmp");
+            if std::fs::write(&tmp_path, &serialized).is_ok() {
+                let _ = std::fs::rename(&tmp_path, &cache_path);
+            }
+        }
+        m
+    };
     let trace = std::env::var_os("ELF2WASM_TRACE").is_some();
 
     let mut linker: Linker<Option<HostState>> = Linker::new(&engine);

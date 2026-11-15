@@ -74,6 +74,7 @@ fn run_cli() -> Result<i32> {
             let wasm_bytes = wasm_emit::emit_wasm(&image, &prog)?;
             fs::write(&output, &wasm_bytes)
                 .with_context(|| format!("Failed to write {}", output.display()))?;
+            let _ = runtime::prewarm_cwasm_cache(&wasm_bytes);
             Ok(0)
         }
         Commands::Run { wasm, vfs_ro, args } => {

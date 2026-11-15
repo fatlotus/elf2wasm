@@ -199,9 +199,16 @@ impl HostFsProvider for StdHostFs {
                 mtime_ns: 0,
             })
         } else {
+            #[cfg(unix)]
+            let mode = {
+                use std::os::unix::fs::PermissionsExt;
+                S_IFREG | (meta.permissions().mode() & 0o777)
+            };
+            #[cfg(not(unix))]
+            let mode = S_IFREG | 0o644;
             Some(FileStat {
                 st_ino: path_hash(norm_path),
-                st_mode: S_IFREG | 0o644,
+                st_mode: mode,
                 st_nlink: 1,
                 st_size: meta.len() as i64,
                 mtime_ns: 0,
