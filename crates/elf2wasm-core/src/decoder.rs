@@ -647,8 +647,13 @@ pub fn discover_code(image: &LoadedImage) -> Result<DecodedProgram> {
             let phnum = u16::from_le_bytes(b[56..58].try_into().unwrap()) as usize;
             if phentsize >= 56 {
                 for i in 0..phnum {
-                    let off = phoff.saturating_add(i * phentsize);
-                    if off + 56 > b.len() {
+                    let Some(off) = i.checked_mul(phentsize).and_then(|d| phoff.checked_add(d)) else {
+                        break;
+                    };
+                    let Some(ph_end) = off.checked_add(56) else {
+                        break;
+                    };
+                    if ph_end > b.len() {
                         break;
                     }
                     let p_type = u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
@@ -658,7 +663,10 @@ pub fn discover_code(image: &LoadedImage) -> Result<DecodedProgram> {
                         let dyn_sz = u64::from_le_bytes(b[off + 32..off + 40].try_into().unwrap()) as usize;
                         let dyn_end = dyn_off.saturating_add(dyn_sz).min(b.len());
                         let mut p = dyn_off;
-                        while p + 16 <= dyn_end {
+                        while let Some(next_p) = p.checked_add(16) {
+                            if next_p > dyn_end {
+                                break;
+                            }
                             let d_tag = i64::from_le_bytes(b[p..p + 8].try_into().unwrap());
                             let d_val = u64::from_le_bytes(b[p + 8..p + 16].try_into().unwrap());
                             if d_tag == 0 {
@@ -669,7 +677,7 @@ pub fn discover_code(image: &LoadedImage) -> Result<DecodedProgram> {
                                     seed(so.base_addr.wrapping_add(rel));
                                 }
                             }
-                            p += 16;
+                            p = next_p;
                         }
                         break;
                     }
