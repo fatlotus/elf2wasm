@@ -1,4 +1,4 @@
-use crate::decoder::{BlockTerminator, DecodedBlock, DecodedProgram};
+use crate::decoder::{BlockTerminator, DecodedBlock, DecodedProgram, FastHashMap};
 use crate::elf_loader::{LoadedImage, INITIAL_MEM_PAGES};
 use crate::lifter::{
     Lifter, DEFAULT_QUANTUM, GLOBAL_CF, GLOBAL_DF, GLOBAL_EXIT_CODE, GLOBAL_EXIT_FLAG,
@@ -7,10 +7,9 @@ use crate::lifter::{
     LOCAL_PC_IDX,
 };
 use crate::meta::{MetaSoFile, WasmMeta};
-use anyhow::{bail, Result};
+use anyhow::Result;
 use iced_x86::Mnemonic;
 use std::borrow::Cow;
-use std::collections::HashMap;
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, CustomSection, DataSection, ElementSection, Elements,
     EntityType, ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType,
@@ -18,9 +17,9 @@ use wasm_encoder::{
     TableSection, TableType, TypeSection, ValType,
 };
 
-pub const DISPATCH_HASH_ADDR: u32 = 0x0F00_0000;
-const CHUNK_MAX_BLOCKS: usize = 64;
-const CHUNK_MAX_INSTRS: usize = 512;
+pub const DISPATCH_HASH_ADDR: u32 = 0x0C00_0000;
+const CHUNK_MAX_BLOCKS: usize = 512;
+const CHUNK_MAX_INSTRS: usize = 4096;
 
 fn make_chunk_function() -> Function {
     // Param 0 is i32 ($pc_idx) from function type.
@@ -37,7 +36,7 @@ fn make_chunk_function() -> Function {
 fn emit_jump_target(
     func: &mut Function,
     target_va: u32,
-    chunk_block_map: &HashMap<u32, u32>,
+    chunk_block_map: &FastHashMap<u32, u32>,
     dispatch_depth: u32,
 ) {
     if let Some(&local_idx) = chunk_block_map.get(&target_va) {
@@ -85,7 +84,7 @@ fn emit_push_ret_addr(func: &mut Function, ret_va: u32) {
 
 fn emit_chunk_function(
     chunk: &[&DecodedBlock],
-    chunk_block_map: &HashMap<u32, u32>,
+    chunk_block_map: &FastHashMap<u32, u32>,
 ) -> Function {
     let mut func = make_chunk_function();
     let n = chunk.len() as u32;
@@ -352,13 +351,13 @@ fn emit_start_function(num_chunks: u32, hash_mask: u32) -> Function {
                 }));
                 func.instruction(&WInst::LocalTee(3));
 
-                // local_idx = packed & 0xFF
-                func.instruction(&WInst::I32Const(0xFF));
+                // local_idx = packed & 0x3FF
+                func.instruction(&WInst::I32Const(0x3FF));
                 func.instruction(&WInst::I32And);
 
-                // chunk_idx = packed >> 8
+                // chunk_idx = packed >> 10
                 func.instruction(&WInst::LocalGet(3));
-                func.instruction(&WInst::I32Const(8));
+                func.instruction(&WInst::I32Const(10));
                 func.instruction(&WInst::I32ShrU);
 
                 // call_indirect type 1 (chunk_fn), table 0
@@ -496,9 +495,11 @@ fn emit_load_ctx_function() -> Function {
 
 pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> {
     // 1. Partition blocks into chunks
-    let mut chunks: Vec<(Vec<&DecodedBlock>, HashMap<u32, u32>)> = Vec::new();
-    let mut cur_blocks: Vec<&DecodedBlock> = Vec::new();
-    let mut cur_map: HashMap<u32, u32> = HashMap::new();
+    let est_chunks = (prog.blocks.len() / CHUNK_MAX_BLOCKS).max(16);
+    let mut chunks: Vec<(Vec<&DecodedBlock>, FastHashMap<u32, u32>)> = Vec::with_capacity(est_chunks);
+    let mut cur_blocks: Vec<&DecodedBlock> = Vec::with_capacity(CHUNK_MAX_BLOCKS);
+    let mut cur_map: FastHashMap<u32, u32> =
+        FastHashMap::with_capacity_and_hasher(CHUNK_MAX_BLOCKS, Default::default());
     let mut cur_instrs: usize = 0;
 
     for (&va, block) in &prog.blocks {
@@ -507,8 +508,11 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
                 || cur_instrs + block.instructions.len() > CHUNK_MAX_INSTRS)
         {
             chunks.push((
-                std::mem::take(&mut cur_blocks),
-                std::mem::take(&mut cur_map),
+                std::mem::replace(&mut cur_blocks, Vec::with_capacity(CHUNK_MAX_BLOCKS)),
+                std::mem::replace(
+                    &mut cur_map,
+                    FastHashMap::with_capacity_and_hasher(CHUNK_MAX_BLOCKS, Default::default()),
+                ),
             ));
             cur_instrs = 0;
         }
@@ -526,14 +530,8 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
     // 2. Build open-addressed dispatch hash table
     let table_slots = (prog.blocks.len() * 2).max(16).next_power_of_two();
     let table_bytes_len = table_slots * 8;
-    let mem_bytes_len = (INITIAL_MEM_PAGES as usize) * 65536;
-    if (DISPATCH_HASH_ADDR as usize) + table_bytes_len > mem_bytes_len {
-        bail!(
-            "Dispatch hash table ({} bytes) exceeds 256 MB linear memory at {:#x}",
-            table_bytes_len,
-            DISPATCH_HASH_ADDR
-        );
-    }
+    let needed_bytes = (DISPATCH_HASH_ADDR as usize) + table_bytes_len;
+    let mem_pages = INITIAL_MEM_PAGES.max(((needed_bytes + 65535) / 65536) as u32);
 
     let hash_mask = (table_slots - 1) as u32;
     let mut hash_bytes = vec![0u8; table_bytes_len];
@@ -543,7 +541,7 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
             if va == 0 {
                 continue;
             }
-            let packed = ((chunk_idx as u32) << 8) | (local_idx as u32);
+            let packed = ((chunk_idx as u32) << 10) | (local_idx as u32);
             let mut slot = va.wrapping_mul(0x9E37_79B1) & hash_mask;
             loop {
                 let off = (slot as usize) * 8;
@@ -597,8 +595,8 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
     // Memory Section
     let mut memories = MemorySection::new();
     memories.memory(MemoryType {
-        minimum: INITIAL_MEM_PAGES as u64,
-        maximum: Some(INITIAL_MEM_PAGES as u64),
+        minimum: mem_pages as u64,
+        maximum: Some(mem_pages as u64),
         memory64: false,
         shared: false,
         page_size_log2: None,
@@ -782,13 +780,6 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
     module.section(&data);
 
     // Custom Section: elf2wasm_meta
-    let mut symbols: Vec<(u32, String)> = image
-        .symbols
-        .iter()
-        .map(|(&addr, name)| (addr, name.clone()))
-        .collect();
-    symbols.sort_by_key(|(addr, _)| *addr);
-
     let meta = WasmMeta {
         entry_rip: image.entry_rip,
         at_phdr: image.at_phdr,
@@ -806,7 +797,7 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
                 bytes: so.bytes.clone(),
             })
             .collect(),
-        symbols,
+        symbols: vec![],
         elf_path: image.elf_path.clone(),
     };
     let meta_bytes = meta.encode();
@@ -821,6 +812,7 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
 #[cfg(all(test, not(target_arch = "wasm32"), feature = "std-fs"))]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use crate::decoder::discover_code;
     use crate::elf_loader::{load_elf_and_sos, ExecSegment, STACK_TOP};
     use std::path::Path;

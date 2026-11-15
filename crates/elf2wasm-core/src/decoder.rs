@@ -2,6 +2,39 @@ use crate::elf_loader::{ExecSegment, LoadedImage};
 use anyhow::Result;
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::hash::{BuildHasherDefault, Hasher};
+
+#[derive(Default)]
+pub struct FxHasher {
+    hash: usize,
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash as u64
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.hash = (self.hash.rotate_left(5) ^ (i as usize)).wrapping_mul(0x9E37_79B9);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.hash = (self.hash.rotate_left(5) ^ i).wrapping_mul(0x9E37_79B9);
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.hash = (self.hash.rotate_left(5) ^ (b as usize)).wrapping_mul(0x9E37_79B9);
+        }
+    }
+}
+
+pub type FastHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+pub type FastHashSet<K> = HashSet<K, BuildHasherDefault<FxHasher>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockTerminator {
@@ -55,7 +88,7 @@ pub struct DecodedProgram {
     /// Sorted, deduplicated guest VAs eligible for indirect dispatch (`call reg`, `jmp reg`, `ret`).
     pub indirect_targets: Vec<u32>,
     /// Fast lookup from any decoded instruction VA -> owning block `start_va`.
-    pub instr_to_block: HashMap<u32, u32>,
+    pub instr_to_block: FastHashMap<u32, u32>,
 }
 
 fn find_segment(segments: &[ExecSegment], addr: u32) -> Option<&ExecSegment> {
@@ -76,7 +109,7 @@ fn is_near_branch(instr: &Instruction) -> bool {
 /// strictly inside `(owner_va, owner_block.end_va)`).
 fn split_block(
     blocks: &mut BTreeMap<u32, DecodedBlock>,
-    instr_to_block: &mut HashMap<u32, u32>,
+    instr_to_block: &mut FastHashMap<u32, u32>,
     owner_va: u32,
     split_va: u32,
 ) {
@@ -117,14 +150,67 @@ fn split_block(
     blocks.insert(split_va, new_block);
 }
 
+fn is_non_stack_mem_base(instr: &Instruction) -> bool {
+    use iced_x86::Register;
+    let base = instr.memory_base();
+    base != Register::RSP && base != Register::RBP
+}
+
+fn is_non_stack_mem_read(instr: &Instruction) -> bool {
+    if instr.mnemonic() == Mnemonic::Lea || !is_non_stack_mem_base(instr) {
+        return false;
+    }
+    if matches!(instr.mnemonic(), Mnemonic::Cmp | Mnemonic::Test) {
+        return (0..instr.op_count()).any(|i| instr.op_kind(i) == OpKind::Memory);
+    }
+    (1..instr.op_count()).any(|i| instr.op_kind(i) == OpKind::Memory)
+}
+
+fn is_non_stack_mem_write(instr: &Instruction) -> bool {
+    if matches!(
+        instr.mnemonic(),
+        Mnemonic::Lea | Mnemonic::Cmp | Mnemonic::Test
+    ) || !is_non_stack_mem_base(instr)
+    {
+        return false;
+    }
+    instr.op_count() > 0 && instr.op0_kind() == OpKind::Memory
+}
+
+fn split_mem_read_write_blocks(
+    blocks: &mut BTreeMap<u32, DecodedBlock>,
+    instr_to_block: &mut FastHashMap<u32, u32>,
+) {
+    let mut splits: Vec<(u32, u32)> = Vec::new();
+    for (&start_va, block) in blocks.iter() {
+        let mut cur_owner = start_va;
+        let mut seen_read = false;
+        for (idx, instr) in block.instructions.iter().enumerate() {
+            let write = is_non_stack_mem_write(instr);
+            if write && seen_read && idx > 0 {
+                let split_va = instr.ip() as u32;
+                splits.push((cur_owner, split_va));
+                cur_owner = split_va;
+                seen_read = false;
+            }
+            if is_non_stack_mem_read(instr) {
+                seen_read = true;
+            }
+        }
+    }
+    for (owner_va, split_va) in splits {
+        split_block(blocks, instr_to_block, owner_va, split_va);
+    }
+}
+
 fn decode_single_block_recursive(
     seg: &ExecSegment,
     start_va: u32,
     blocks: &mut BTreeMap<u32, DecodedBlock>,
-    instr_to_block: &mut HashMap<u32, u32>,
+    instr_to_block: &mut FastHashMap<u32, u32>,
     worklist: &mut VecDeque<u32>,
-    queued: &mut HashSet<u32>,
-    function_entries: &mut HashSet<u32>,
+    queued: &mut FastHashSet<u32>,
+    function_entries: &mut FastHashSet<u32>,
 ) {
     let seg_end = seg.vaddr.saturating_add(seg.data.len() as u32);
     let offset = (start_va - seg.vaddr) as usize;
@@ -136,9 +222,12 @@ fn decode_single_block_recursive(
     let mut end_va = start_va;
 
     let mut enqueue = |va: u32, is_func: bool| {
+        #[cfg(test)]
         if is_func {
             function_entries.insert(va);
         }
+        #[cfg(not(test))]
+        let _ = is_func;
         if queued.insert(va) {
             worklist.push_back(va);
         }
@@ -151,17 +240,13 @@ fn decode_single_block_recursive(
         }
 
         if cur_ip != start_va {
-            if blocks.contains_key(&cur_ip) {
+            if let Some(&owner_va) = instr_to_block.get(&cur_ip) {
                 terminator = BlockTerminator::Fallthrough(cur_ip);
                 succs.push(cur_ip);
                 end_va = cur_ip;
-                break;
-            }
-            if instr_to_block.contains_key(&cur_ip) {
-                terminator = BlockTerminator::Fallthrough(cur_ip);
-                succs.push(cur_ip);
-                end_va = cur_ip;
-                enqueue(cur_ip, false);
+                if owner_va != cur_ip {
+                    enqueue(cur_ip, false);
+                }
                 break;
             }
         }
@@ -289,7 +374,7 @@ fn linear_sweep_gap(
     gap_start: u32,
     gap_end: u32,
     blocks: &mut BTreeMap<u32, DecodedBlock>,
-    instr_to_block: &mut HashMap<u32, u32>,
+    instr_to_block: &mut FastHashMap<u32, u32>,
 ) {
     let mut pos_va = gap_start;
 
@@ -476,14 +561,19 @@ fn linear_sweep_gap(
 }
 
 pub fn discover_code(image: &LoadedImage) -> Result<DecodedProgram> {
+    let total_exec_bytes: usize = image.exec_segments.iter().map(|s| s.data.len()).sum();
     let mut blocks: BTreeMap<u32, DecodedBlock> = BTreeMap::new();
-    let mut instr_to_block: HashMap<u32, u32> = HashMap::new();
-    let mut worklist: VecDeque<u32> = VecDeque::new();
-    let mut queued: HashSet<u32> = HashSet::new();
-    let mut function_entries: HashSet<u32> = HashSet::new();
+    let mut instr_to_block: FastHashMap<u32, u32> =
+        FastHashMap::with_capacity_and_hasher(total_exec_bytes / 3, Default::default());
+    let mut worklist: VecDeque<u32> = VecDeque::with_capacity(total_exec_bytes / 16);
+    let mut queued: FastHashSet<u32> =
+        FastHashSet::with_capacity_and_hasher(total_exec_bytes / 12, Default::default());
+    #[allow(unused_mut)]
+    let mut function_entries: FastHashSet<u32> = FastHashSet::default();
 
     let mut seed = |va: u32| {
         if find_segment(&image.exec_segments, va).is_some() {
+            #[cfg(test)]
             function_entries.insert(va);
             if queued.insert(va) {
                 worklist.push_back(va);
@@ -500,6 +590,46 @@ pub fn discover_code(image: &LoadedImage) -> Result<DecodedProgram> {
     sym_addrs.sort_unstable();
     for va in sym_addrs {
         seed(va);
+    }
+
+    // Seed DT_INIT (12) and DT_FINI (13) from PT_DYNAMIC of each shared object.
+    for so in &image.so_files {
+        let b = &so.bytes;
+        if b.len() >= 64 && &b[0..4] == b"\x7fELF" && b[4] == 2 && b[5] == 1 {
+            let phoff = u64::from_le_bytes(b[32..40].try_into().unwrap()) as usize;
+            let phentsize = u16::from_le_bytes(b[54..56].try_into().unwrap()) as usize;
+            let phnum = u16::from_le_bytes(b[56..58].try_into().unwrap()) as usize;
+            if phentsize >= 56 {
+                for i in 0..phnum {
+                    let off = phoff.saturating_add(i * phentsize);
+                    if off + 56 > b.len() {
+                        break;
+                    }
+                    let p_type = u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+                    if p_type == 2 {
+                        // PT_DYNAMIC
+                        let dyn_off = u64::from_le_bytes(b[off + 8..off + 16].try_into().unwrap()) as usize;
+                        let dyn_sz = u64::from_le_bytes(b[off + 32..off + 40].try_into().unwrap()) as usize;
+                        let dyn_end = dyn_off.saturating_add(dyn_sz).min(b.len());
+                        let mut p = dyn_off;
+                        while p + 16 <= dyn_end {
+                            let d_tag = i64::from_le_bytes(b[p..p + 8].try_into().unwrap());
+                            let d_val = u64::from_le_bytes(b[p + 8..p + 16].try_into().unwrap());
+                            if d_tag == 0 {
+                                break;
+                            }
+                            if (d_tag == 12 || d_tag == 13) && d_val != 0 {
+                                if let Ok(rel) = u32::try_from(d_val) {
+                                    seed(so.base_addr.wrapping_add(rel));
+                                }
+                            }
+                            p += 16;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     // 1. Authoritative recursive descent pass.
@@ -578,8 +708,13 @@ pub fn discover_code(image: &LoadedImage) -> Result<DecodedProgram> {
         }
     }
 
-    // 3. Build functions map.
+    split_mem_read_write_blocks(&mut blocks, &mut instr_to_block);
+
+    // 3. Build functions map (only used by decoder unit tests).
+    #[allow(unused_mut)]
     let mut functions: BTreeMap<u32, DecodedFunction> = BTreeMap::new();
+    #[cfg(test)]
+    {
     let mut sorted_func_entries: Vec<u32> = function_entries.iter().copied().collect();
     sorted_func_entries.sort_unstable();
 
@@ -587,7 +722,7 @@ pub fn discover_code(image: &LoadedImage) -> Result<DecodedProgram> {
         if !blocks.contains_key(&entry_va) {
             continue;
         }
-        let mut func_blocks = HashSet::new();
+        let mut func_blocks = FastHashSet::default();
         let mut fqueue = VecDeque::new();
         func_blocks.insert(entry_va);
         fqueue.push_back(entry_va);
@@ -632,6 +767,7 @@ pub fn discover_code(image: &LoadedImage) -> Result<DecodedProgram> {
                 block_vas,
             },
         );
+        }
     }
 
     let max_code_addr = blocks.values().map(|b| b.end_va).max().unwrap_or(0);
@@ -648,9 +784,8 @@ pub fn discover_code(image: &LoadedImage) -> Result<DecodedProgram> {
 }
 
 pub fn split_indirect_targets(image: &LoadedImage, prog: &mut DecodedProgram) {
-    use goblin::elf::{program_header, Elf};
     use iced_x86::{Mnemonic, OpKind, Register};
-    use std::collections::{BTreeSet, HashSet};
+    use std::collections::BTreeSet;
 
     let in_exec = |va: u32| -> bool {
         image.exec_segments.iter().any(|seg| {
@@ -696,18 +831,37 @@ pub fn split_indirect_targets(image: &LoadedImage, prog: &mut DecodedProgram) {
 
     let mut so_views = Vec::new();
     for so in &image.so_files {
-        if let Ok(elf) = Elf::parse(&so.bytes) {
-            let mut loads = Vec::new();
-            for ph in &elf.program_headers {
-                if ph.p_type == program_header::PT_LOAD {
-                    loads.push((ph.p_vaddr, ph.p_filesz, ph.p_offset));
+        let b = &so.bytes;
+        if b.len() >= 64
+            && &b[0..4] == b"\x7fELF"
+            && b[4] == 2 // ELFCLASS64
+            && b[5] == 1 // ELFDATA2LSB
+        {
+            let phoff = u64::from_le_bytes(b[32..40].try_into().unwrap()) as usize;
+            let phentsize = u16::from_le_bytes(b[54..56].try_into().unwrap()) as usize;
+            let phnum = u16::from_le_bytes(b[56..58].try_into().unwrap()) as usize;
+            if phentsize >= 56 {
+                let mut loads = Vec::new();
+                for i in 0..phnum {
+                    let off = phoff.saturating_add(i * phentsize);
+                    if off + 56 > b.len() {
+                        break;
+                    }
+                    let p_type = u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+                    if p_type == 1 {
+                        // PT_LOAD
+                        let p_offset = u64::from_le_bytes(b[off + 8..off + 16].try_into().unwrap());
+                        let p_vaddr = u64::from_le_bytes(b[off + 16..off + 24].try_into().unwrap());
+                        let p_filesz = u64::from_le_bytes(b[off + 32..off + 40].try_into().unwrap());
+                        loads.push((p_vaddr, p_filesz, p_offset));
+                    }
                 }
+                so_views.push(SoRoView {
+                    base_addr: so.base_addr,
+                    bytes: b,
+                    loads,
+                });
             }
-            so_views.push(SoRoView {
-                base_addr: so.base_addr,
-                bytes: &so.bytes,
-                loads,
-            });
         }
     }
 
@@ -730,13 +884,6 @@ pub fn split_indirect_targets(image: &LoadedImage, prog: &mut DecodedProgram) {
         }
         None
     };
-
-    let mut instr_addrs = HashSet::new();
-    for block in prog.blocks.values() {
-        for instr in &block.instructions {
-            instr_addrs.insert(instr.ip() as u32);
-        }
-    }
 
     let mut targets = BTreeSet::new();
     let mut ro_table_candidates = BTreeSet::new();
@@ -822,7 +969,7 @@ pub fn split_indirect_targets(image: &LoadedImage, prog: &mut DecodedProgram) {
             let Ok(target) = u32::try_from(entry) else {
                 break;
             };
-            if in_exec(target) && instr_addrs.contains(&target) {
+            if in_exec(target) && prog.instr_to_block.contains_key(&target) {
                 targets.insert(target);
             } else {
                 break;
