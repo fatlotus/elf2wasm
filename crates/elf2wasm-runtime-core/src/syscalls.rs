@@ -7,6 +7,9 @@ use crate::vfs::{
 use elf2wasm_core::elf_loader::{BRK_START, MMAP_START};
 
 pub const MMAP_END: u32 = 0x0B00_0000;
+/// Top of bump-allocated mmap region; the final 4 KiB page (`MMAP_END - 4096..MMAP_END`)
+/// is reserved for the scheduler's `save_ctx`/`load_ctx` scratch buffer.
+pub const MMAP_ALLOC_END: u32 = MMAP_END - 4096;
 
 const SYS_READ: i64 = 0;
 const SYS_WRITE: i64 = 1;
@@ -605,7 +608,7 @@ fn handle_syscall_inner(
                     let Some(next) = cur.checked_add(aligned) else {
                         return -ENOMEM;
                     };
-                    if next > MMAP_END {
+                    if next > MMAP_ALLOC_END {
                         return -ENOMEM;
                     }
                     (cur, Some(next))
@@ -653,7 +656,7 @@ fn handle_syscall_inner(
                 let Some(next) = cur.checked_add(aligned) else {
                     return -ENOMEM;
                 };
-                if next > MMAP_END {
+                if next > MMAP_ALLOC_END {
                     return -ENOMEM;
                 }
                 (cur, Some(next))
@@ -705,7 +708,7 @@ fn handle_syscall_inner(
             let Some(next) = target.checked_add(aligned) else {
                 return -ENOMEM;
             };
-            if next > MMAP_END {
+            if next > MMAP_ALLOC_END {
                 return -ENOMEM;
             }
             let old_bytes = match read_bytes(ctx, old_addr as u64, old_size) {

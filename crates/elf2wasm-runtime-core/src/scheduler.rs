@@ -1,5 +1,5 @@
 use crate::context::GuestContext;
-use crate::syscalls::MMAP_END;
+use crate::syscalls::MMAP_ALLOC_END;
 use crate::vfs::ETIMEDOUT;
 use elf2wasm_core::lifter::{CTX_SIZE, DEFAULT_QUANTUM};
 use std::collections::{BTreeMap, VecDeque};
@@ -102,7 +102,7 @@ impl Scheduler {
             run_queue: VecDeque::new(),
             virtual_mono_ns: 0,
             realtime_base_ns: INITIAL_REALTIME_BASE_NS,
-            scratch_addr: MMAP_END - 4096,
+            scratch_addr: MMAP_ALLOC_END,
         }
     }
 

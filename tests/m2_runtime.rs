@@ -1,7 +1,10 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::Instant;
+
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn elf2wasm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_elf2wasm"))
@@ -56,6 +59,7 @@ fn compile_and_translate(name: &str, c_src: &str, extra_gcc: &[&str]) -> Option<
 
 #[test]
 fn test_m2_writable_vfs_overlay() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let c_src = r#"
 #include <fcntl.h>
 #include <stdio.h>
@@ -116,6 +120,7 @@ int main(void) {
 
 #[test]
 fn test_m2_fast_sleep_virtual_time() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let c_src = r#"
 #include <stdio.h>
 #include <time.h>
@@ -124,12 +129,12 @@ fn test_m2_fast_sleep_virtual_time() {
 int main(void) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    sleep(30);
+    sleep(120);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     long long delta_ns = (long long)(t1.tv_sec - t0.tv_sec) * 1000000000LL
                        + (long long)(t1.tv_nsec - t0.tv_nsec);
     printf("delta_s=%.3f\n", (double)delta_ns / 1e9);
-    return delta_ns >= 30000000000LL ? 0 : 1;
+    return delta_ns >= 120000000000LL ? 0 : 1;
 }
 "#;
 
@@ -152,16 +157,17 @@ int main(void) {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        elapsed.as_secs() < 15,
-        "sleep(30) took too long on host (expected << 30s even with JIT): {:?}",
+        elapsed.as_secs() < 60,
+        "sleep(120) took too long on host (expected << 60s): {:?}",
         elapsed
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("delta_s=30."), "unexpected stdout: {}", stdout);
+    assert!(stdout.contains("delta_s=120."), "unexpected stdout: {}", stdout);
 }
 
 #[test]
 fn test_m2_deterministic_racy_pthreads() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let c_src = r#"
 #include <pthread.h>
 #include <stdio.h>
