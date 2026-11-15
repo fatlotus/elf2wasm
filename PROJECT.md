@@ -14,20 +14,29 @@
 ## Code Layout
 ```
 /home/antigravity/elf2wasm/
-├── Cargo.toml
+├── Cargo.toml                         # Workspace root (elf2wasm CLI + runtime)
 ├── Cargo.lock
 ├── PROJECT.md
+├── crates/
+│   ├── elf2wasm-core/                 # Pure compiler library (no wasmtime/clap; std-fs optional)
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── elf_loader.rs          # In-memory & host ELF64 + .so loader, dynamic VA bases
+│   │       ├── meta.rs                # WasmMeta custom section serialization
+│   │       ├── decoder.rs             # iced-x86 code discovery, CFG, split_indirect_targets
+│   │       ├── lifter.rs              # x86-64 -> WASM instruction lifting & CPU state
+│   │       └── wasm_emit.rs           # wasm-encoder module assembly, quantum/yield, save/load_ctx
+│   └── elf2wasm-compiler-wasm/        # wasm32-unknown-unknown cdylib compiler
+│       ├── Cargo.toml
+│       └── src/
+│           └── lib.rs                 # C-ABI alloc, dealloc, compile_bundle (E2WB format)
 ├── src/
-│   ├── main.rs          # CLI entry point (translate, run)
-│   ├── elf_loader.rs    # Existing ELF64 + .so loader & memory layout constants
-│   ├── meta.rs          # Existing WasmMeta custom section serialization
-│   ├── decoder.rs       # M1: iced-x86 code discovery & basic-block/function CFG
-│   ├── lifter.rs        # M2: x86-64 -> WASM instruction lifting & CPU state
-│   ├── wasm_emit.rs     # M2: wasm-encoder module assembly & dispatch table
-│   ├── runtime.rs       # M3: wasmtime 27 host, stack/auxv setup, execution loop
-│   ├── syscalls.rs      # M3/M4: Linux x86-64 sandboxed syscall emulator
-│   └── vfs.rs           # M3/M4: Sandboxed virtual filesystem & fd table
-└── tests/               # E2E & integration test suite
+│   ├── main.rs                        # CLI entry point (translate, run)
+│   ├── runtime.rs                     # wasmtime 27 host, stack/auxv setup, slice execution loop
+│   ├── syscalls.rs                    # Linux x86-64 sandboxed syscall emulator
+│   └── vfs.rs                         # Sandboxed virtual filesystem & fd table
+└── tests/                             # E2E & integration test suite
 ```
 
 ## Feature Inventory
@@ -63,15 +72,21 @@ Every feature from the Survey phase is assigned a milestone below:
 ## Interface Contracts
 
 ### `elf_loader` ↔ `decoder`
-- `LoadedImage` provides `exec_segments: Vec<ExecSegment>` (`vaddr: u32`, `bytes: Vec<u8>`), `entry_rip: u32`, and `symbols: Vec<(u32, String)>`.
-- `decoder::discover_code(image: &LoadedImage) -> Result<DecodedProgram>` returns basic blocks/functions keyed by `u32` guest virtual address, with sorted instruction/block entry addresses for indirect dispatch.
+- `elf_loader::load_elf_and_sos_bytes(main_path: &str, main_bytes: &[u8], sos: &[(&str, &[u8])]) -> Result<LoadedImage>` performs pure in-memory ELF64 + `.so` loading with dynamic `LD_BASE` / `SO_BASE_START` placement above `main_end` (zero `std::fs`).
+- `elf_loader::load_elf_and_sos(main_path: &Path, so_paths: &[PathBuf]) -> Result<LoadedImage>` (`std-fs` feature) wraps `load_elf_and_sos_bytes` with host file reading and symlink canonicalization.
+- `decoder::discover_code(image: &LoadedImage) -> Result<DecodedProgram>` and `decoder::split_indirect_targets(image: &LoadedImage, prog: &mut DecodedProgram)` discover basic blocks/functions and indirect jump/call targets.
 
 ### `decoder` ↔ `lifter` / `wasm_emit`
 - `wasm_emit::emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>>` produces a valid `.wasm` binary containing:
   - Import: `("env", "syscall", [i64, i64, i64, i64, i64, i64, i64] -> [i64])`
-  - Export: `"memory"` (Memory, 4096 initial pages), `"_start"` (`[] -> [i32]` or `() -> ()` with exit code via syscall/global)
+  - Exports: `"memory"` (Memory, 4096 initial pages), `"_start"` (`[] -> [i32]`), `"save_ctx"` / `"load_ctx"` (`[i32] -> []`, 464-byte CPU context), `"yield_flag"` (`i32`), `"quantum"` (`i32`, default `128`), GPRs, `"rip"`, `"exit_flag"`, `"exit_code"`, `"fsbase"`, `"gsbase"`.
   - Custom section: `"elf2wasm_meta"` encoded by `WasmMeta::encode()`.
 
+### `elf2wasm-compiler-wasm` (WASM C-ABI)
+- Exports `alloc(len: usize) -> *mut u8`, `dealloc(ptr: *mut u8, len: usize)`, and `compile_bundle(ptr: *const u8, len: usize, out_len_ptr: *mut usize) -> *mut u8`.
+- Input bundle: `b"E2WB"` magic + `u32 main_path_len` + `main_path` + `u32 main_bytes_len` + `main_bytes` + `u32 num_sos` + `[u32 path_len + path + u32 bytes_len + bytes]...` (little-endian `u32`).
+- Output buffer: byte `0` == `0x00` + `.wasm` bytes on success, or `0x01` + UTF-8 error message on failure.
+
 ### `wasm_emit` ↔ `runtime` / `syscalls` / `vfs`
-- `runtime::run_wasm(wasm_bytes: &[u8], config: RunConfig) -> Result<RunOutput>` decodes `"elf2wasm_meta"`, initializes `STACK_TOP` with `argc`/`argv`/`envp`/`auxv`, runs `_start`, and returns `RunOutput { exit_code: i32, stdout: Vec<u8>, stderr: Vec<u8> }`.
+- `runtime::run_wasm(wasm_bytes: &[u8], config: RunConfig) -> Result<RunOutput>` decodes `"elf2wasm_meta"`, initializes `STACK_TOP` with `argc`/`argv`/`envp`/`auxv`, runs `_start` in a slice loop while `yield_flag != 0 && exit_flag == 0` (resetting `yield_flag = 0` and `quantum = DEFAULT_QUANTUM`), and returns `RunOutput { exit_code: i32, stdout: Vec<u8>, stderr: Vec<u8> }`.
 - `syscalls::handle_syscall(caller, nr, a0..a5) -> i64` accesses guest linear memory via `wasmtime::Memory`, `.so` payloads via `WasmMeta.so_files`, and sandboxed files via `vfs::VirtualFs`.
