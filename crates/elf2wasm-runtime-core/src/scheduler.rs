@@ -56,6 +56,7 @@ pub enum PendingWakeup {
         wstatus_addr: u64,
         options: i32,
         rusage_addr: u64,
+        waitid_infop: Option<u64>,
     },
     Poll {
         kind: PollKind,
@@ -96,6 +97,7 @@ pub enum ThreadState {
         wstatus_addr: u64,
         options: i32,
         rusage_addr: u64,
+        waitid_infop: Option<u64>,
     },
     PollWait {
         kind: PollKind,
@@ -364,6 +366,10 @@ impl Scheduler {
                         wake_ns: Some(wake_ns),
                         ..
                     } => Some(wake_ns),
+                    ThreadState::PollWait {
+                        wake_ns: Some(wake_ns),
+                        ..
+                    } => Some(wake_ns),
                     _ => None,
                 })
                 .min();
@@ -379,7 +385,7 @@ impl Scheduler {
             let tids: Vec<i32> = self.threads.keys().copied().collect();
             for tid in tids {
                 if let Some(t) = self.threads.get_mut(&tid) {
-                    match t.state {
+                    match t.state.clone() {
                         ThreadState::Sleeping { wake_ns } if wake_ns <= self.virtual_mono_ns => {
                             t.state = ThreadState::Runnable;
                             t.set_rax(0);
@@ -391,6 +397,17 @@ impl Scheduler {
                         } if wake_ns <= self.virtual_mono_ns => {
                             t.state = ThreadState::Runnable;
                             t.set_rax(-ETIMEDOUT);
+                            self.run_queue.push_back(tid);
+                        }
+                        ThreadState::PollWait {
+                            kind,
+                            wake_ns: Some(wake_ns),
+                        } if wake_ns <= self.virtual_mono_ns => {
+                            t.state = ThreadState::Runnable;
+                            t.pending_wakeup = Some(PendingWakeup::Poll {
+                                kind,
+                                timed_out: true,
+                            });
                             self.run_queue.push_back(tid);
                         }
                         _ => {}

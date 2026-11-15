@@ -144,6 +144,7 @@ pub struct OpenFile {
     pub cloexec: bool,
     pub nonblock: bool,
     pub dir_entries: Vec<DirEntry>,
+    pub unlinked: bool,
 }
 
 pub fn normalize_guest_path(path: &str) -> String {
@@ -263,6 +264,7 @@ impl VirtualFs {
                 cloexec: false,
                 nonblock: false,
                 dir_entries: Vec::new(),
+                    unlinked: false,
             },
         );
         fds.insert(
@@ -282,6 +284,7 @@ impl VirtualFs {
                 cloexec: false,
                 nonblock: false,
                 dir_entries: Vec::new(),
+                    unlinked: false,
             },
         );
         fds.insert(
@@ -301,6 +304,7 @@ impl VirtualFs {
                 cloexec: false,
                 nonblock: false,
                 dir_entries: Vec::new(),
+                    unlinked: false,
             },
         );
 
@@ -353,6 +357,7 @@ impl VirtualFs {
                     cloexec: false,
                     nonblock: false,
                     dir_entries: Vec::new(),
+                    unlinked: false,
                 },
             );
         }
@@ -514,6 +519,17 @@ impl VirtualFs {
         self.is_virtual_parent_dir(norm_path)
     }
 
+    fn missing_parent_errno(&self, parent: &str) -> i64 {
+        if self.overlay.contains_key(parent)
+            || self.host_fs.stat_host_ro(parent).is_some()
+            || self.find_so(parent).is_some()
+        {
+            -ENOTDIR
+        } else {
+            -ENOENT
+        }
+    }
+
     fn build_dir_entries(&self, norm_path: &str) -> Vec<DirEntry> {
         let parent_path = parent_guest_path(norm_path);
         let mut entries = vec![
@@ -672,6 +688,7 @@ impl VirtualFs {
                     cloexec,
                     nonblock,
                     dir_entries: Vec::new(),
+                    unlinked: false,
                 },
             );
             return fd as i64;
@@ -711,6 +728,7 @@ impl VirtualFs {
                             cloexec,
                             nonblock,
                             dir_entries,
+                        unlinked: false,
                         },
                     );
                     return fd as i64;
@@ -762,6 +780,7 @@ impl VirtualFs {
                             cloexec,
                             nonblock,
                             dir_entries: Vec::new(),
+                    unlinked: false,
                         },
                     );
                     return fd as i64;
@@ -802,6 +821,7 @@ impl VirtualFs {
                         cloexec,
                         nonblock,
                         dir_entries,
+                        unlinked: false,
                     },
                 );
                 return fd as i64;
@@ -840,6 +860,7 @@ impl VirtualFs {
                             cloexec,
                             nonblock,
                             dir_entries: Vec::new(),
+                    unlinked: false,
                         },
                     );
                     return fd as i64;
@@ -880,6 +901,7 @@ impl VirtualFs {
                     cloexec,
                     nonblock,
                     dir_entries,
+                        unlinked: false,
                 },
             );
             return fd as i64;
@@ -892,7 +914,7 @@ impl VirtualFs {
             }
             let parent = parent_guest_path(&norm_path);
             if !self.is_existing_dir(parent) {
-                return -ENOENT;
+                return self.missing_parent_errno(parent);
             }
             let empty = Arc::new(Vec::new());
             self.overlay.insert(
@@ -928,6 +950,7 @@ impl VirtualFs {
                     cloexec,
                     nonblock,
                     dir_entries: Vec::new(),
+                    unlinked: false,
                 },
             );
             return fd as i64;
@@ -1010,7 +1033,12 @@ impl VirtualFs {
     }
 
     fn current_file_data<'a>(&'a self, file: &'a OpenFile) -> &'a [u8] {
-        if file.so_index.is_none() && file.is_std.is_none() && !file.is_dir && !file.is_pipe {
+        if !file.unlinked
+            && file.so_index.is_none()
+            && file.is_std.is_none()
+            && !file.is_dir
+            && !file.is_pipe
+        {
             if let Some(OverlayNode::File { data, .. }) = self.overlay.get(&file.guest_path) {
                 return data.as_slice();
             }
@@ -1078,6 +1106,9 @@ impl VirtualFs {
         if file.is_std.is_some() {
             return Err(-EBADF);
         }
+        if file.is_pipe {
+            return Err(-ESPIPE);
+        }
         if file.is_dir {
             return Err(-EISDIR);
         }
@@ -1103,7 +1134,7 @@ impl VirtualFs {
     }
 
     fn write_at(&mut self, fd: i32, data: &[u8], explicit_offset: Option<usize>, now_ns: u64) -> i64 {
-        let Some((is_std, is_dir, is_pipe, writable, append, cursor, guest_path)) =
+        let Some((is_std, is_dir, is_pipe, writable, append, cursor, guest_path, unlinked)) =
             self.fds.get(&fd).map(|f| {
                 (
                     f.is_std,
@@ -1113,6 +1144,7 @@ impl VirtualFs {
                     f.append,
                     f.cursor,
                     f.guest_path.clone(),
+                    f.unlinked,
                 )
             })
         else {
@@ -1136,13 +1168,46 @@ impl VirtualFs {
             };
         }
         if is_pipe {
-            return -EBADF;
+            return if explicit_offset.is_some() {
+                -ESPIPE
+            } else {
+                -EBADF
+            };
         }
         if is_dir {
             return -EISDIR;
         }
         if !writable {
             return -EBADF;
+        }
+
+        if unlinked {
+            let Some(f) = self.fds.get_mut(&fd) else {
+                return -EBADF;
+            };
+            let buf = Arc::make_mut(&mut f.data);
+            let pos = match explicit_offset {
+                Some(off) => off,
+                None => {
+                    if append {
+                        buf.len()
+                    } else {
+                        cursor
+                    }
+                }
+            };
+            let end = match pos.checked_add(data.len()) {
+                Some(e) => e,
+                None => return -EINVAL,
+            };
+            if end > buf.len() {
+                buf.resize(end, 0);
+            }
+            buf[pos..end].copy_from_slice(data);
+            if explicit_offset.is_none() {
+                f.cursor = end;
+            }
+            return data.len() as i64;
         }
 
         let Some(OverlayNode::File {
@@ -1279,7 +1344,7 @@ impl VirtualFs {
                 mtime_ns,
             });
         }
-        if file.so_index.is_none() {
+        if !file.unlinked && file.so_index.is_none() {
             if let Some(OverlayNode::File {
                 data,
                 mode,
@@ -1527,6 +1592,7 @@ impl VirtualFs {
                 cloexec,
                 nonblock,
                 dir_entries: Vec::new(),
+                    unlinked: false,
             },
         );
         let wfd = match self.alloc_fd() {
@@ -1553,6 +1619,7 @@ impl VirtualFs {
                 cloexec,
                 nonblock,
                 dir_entries: Vec::new(),
+                    unlinked: false,
             },
         );
         self.pipes.insert(pipe_id, PipeBuffer::new());
@@ -1592,11 +1659,7 @@ impl VirtualFs {
         }
         let parent = parent_guest_path(&norm_path);
         if !self.is_existing_dir(parent) {
-            return if self.overlay.contains_key(parent) {
-                -ENOTDIR
-            } else {
-                -ENOENT
-            };
+            return self.missing_parent_errno(parent);
         }
         self.overlay.insert(
             norm_path,
@@ -1643,7 +1706,14 @@ impl VirtualFs {
                 }
             }
         }
-        self.overlay.remove(&norm_path);
+        if let Some(OverlayNode::File { data, .. }) = self.overlay.remove(&norm_path) {
+            for f in self.fds.values_mut() {
+                if !f.unlinked && !f.is_dir && !f.is_pipe && f.guest_path == norm_path {
+                    f.unlinked = true;
+                    f.data = Arc::clone(&data);
+                }
+            }
+        }
         0
     }
 
@@ -1685,7 +1755,7 @@ impl VirtualFs {
         };
         let new_parent = parent_guest_path(&new_norm);
         if !self.is_existing_dir(new_parent) {
-            return -ENOENT;
+            return self.missing_parent_errno(new_parent);
         }
         if matches!(node, OverlayNode::Dir { .. })
             && new_norm.starts_with(&format!("{}/", old_norm))
@@ -1708,6 +1778,17 @@ impl VirtualFs {
             }
         }
 
+        // Mark any open FDs pointing to an overwritten target file as unlinked
+        if let Some(OverlayNode::File { data, .. }) = self.overlay.get(&new_norm) {
+            let old_target_data = Arc::clone(data);
+            for f in self.fds.values_mut() {
+                if !f.unlinked && !f.is_dir && !f.is_pipe && f.guest_path == new_norm {
+                    f.unlinked = true;
+                    f.data = Arc::clone(&old_target_data);
+                }
+            }
+        }
+
         self.overlay.remove(&old_norm);
         if matches!(node, OverlayNode::Dir { .. }) {
             let old_prefix = format!("{}/", old_norm);
@@ -1722,6 +1803,22 @@ impl VirtualFs {
                 let suffix = &k[old_prefix.len()..];
                 let dest = format!("{}/{}", new_norm, suffix);
                 self.overlay.insert(dest, v);
+            }
+            for f in self.fds.values_mut() {
+                if !f.unlinked && !f.is_pipe {
+                    if f.guest_path == old_norm {
+                        f.guest_path = new_norm.clone();
+                    } else if f.guest_path.starts_with(&old_prefix) {
+                        let suffix = &f.guest_path[old_prefix.len()..];
+                        f.guest_path = format!("{}/{}", new_norm, suffix);
+                    }
+                }
+            }
+        } else {
+            for f in self.fds.values_mut() {
+                if !f.unlinked && !f.is_dir && !f.is_pipe && f.guest_path == old_norm {
+                    f.guest_path = new_norm.clone();
+                }
             }
         }
         self.overlay.insert(new_norm, node);
@@ -1762,15 +1859,21 @@ impl VirtualFs {
         if length < 0 {
             return -EINVAL;
         }
-        let Some((writable, is_dir, is_std, guest_path)) = self
+        let Some((writable, is_dir, is_std, guest_path, unlinked)) = self
             .fds
             .get(&fd)
-            .map(|f| (f.writable, f.is_dir, f.is_std, f.guest_path.clone()))
+            .map(|f| (f.writable, f.is_dir, f.is_std, f.guest_path.clone(), f.unlinked))
         else {
             return -EBADF;
         };
         if is_std.is_some() || is_dir || !writable {
             return -EINVAL;
+        }
+        if unlinked {
+            if let Some(f) = self.fds.get_mut(&fd) {
+                Arc::make_mut(&mut f.data).resize(length as usize, 0);
+            }
+            return 0;
         }
         let Some(OverlayNode::File {
             data, mtime_ns, ..

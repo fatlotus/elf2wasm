@@ -6,8 +6,8 @@ use crate::scheduler::{
 use crate::stack::setup_guest_stack_ctx;
 use crate::vfs::{
     normalize_guest_path, FileStat, OpenFile, SoEntry, VirtualFs, AT_FDCWD, AT_REMOVEDIR, EACCES,
-    EAGAIN, EBADF, ECHILD, EFAULT, EINVAL, ENOENT, ENOMEM, ENOSYS, ENOTTY, EPIPE, ERANGE, ESRCH,
-    ETIMEDOUT, O_NONBLOCK, S_IFDIR,
+    EAGAIN, EBADF, ECHILD, EFAULT, EINVAL, ENOENT, ENOMEM, ENOSYS, ENOTDIR, ENOTTY, EPIPE, ERANGE,
+    ESRCH, ETIMEDOUT, O_NONBLOCK, S_IFDIR,
 };
 use elf2wasm_core::elf_loader::{BRK_START, MMAP_START};
 use elf2wasm_core::lifter::DEFAULT_QUANTUM;
@@ -586,6 +586,7 @@ impl HostState {
                         wstatus_addr,
                         options,
                         rusage_addr,
+                        waitid_infop,
                     } => {
                         let (has_child, zombie_pid) = self.find_wait_status(pid, target_pid);
                         if !has_child || zombie_pid.is_some() {
@@ -594,6 +595,7 @@ impl HostState {
                                 wstatus_addr,
                                 options,
                                 rusage_addr,
+                                waitid_infop,
                             })
                         } else {
                             None
@@ -726,12 +728,40 @@ impl HostState {
                 wstatus_addr,
                 options: _,
                 rusage_addr,
+                waitid_infop,
             } => {
                 let (has_child, zombie_pid) = self.find_wait_status(self.active_pid, target_pid);
                 if let Some(zpid) = zombie_pid {
-                    let ret = match self.reap_child(ctx, zpid, wstatus_addr, rusage_addr) {
-                        Ok(r) => r,
-                        Err(e) => e,
+                    let ret = if let Some(infop) = waitid_infop {
+                        let exit_status = self
+                            .processes
+                            .get(&zpid)
+                            .map(|c| c.exit_status)
+                            .unwrap_or(0);
+                        match self.reap_child(ctx, zpid, 0, rusage_addr) {
+                            Ok(_) => {
+                                if infop != 0 {
+                                    let mut si = [0u8; 128];
+                                    si[0..4].copy_from_slice(&17i32.to_le_bytes()); // si_signo = SIGCHLD
+                                    si[8..12].copy_from_slice(&1i32.to_le_bytes()); // si_code = CLD_EXITED
+                                    si[16..20].copy_from_slice(&zpid.to_le_bytes()); // si_pid
+                                    si[20..24].copy_from_slice(&1000u32.to_le_bytes()); // si_uid
+                                    si[24..28].copy_from_slice(&((exit_status >> 8) & 0xff).to_le_bytes());
+                                    match write_bytes(ctx, infop, &si) {
+                                        Ok(()) => 0,
+                                        Err(e) => e,
+                                    }
+                                } else {
+                                    0
+                                }
+                            }
+                            Err(e) => e,
+                        }
+                    } else {
+                        match self.reap_child(ctx, zpid, wstatus_addr, rusage_addr) {
+                            Ok(r) => r,
+                            Err(e) => e,
+                        }
                     };
                     if let Some(t) = self.scheduler.threads.get_mut(&cur_tid) {
                         t.set_rax(ret);
@@ -749,6 +779,7 @@ impl HostState {
                             wstatus_addr,
                             options: 0,
                             rusage_addr,
+                            waitid_infop,
                         };
                     }
                     Ok(false)
@@ -1000,16 +1031,14 @@ impl HostState {
     }
 
     pub fn ack_fork(&mut self, child_pid: i32) -> bool {
-        let Some(PendingHostAction::Fork {
-            child_pid: pending_child,
-            ..
-        }) = self.pending_action.take()
-        else {
-            return false;
-        };
-        if pending_child != child_pid {
-            return false;
+        match &self.pending_action {
+            Some(PendingHostAction::Fork {
+                child_pid: pending_child,
+                ..
+            }) if *pending_child == child_pid => {}
+            _ => return false,
         }
+        self.pending_action.take();
         self.switch_active_process(child_pid);
         true
     }
@@ -1964,8 +1993,8 @@ fn handle_syscall_inner(
         }
         SYS_FORK => do_fork(ctx, state, false, 0, 0, 0, 0, 0),
         SYS_VFORK => do_fork(ctx, state, true, 0, 0, 0, 0, 0),
-        SYS_EXECVE => do_execve(ctx, state, AT_FDCWD, a0 as u64, a1 as u64, a2 as u64),
-        SYS_EXECVEAT => do_execve(ctx, state, a0 as i32, a1 as u64, a2 as u64, a3 as u64),
+        SYS_EXECVE => do_execve(ctx, state, AT_FDCWD, a0 as u64, a1 as u64, a2 as u64, 0),
+        SYS_EXECVEAT => do_execve(ctx, state, a0 as i32, a1 as u64, a2 as u64, a3 as u64, a4 as i32),
         SYS_WAIT4 => {
             if !state.multiproc_enabled {
                 return -ENOSYS;
@@ -1992,6 +2021,7 @@ fn handle_syscall_inner(
                 wstatus_addr,
                 options,
                 rusage_addr,
+                waitid_infop: None,
             };
             ctx.set_yield_flag(1);
             0
@@ -2046,6 +2076,7 @@ fn handle_syscall_inner(
                 wstatus_addr: 0,
                 options,
                 rusage_addr,
+                waitid_infop: Some(infop),
             };
             ctx.set_yield_flag(1);
             0
@@ -2056,7 +2087,14 @@ fn handle_syscall_inner(
                 -1i64
             } else {
                 match read_timespec(ctx, a2 as u64) {
-                    Ok((sec, nsec)) => sec.saturating_mul(1000) + nsec / 1_000_000,
+                    Ok((sec, nsec)) => {
+                        let ms = sec.saturating_mul(1000).saturating_add(nsec / 1_000_000);
+                        if ms == 0 && (sec > 0 || nsec > 0) {
+                            1
+                        } else {
+                            ms
+                        }
+                    }
                     Err(e) => return e,
                 }
             };
@@ -2778,6 +2816,7 @@ fn do_execve(
     path_addr: u64,
     argv_addr: u64,
     envp_addr: u64,
+    flags: i32,
 ) -> i64 {
     if !state.multiproc_enabled {
         return -ENOSYS;
@@ -2786,7 +2825,19 @@ fn do_execve(
         Ok(p) => p,
         Err(e) => return e,
     };
-    let norm_path = if raw_path.starts_with('/') {
+    const AT_EMPTY_PATH: i32 = 0x1000;
+    let norm_path = if raw_path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+        if dirfd == AT_FDCWD {
+            return -ENOENT;
+        } else if let Some(df) = state.vfs.get_fd(dirfd) {
+            if df.is_dir {
+                return -EACCES;
+            }
+            df.guest_path.clone()
+        } else {
+            return -EBADF;
+        }
+    } else if raw_path.starts_with('/') {
         normalize_guest_path(&raw_path)
     } else if dirfd == AT_FDCWD {
         if state.vfs.cwd == "/" {
@@ -2795,6 +2846,9 @@ fn do_execve(
             normalize_guest_path(&format!("{}/{}", state.vfs.cwd, raw_path))
         }
     } else if let Some(df) = state.vfs.get_fd(dirfd) {
+        if !df.is_dir {
+            return -ENOTDIR;
+        }
         normalize_guest_path(&format!("{}/{}", df.guest_path, raw_path))
     } else {
         return -EBADF;
