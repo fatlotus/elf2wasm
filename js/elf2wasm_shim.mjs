@@ -19,6 +19,13 @@ const GLOBAL_NAMES = [
   "exit_code",
   "yield_flag",
   "quantum",
+  "rax",
+  "rdi",
+  "rsi",
+  "rdx",
+  "r10",
+  "r8",
+  "r9",
 ];
 const I32_GLOBAL_IDS = new Set([5, 6, 7, 8]);
 
@@ -546,6 +553,7 @@ export class Elf2WasmSystem {
     this.hostVfs = hostVfs;
     this.moduleCache = new Map();
     this.initialSoMap = new Map();
+    this.vfsSymlinks = new Map();
     this.activeGuest = null;
   }
 
@@ -708,11 +716,11 @@ export class Elf2WasmSystem {
     return compileWithInstance(this.compilerInst, elfBytes, soEntries, options);
   }
 
-  _compileCached(elfBytes, soEntries, elfPath) {
+  async _compileCached(elfBytes, soEntries, elfPath) {
     const soKey = (soEntries || [])
       .map((s) => {
         const b = toUint8Array(s.bytes);
-        return `${s.guestPath}:${b.length}:${fnv1a32(b)}`;
+        return `${s.path || s.guestPath || s.name || ""}:${b.length}:${fnv1a32(b)}`;
       })
       .join("|");
     const key = `${elfPath}:${elfBytes.length}:${fnv1a32(elfBytes)}:${soKey}`;
@@ -720,7 +728,7 @@ export class Elf2WasmSystem {
     if (cached) return cached;
 
     const wasmBytes = this.compile(elfBytes, soEntries, { elfPath });
-    const mod = new WebAssembly.Module(wasmBytes);
+    const mod = await WebAssembly.compile(wasmBytes);
     const sections = WebAssembly.Module.customSections(mod, "elf2wasm_meta");
     if (!sections || sections.length === 0) {
       throw new Error("Compiled WASM module missing elf2wasm_meta custom section");
@@ -734,7 +742,9 @@ export class Elf2WasmSystem {
   writeVfsFile(guestPath, bytes, mode = 0o644) {
     if (!this.runtimeInst) throw new Error("Elf2WasmSystem created without runtimeWasm");
     const rExp = this.runtimeInst.exports;
-    const pathBytes = textEncoder.encode(guestPath);
+    const normPath = normalizeGuestPath(guestPath);
+    this.vfsSymlinks.delete(normPath);
+    const pathBytes = textEncoder.encode(normPath);
     const data = toUint8Array(bytes);
     const pPtr = rExp.alloc(pathBytes.length);
     new Uint8Array(rExp.memory.buffer, pPtr, pathBytes.length).set(pathBytes);
@@ -749,10 +759,78 @@ export class Elf2WasmSystem {
     if (rc !== 0) throw new Error(`runtime_add_vfs_file failed for ${guestPath}: ${rc}`);
   }
 
+  writeVfsSymlink(guestPath, target) {
+    if (!this.runtimeInst) throw new Error("Elf2WasmSystem created without runtimeWasm");
+    const rExp = this.runtimeInst.exports;
+    const normPath = normalizeGuestPath(guestPath);
+    const targetStr = String(target);
+    this.vfsSymlinks.set(normPath, targetStr);
+    if (typeof rExp.runtime_add_vfs_symlink === "function") {
+      const pathBytes = textEncoder.encode(normPath);
+      const targetBytes = textEncoder.encode(targetStr);
+      const pPtr = rExp.alloc(Math.max(1, pathBytes.length));
+      const tPtr = rExp.alloc(Math.max(1, targetBytes.length));
+      if (pathBytes.length > 0) {
+        new Uint8Array(rExp.memory.buffer, pPtr, pathBytes.length).set(pathBytes);
+      }
+      if (targetBytes.length > 0) {
+        new Uint8Array(rExp.memory.buffer, tPtr, targetBytes.length).set(targetBytes);
+      }
+      const rc = rExp.runtime_add_vfs_symlink(
+        pPtr,
+        pathBytes.length,
+        tPtr,
+        targetBytes.length
+      );
+      rExp.dealloc(pPtr, Math.max(1, pathBytes.length));
+      rExp.dealloc(tPtr, Math.max(1, targetBytes.length));
+      if (rc !== 0) {
+        throw new Error(`runtime_add_vfs_symlink failed for ${guestPath}: ${rc}`);
+      }
+    }
+  }
+
+  readVfsLink(guestPath) {
+    return this.vfsSymlinks.get(normalizeGuestPath(guestPath)) ?? null;
+  }
+
+  resolveVfsPath(guestPath, maxHops = 40) {
+    let parts = normalizeGuestPath(guestPath).split("/").filter(Boolean);
+    let resolved = [];
+    let hops = 0;
+
+    while (parts.length > 0) {
+      const comp = parts.shift();
+      if (comp === "." || comp === "") continue;
+      if (comp === "..") {
+        resolved.pop();
+        continue;
+      }
+      resolved.push(comp);
+      const curPath = "/" + resolved.join("/");
+      const target = this.vfsSymlinks.get(curPath);
+      if (target !== undefined) {
+        hops++;
+        if (hops > maxHops) {
+          throw new Error(`Too many levels of symbolic links: ${guestPath}`);
+        }
+        const targetParts = target.split("/").filter((c) => c.length > 0 && c !== ".");
+        if (target.startsWith("/")) {
+          resolved = [];
+        } else {
+          resolved.pop();
+        }
+        parts = targetParts.concat(parts);
+      }
+    }
+    return resolved.length === 0 ? "/" : "/" + resolved.join("/");
+  }
+
   readVfsFile(guestPath) {
     if (!this.runtimeInst) throw new Error("Elf2WasmSystem created without runtimeWasm");
     const rExp = this.runtimeInst.exports;
-    const pathBytes = textEncoder.encode(guestPath);
+    const resolvedPath = this.resolveVfsPath(guestPath);
+    const pathBytes = textEncoder.encode(resolvedPath);
     const pPtr = rExp.alloc(pathBytes.length);
     const outLenPtr = rExp.alloc(4);
     new Uint8Array(rExp.memory.buffer, pPtr, pathBytes.length).set(pathBytes);
@@ -769,6 +847,7 @@ export class Elf2WasmSystem {
   _resolveElfSos(elfBytes, extraPaths = []) {
     const resolved = [];
     const seen = new Set();
+    const resolvedSeen = new Set();
     const queue = [];
 
     const enqueue = (nameOrPath) => {
@@ -823,7 +902,10 @@ export class Elf2WasmSystem {
         foundBytes[3] === 0x46 &&
         foundBytes[4] === 2
       ) {
-        resolved.push({ path: foundPath, name: basename(foundPath), bytes: foundBytes });
+        const canonical = this.resolveVfsPath(foundPath);
+        if (resolvedSeen.has(canonical)) continue;
+        resolvedSeen.add(canonical);
+        resolved.push({ path: canonical, name: basename(canonical), bytes: foundBytes });
         const sub = parseElf64Deps(foundBytes);
         for (const n of sub.needed) enqueue(n);
       }
@@ -888,18 +970,13 @@ export class Elf2WasmSystem {
       if (so.name) this.initialSoMap.set(so.name, so);
     }
 
-    const { mod, metaBytes } = this._compileCached(elfU8, normSos, elfPath);
+    const { mod, metaBytes } = await this._compileCached(elfU8, normSos, elfPath);
 
-    const guestImports = {
-      env: {
-        syscall: (nr, a0, a1, a2, a3, a4, a5) =>
-          rExp.runtime_handle_syscall(nr, a0, a1, a2, a3, a4, a5),
-      },
-    };
+    const guestImports = {};
 
     const processes = new Map();
     let activePid = 1000;
-    const mainInst = new WebAssembly.Instance(mod, guestImports);
+    const mainInst = await WebAssembly.instantiate(mod, guestImports);
     processes.set(activePid, { instance: mainInst, module: mod });
     this.activeGuest = mainInst;
 
@@ -936,7 +1013,7 @@ export class Elf2WasmSystem {
         const childPid = rExp.runtime_get_pending_child_pid();
         const scratchAddr = rExp.runtime_get_pending_scratch_addr() >>> 0;
         const parentEntry = processes.get(activePid);
-        const childInst = new WebAssembly.Instance(parentEntry.module, guestImports);
+        const childInst = await WebAssembly.instantiate(parentEntry.module, guestImports);
 
         const parentMem = parentEntry.instance.exports.memory;
         const childMem = childInst.exports.memory;
@@ -989,8 +1066,8 @@ export class Elf2WasmSystem {
           }
         }
         const execSos = this._resolveElfSos(execElf, extraSos);
-        const compiled = this._compileCached(execElf, execSos, execInfo.path);
-        const newInst = new WebAssembly.Instance(compiled.mod, guestImports);
+        const compiled = await this._compileCached(execElf, execSos, execInfo.path);
+        const newInst = await WebAssembly.instantiate(compiled.mod, guestImports);
 
         processes.set(execInfo.pid, { instance: newInst, module: compiled.mod });
         activePid = execInfo.pid;
@@ -1024,6 +1101,20 @@ export class Elf2WasmSystem {
       stderr,
       virtualTimeNs: Number(rExp.runtime_get_virtual_time_ns()),
     };
+  }
+
+  async runFromVfs(guestPath, args = [], options = {}) {
+    const normPath = normalizeGuestPath(guestPath);
+    const resolvedPath = this.resolveVfsPath(normPath);
+    const elfBytes = this.readVfsFile(resolvedPath);
+    if (!elfBytes) {
+      throw new Error(`ELF not found in VFS: ${guestPath}`);
+    }
+    const soEntries = this._resolveElfSos(elfBytes, options.extraSos || []);
+    return await this.runElf(elfBytes, soEntries, args, {
+      ...options,
+      elfPath: options.elfPath || normPath,
+    });
   }
 }
 
@@ -1093,4 +1184,392 @@ export async function compileAndRunInVfs({
   return await sys.runElf(compiledElf, soEntries, [guestOutPath], {
     elfPath: guestOutPath,
   });
+}
+
+async function decompressStreamBytes(bytes, format) {
+  const input = toUint8Array(bytes);
+  if (typeof DecompressionStream !== "undefined") {
+    const ds = new DecompressionStream(format);
+    const writer = ds.writable.getWriter();
+    const reader = ds.readable.getReader();
+    const chunks = [];
+    let total = 0;
+
+    const writePromise = (async () => {
+      await writer.write(input);
+      await writer.close();
+    })();
+
+    const readPromise = (async () => {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value && value.length > 0) {
+          chunks.push(value);
+          total += value.length;
+        }
+      }
+    })();
+
+    await Promise.all([writePromise, readPromise]);
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      out.set(c, off);
+      off += c.length;
+    }
+    return out;
+  }
+
+  const zlib = await import("node:zlib");
+  if (format === "gzip") {
+    return new Uint8Array(zlib.gunzipSync(input));
+  }
+  if (format === "deflate-raw") {
+    return new Uint8Array(zlib.inflateRawSync(input));
+  }
+  throw new Error(`Unsupported compression format: ${format}`);
+}
+
+function parseTarOctalOrBase256(buf, offset, length) {
+  if ((buf[offset] & 0x80) !== 0) {
+    let val = (buf[offset] & 0x7f) !== 0 ? -1 : 0;
+    for (let i = 1; i < length; i++) {
+      val = val * 256 + buf[offset + i];
+    }
+    return val;
+  }
+  let s = "";
+  for (let i = 0; i < length; i++) {
+    const b = buf[offset + i];
+    if (b === 0) break;
+    s += String.fromCharCode(b);
+  }
+  s = s.trim();
+  if (!s) return 0;
+  return parseInt(s, 8) || 0;
+}
+
+function readTarString(buf, offset, length) {
+  let end = offset;
+  const max = offset + length;
+  while (end < max && buf[end] !== 0) end++;
+  return textDecoder.decode(buf.subarray(offset, end));
+}
+
+function parsePaxRecords(bytes) {
+  const buf = toUint8Array(bytes);
+  const records = {};
+  let idx = 0;
+  while (idx < buf.length) {
+    let spaceIdx = -1;
+    for (let i = idx; i < buf.length; i++) {
+      if (buf[i] === 0x20) {
+        spaceIdx = i;
+        break;
+      }
+    }
+    if (spaceIdx < 0) break;
+    const lenStr = textDecoder.decode(buf.subarray(idx, spaceIdx));
+    const len = parseInt(lenStr, 10);
+    if (!Number.isFinite(len) || len <= 0 || idx + len > buf.length) break;
+    const recEnd = idx + len;
+    let eqIdx = -1;
+    for (let i = spaceIdx + 1; i < recEnd; i++) {
+      if (buf[i] === 0x3d) {
+        eqIdx = i;
+        break;
+      }
+    }
+    if (eqIdx >= 0) {
+      const key = textDecoder.decode(buf.subarray(spaceIdx + 1, eqIdx));
+      let valEnd = recEnd;
+      if (valEnd > eqIdx + 1 && buf[valEnd - 1] === 0x0a) {
+        valEnd--;
+      }
+      const val = textDecoder.decode(buf.subarray(eqIdx + 1, valEnd));
+      records[key] = val;
+    }
+    idx += len;
+  }
+  return records;
+}
+
+export function extractTarToVfs(arg1, arg2) {
+  let sys = null;
+  let rawBytes;
+  if (arg1 && typeof arg1.writeVfsFile === "function") {
+    sys = arg1;
+    rawBytes = arg2;
+  } else {
+    rawBytes = arg1;
+  }
+
+  const tar = toUint8Array(rawBytes);
+  const files = new Map();
+  const symlinks = new Map();
+
+  let offset = 0;
+  let nextLongName = null;
+  let nextLongLink = null;
+  let nextPax = null;
+  let globalPax = {};
+
+  while (offset + 512 <= tar.length) {
+    let allZero = true;
+    for (let i = 0; i < 512; i++) {
+      if (tar[offset + i] !== 0) {
+        allZero = false;
+        break;
+      }
+    }
+    if (allZero) {
+      offset += 512;
+      continue;
+    }
+
+    const nameField = readTarString(tar, offset, 100);
+    const mode = parseTarOctalOrBase256(tar, offset + 100, 8);
+    let size = parseTarOctalOrBase256(tar, offset + 124, 12);
+    const typeFlag = String.fromCharCode(tar[offset + 156]);
+    const linkNameField = readTarString(tar, offset + 157, 100);
+    const prefixField = readTarString(tar, offset + 345, 155);
+
+    offset += 512;
+
+    if (nextPax && nextPax.size !== undefined) {
+      const paxSize = Number(nextPax.size);
+      if (Number.isFinite(paxSize) && paxSize >= 0) size = paxSize;
+    }
+
+    const dataEnd = Math.min(offset + size, tar.length);
+    const payload = tar.slice(offset, dataEnd);
+    const paddedBlocks = Math.ceil(size / 512) * 512;
+    offset += paddedBlocks;
+
+    if (typeFlag === "L") {
+      nextLongName = textDecoder.decode(payload).replace(/\0+$/, "");
+      continue;
+    }
+    if (typeFlag === "K") {
+      nextLongLink = textDecoder.decode(payload).replace(/\0+$/, "");
+      continue;
+    }
+    if (typeFlag === "x") {
+      nextPax = parsePaxRecords(payload);
+      continue;
+    }
+    if (typeFlag === "g") {
+      globalPax = { ...globalPax, ...parsePaxRecords(payload) };
+      continue;
+    }
+
+    let rawPath = prefixField ? `${prefixField}/${nameField}` : nameField;
+    if (nextLongName !== null) rawPath = nextLongName;
+    if (nextPax && nextPax.path !== undefined) rawPath = nextPax.path;
+    else if (globalPax.path !== undefined) rawPath = globalPax.path;
+
+    let linkTarget = linkNameField;
+    if (nextLongLink !== null) linkTarget = nextLongLink;
+    if (nextPax && nextPax.linkpath !== undefined) linkTarget = nextPax.linkpath;
+    else if (globalPax.linkpath !== undefined) linkTarget = globalPax.linkpath;
+
+    nextLongName = null;
+    nextLongLink = null;
+    nextPax = null;
+
+    const guestPath = normalizeGuestPath("/" + rawPath.replace(/^\.\//, ""));
+    if (guestPath === "/") continue;
+
+    if (typeFlag === "5") {
+      continue;
+    }
+    if (typeFlag === "2") {
+      files.delete(guestPath);
+      symlinks.set(guestPath, linkTarget);
+      continue;
+    }
+    if (typeFlag === "1") {
+      const targetGuestPath = normalizeGuestPath("/" + linkTarget.replace(/^\.\//, ""));
+      const existing = files.get(targetGuestPath);
+      if (existing) {
+        const copy = existing.bytes.slice();
+        symlinks.delete(guestPath);
+        files.set(guestPath, { bytes: copy, mode: mode || existing.mode || 0o644 });
+      } else if (sys) {
+        const targetBytes = sys.readVfsFile(targetGuestPath);
+        if (targetBytes) {
+          symlinks.delete(guestPath);
+          files.set(guestPath, { bytes: targetBytes, mode: mode || 0o644 });
+        } else {
+          files.delete(guestPath);
+          symlinks.set(guestPath, targetGuestPath);
+        }
+      } else {
+        files.delete(guestPath);
+        symlinks.set(guestPath, targetGuestPath);
+      }
+      continue;
+    }
+    if (typeFlag === "0" || typeFlag === "\0") {
+      const fileMode = mode || 0o644;
+      symlinks.delete(guestPath);
+      files.set(guestPath, { bytes: payload, mode: fileMode });
+    }
+  }
+
+  if (sys) {
+    applyVfsOverlay(sys, { files, symlinks });
+  }
+
+  return { files, symlinks };
+}
+
+export async function extractTarGzToVfs(arg1, arg2) {
+  let sys = null;
+  let rawBytes;
+  if (arg1 && typeof arg1.writeVfsFile === "function") {
+    sys = arg1;
+    rawBytes = arg2;
+  } else {
+    rawBytes = arg1;
+  }
+  const tarBytes = await decompressStreamBytes(rawBytes, "gzip");
+  return sys ? extractTarToVfs(sys, tarBytes) : extractTarToVfs(tarBytes);
+}
+
+export async function extractZipToVfs(arg1, arg2) {
+  let sys = null;
+  let rawBytes;
+  if (arg1 && typeof arg1.writeVfsFile === "function") {
+    sys = arg1;
+    rawBytes = arg2;
+  } else {
+    rawBytes = arg1;
+  }
+
+  const zip = toUint8Array(rawBytes);
+  const view = new DataView(zip.buffer, zip.byteOffset, zip.byteLength);
+  const files = new Map();
+  const symlinks = new Map();
+
+  let eocdOffset = -1;
+  const minOff = Math.max(0, zip.length - 65557);
+  for (let i = zip.length - 22; i >= minOff; i--) {
+    if (view.getUint32(i, true) === 0x06054b50) {
+      eocdOffset = i;
+      break;
+    }
+  }
+  if (eocdOffset < 0) {
+    throw new Error("Invalid ZIP archive: EOCD not found");
+  }
+
+  const cdCount = view.getUint16(eocdOffset + 10, true);
+  let cdOffset = view.getUint32(eocdOffset + 16, true);
+
+  for (let i = 0; i < cdCount; i++) {
+    if (cdOffset + 46 > zip.length || view.getUint32(cdOffset, true) !== 0x02014b50) {
+      throw new Error("Invalid ZIP central directory header");
+    }
+    const method = view.getUint16(cdOffset + 10, true);
+    const compSize = view.getUint32(cdOffset + 20, true);
+    const nameLen = view.getUint16(cdOffset + 28, true);
+    const extraLen = view.getUint16(cdOffset + 30, true);
+    const commentLen = view.getUint16(cdOffset + 32, true);
+    const externalAttrs = view.getUint32(cdOffset + 38, true);
+    const localHeaderOffset = view.getUint32(cdOffset + 42, true);
+
+    const rawName = textDecoder.decode(zip.subarray(cdOffset + 46, cdOffset + 46 + nameLen));
+    cdOffset += 46 + nameLen + extraLen + commentLen;
+
+    if (
+      localHeaderOffset + 30 > zip.length ||
+      view.getUint32(localHeaderOffset, true) !== 0x04034b50
+    ) {
+      throw new Error("Invalid ZIP local file header");
+    }
+    const lfNameLen = view.getUint16(localHeaderOffset + 26, true);
+    const lfExtraLen = view.getUint16(localHeaderOffset + 28, true);
+    const dataStart = localHeaderOffset + 30 + lfNameLen + lfExtraLen;
+    const compData = zip.subarray(dataStart, dataStart + compSize);
+
+    let data;
+    if (method === 0) {
+      data = compData.slice();
+    } else if (method === 8) {
+      data = await decompressStreamBytes(compData, "deflate-raw");
+    } else {
+      throw new Error(`Unsupported ZIP compression method: ${method}`);
+    }
+
+    const guestPath = normalizeGuestPath("/" + rawName.replace(/^\.\//, ""));
+    if (guestPath === "/") continue;
+
+    const unixMode = (externalAttrs >>> 16) & 0xffff;
+    const fileType = unixMode & 0o170000;
+    const isDir = fileType === 0o040000 || rawName.endsWith("/");
+    if (isDir) continue;
+
+    if (fileType === 0o120000) {
+      const target = textDecoder.decode(data);
+      files.delete(guestPath);
+      symlinks.set(guestPath, target);
+    } else {
+      const perm = unixMode & 0o7777 ? unixMode & 0o7777 : 0o644;
+      symlinks.delete(guestPath);
+      files.set(guestPath, { bytes: data, mode: perm });
+    }
+  }
+
+  if (sys) {
+    applyVfsOverlay(sys, { files, symlinks });
+  }
+
+  return { files, symlinks };
+}
+
+function pathDepth(p) {
+  return normalizeGuestPath(p).split("/").filter(Boolean).length;
+}
+
+function applyVfsOverlay(sys, vfs) {
+  if (!vfs) return;
+  if (vfs.symlinks instanceof Map) {
+    const sortedSymlinks = Array.from(vfs.symlinks.entries()).sort(
+      ([a], [b]) => pathDepth(a) - pathDepth(b)
+    );
+    for (const [path, target] of sortedSymlinks) {
+      sys.writeVfsSymlink(path, target);
+    }
+  }
+  if (vfs.files instanceof Map) {
+    for (const [path, entry] of vfs.files.entries()) {
+      if (entry instanceof Uint8Array || ArrayBuffer.isView(entry)) {
+        sys.writeVfsFile(path, entry, 0o755);
+      } else {
+        sys.writeVfsFile(path, entry.bytes, entry.mode ?? 0o644);
+      }
+    }
+  }
+}
+
+export async function runFromVfs({
+  compilerWasm,
+  runtimeWasm,
+  vfs,
+  command,
+  args = [],
+  env = undefined,
+  vfsRo = [],
+  vfsRw = [],
+} = {}) {
+  const sys = await Elf2WasmSystem.create({
+    compilerWasm,
+    runtimeWasm,
+    vfsRo,
+    vfsRw,
+  });
+  applyVfsOverlay(sys, vfs);
+  return await sys.runFromVfs(command, args, { env });
 }
