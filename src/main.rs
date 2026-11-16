@@ -1,7 +1,5 @@
-pub use elf2wasm_core::{decoder, elf_loader, lifter, meta, wasm_emit};
-pub mod runtime;
-pub mod syscalls;
-pub mod vfs;
+use elf2wasm_core::{decoder, elf_loader, wasm_emit};
+mod runtime;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};

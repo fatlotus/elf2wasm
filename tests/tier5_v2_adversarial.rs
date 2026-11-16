@@ -441,18 +441,8 @@ fn test_t5_v2_wasm_emit_quantum_boundaries_and_high_rip_trap() {
 
     let engine = Engine::default();
     let module = WasmModule::new(&engine, &wasm_bytes).unwrap();
-    let mut linker: Linker<()> = Linker::new(&engine);
-    linker
-        .func_wrap(
-            "env",
-            "syscall",
-            |_: Caller<'_, ()>, _: i64, _: i64, _: i64, _: i64, _: i64, _: i64, _: i64| -> i64 {
-                -38
-            },
-        )
-        .unwrap();
     let mut store = Store::new(&engine, ());
-    let inst = linker.instantiate(&mut store, &module).unwrap();
+    let inst = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
     let start = inst.get_typed_func::<(), i32>(&mut store, "_start").unwrap();
 
     inst.get_global(&mut store, "rip").unwrap().set(&mut store, Val::I64(0x0010_0000)).unwrap();
@@ -488,18 +478,8 @@ fn test_t5_v2_save_ctx_load_ctx_oob_trap_and_unaligned() {
 
     let engine = Engine::default();
     let module = WasmModule::new(&engine, &wasm_bytes).unwrap();
-    let mut linker: Linker<()> = Linker::new(&engine);
-    linker
-        .func_wrap(
-            "env",
-            "syscall",
-            |_: Caller<'_, ()>, _: i64, _: i64, _: i64, _: i64, _: i64, _: i64, _: i64| -> i64 {
-                -38
-            },
-        )
-        .unwrap();
     let mut store = Store::new(&engine, ());
-    let inst = linker.instantiate(&mut store, &module).unwrap();
+    let inst = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
     let mem = inst.get_memory(&mut store, "memory").unwrap();
     let mem_bytes = mem.data_size(&store) as i32;
     assert!(mem_bytes >= (INITIAL_MEM_PAGES as i32) * 65536);
@@ -538,18 +518,8 @@ fn test_t5_v2_emit_wasm_empty_program_validates() {
     let wasm_bytes = emit_wasm(&image, &prog).unwrap();
     let engine = Engine::default();
     let module = WasmModule::new(&engine, &wasm_bytes).unwrap();
-    let mut linker: Linker<()> = Linker::new(&engine);
-    linker
-        .func_wrap(
-            "env",
-            "syscall",
-            |_: Caller<'_, ()>, _: i64, _: i64, _: i64, _: i64, _: i64, _: i64, _: i64| -> i64 {
-                -38
-            },
-        )
-        .unwrap();
     let mut store = Store::new(&engine, ());
-    let inst = linker.instantiate(&mut store, &module).unwrap();
+    let inst = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
     let mem = inst.get_memory(&mut store, "memory").unwrap();
     assert!(mem.size(&store) >= INITIAL_MEM_PAGES as u64);
     assert!(mem.data_size(&store) as u32 >= DISPATCH_HASH_ADDR + 128);
@@ -563,13 +533,13 @@ fn test_t5_v2_emit_wasm_empty_program_validates() {
 
 struct MockRuntimeHost {
     guest_mem: Vec<u8>,
-    globals: [i64; 9],
+    globals: [i64; 16],
     fail_mem_io: bool,
 }
 
 impl MockRuntimeHost {
     fn new(guest_mem_size: usize) -> Self {
-        let mut globals = [0i64; 9];
+        let mut globals = [0i64; 16];
         globals[8] = DEFAULT_QUANTUM as i64;
         Self {
             guest_mem: vec![0u8; guest_mem_size],
@@ -1186,6 +1156,28 @@ impl GuestContext for MockCtx {
     fn set_rsp(&mut self, val: i64) {
         self.rsp = val;
     }
+    fn get_rax(&self) -> i64 {
+        0
+    }
+    fn set_rax(&mut self, _val: i64) {}
+    fn get_rdi(&self) -> i64 {
+        0
+    }
+    fn get_rsi(&self) -> i64 {
+        0
+    }
+    fn get_rdx(&self) -> i64 {
+        0
+    }
+    fn get_r10(&self) -> i64 {
+        0
+    }
+    fn get_r8(&self) -> i64 {
+        0
+    }
+    fn get_r9(&self) -> i64 {
+        0
+    }
     fn set_exit(&mut self, code: i32) {
         self.exit_flag = 1;
         self.exit_code = code;
@@ -1732,3 +1724,88 @@ fn test_v2_adv_vfs_enotdir_pipe_espipe_and_open_unlink_rename() {
     assert_eq!(vfs.stat_fd(fd).unwrap().st_size, 4);
     assert_eq!(vfs.close(fd), 0);
 }
+
+#[test]
+fn test_v2_adv_timed_waiter_wakes_while_other_process_spins() {
+    // 1. Test Scheduler::on_yield (multi-thread within one process)
+    {
+        let mut sched = Scheduler::new();
+        sched.scratch_addr = 0x2000;
+        let mut ctx = MockCtx::new(0x10000);
+        let t2 = sched.alloc_tid();
+        let mut t2_ctx = ThreadContext::new(t2);
+        t2_ctx.state = ThreadState::Sleeping { wake_ns: 500_000 }; // 500us
+        sched.threads.insert(t2, t2_ctx);
+
+        // Simulate t1 spinning through quantum yields up to 2ms without blocking
+        let mut t2_woken_at_ns = None;
+        for _ in 0..2000 {
+            let cont = sched.on_yield(&mut ctx, 2).unwrap();
+            assert!(cont);
+            if sched.current_tid == t2 {
+                t2_woken_at_ns = Some(sched.virtual_mono_ns);
+                break;
+            }
+        }
+        let woke_ns = t2_woken_at_ns.expect("sleeping thread t2 was starved by spinning t1");
+        assert!(
+            woke_ns >= 500_000 && woke_ns < 2_000_000,
+            "expected t2 to wake around 500us before 2ms, woke at {}ns",
+            woke_ns
+        );
+    }
+
+    // 2. Test HostState::on_yield_multiproc (nanosleep(500us) parent + spinning child)
+    let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+    state.multiproc_enabled = true;
+    state.scheduler.scratch_addr = 0x2000;
+    let mut ctx = MockCtx::new(0x10000);
+    let parent_pid = MAIN_PID;
+    let child_pid = parent_pid + 1;
+
+    // Fork child process via clone(SIGCHLD)
+    let fork_ret = handle_syscall(&mut ctx, &mut state, 56, 17, 0, 0, 0, 0, 0);
+    assert_eq!(fork_ret, child_pid as i64);
+    assert_eq!(state.on_yield_multiproc(&mut ctx, 3).unwrap(), 3);
+    assert!(state.ack_fork(child_pid));
+    state.scheduler.scratch_addr = 0x2000;
+    assert_eq!(state.active_pid, child_pid);
+
+    // Child yields -> switches to parent
+    assert_eq!(state.on_yield_multiproc(&mut ctx, 2).unwrap(), 2);
+    assert_eq!(state.active_pid, parent_pid);
+    let req_addr = 0x1000u64;
+    let mut req = [0u8; 16];
+    req[0..8].copy_from_slice(&0i64.to_le_bytes());
+    req[8..16].copy_from_slice(&500_000i64.to_le_bytes()); // 500us
+    ctx.mem_write(req_addr, &req).unwrap();
+    let ret = handle_syscall(&mut ctx, &mut state, 35, req_addr as i64, 0, 0, 0, 0, 0);
+    assert_eq!(ret, 0);
+    assert!(matches!(
+        state.scheduler.current_thread().state,
+        ThreadState::Sleeping { wake_ns } if wake_ns >= 500_000 && wake_ns < 600_000
+    ));
+
+    // Yield from blocked parent -> should switch to child
+    let action = state.on_yield_multiproc(&mut ctx, 1).unwrap();
+    assert_eq!(action, 2);
+    assert_eq!(state.active_pid, child_pid);
+
+    // Child spins in quantum yields (each advancing virtual_mono_ns by QUANTUM_TIME_STEP_NS = 1000ns)
+    let mut parent_woken_at_ns = None;
+    for _ in 0..2000 {
+        let act = state.on_yield_multiproc(&mut ctx, 2).unwrap();
+        if act == 2 && state.active_pid == parent_pid {
+            parent_woken_at_ns = Some(state.scheduler.virtual_mono_ns);
+            break;
+        }
+    }
+    let woke_ns = parent_woken_at_ns.expect("nanosleep(500us) parent was starved by spinning child");
+    assert!(
+        woke_ns >= 500_000 && woke_ns < 2_000_000,
+        "expected parent to wake at ~500us before child finished 2ms, woke at {}ns",
+        woke_ns
+    );
+    assert!(!state.has_expired_timed_waiter());
+}
+

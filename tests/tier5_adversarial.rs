@@ -4,9 +4,9 @@ use std::os::unix::fs as unix_fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use wasm_encoder::{
-    CodeSection, CustomSection, ExportKind, ExportSection, Function, FunctionSection,
-    GlobalSection, GlobalType, ImportSection, Instruction, MemorySection, MemoryType, Module,
-    TypeSection, ValType,
+    BlockType, CodeSection, CustomSection, ExportKind, ExportSection, Function, FunctionSection,
+    GlobalSection, GlobalType, Instruction, MemorySection, MemoryType, Module, TypeSection,
+    ValType,
 };
 
 fn elf2wasm_bin() -> PathBuf {
@@ -35,16 +35,11 @@ fn build_syscall_probe_wasm(
 fn build_multi_syscall_wasm(calls: &[(i64, i64, i64, i64, i64, i64, i64)]) -> Vec<u8> {
     let mut module = Module::new();
     let mut types = TypeSection::new();
-    types.ty().function(vec![ValType::I64; 7], vec![ValType::I64]);
-    types.ty().function(vec![], vec![ValType::I32]);
+    types.ty().function(vec![], vec![ValType::I32]); // 0: _start
     module.section(&types);
 
-    let mut imports = ImportSection::new();
-    imports.import("env", "syscall", wasm_encoder::EntityType::Function(0));
-    module.section(&imports);
-
     let mut funcs = FunctionSection::new();
-    funcs.function(1);
+    funcs.function(0);
     module.section(&funcs);
 
     let mut mems = MemorySection::new();
@@ -57,17 +52,39 @@ fn build_multi_syscall_wasm(calls: &[(i64, i64, i64, i64, i64, i64, i64)]) -> Ve
     });
     module.section(&mems);
 
+    // Globals:
+    // 0: rsp (i64)
+    // 1: rip (i64)
+    // 2: yield_flag (i32)
+    // 3: exit_flag (i32)
+    // 4: exit_code (i32)
+    // 5: rcx (i64)
+    // 6: rax (i64)
+    // 7: rdi (i64)
+    // 8: rsi (i64)
+    // 9: rdx (i64)
+    // 10: r10 (i64)
+    // 11: r8 (i64)
+    // 12: r9 (i64)
     let mut globals = GlobalSection::new();
-    for _ in 0..2 {
-        // rsp, rip
-        globals.global(
-            GlobalType {
-                val_type: ValType::I64,
-                mutable: true,
-                shared: false,
-            },
-            &wasm_encoder::ConstExpr::i64_const(0),
-        );
+    let i64_mut = GlobalType {
+        val_type: ValType::I64,
+        mutable: true,
+        shared: false,
+    };
+    let i32_mut = GlobalType {
+        val_type: ValType::I32,
+        mutable: true,
+        shared: false,
+    };
+    globals.global(i64_mut, &wasm_encoder::ConstExpr::i64_const(0)); // 0: rsp
+    globals.global(i64_mut, &wasm_encoder::ConstExpr::i64_const(0)); // 1: rip
+    globals.global(i32_mut, &wasm_encoder::ConstExpr::i32_const(0)); // 2: yield_flag
+    globals.global(i32_mut, &wasm_encoder::ConstExpr::i32_const(0)); // 3: exit_flag
+    globals.global(i32_mut, &wasm_encoder::ConstExpr::i32_const(0)); // 4: exit_code
+    for _ in 0..8 {
+        // 5..=12: rcx, rax, rdi, rsi, rdx, r10, r8, r9
+        globals.global(i64_mut, &wasm_encoder::ConstExpr::i64_const(0));
     }
     module.section(&globals);
 
@@ -75,28 +92,56 @@ fn build_multi_syscall_wasm(calls: &[(i64, i64, i64, i64, i64, i64, i64)]) -> Ve
     exports.export("memory", ExportKind::Memory, 0);
     exports.export("rsp", ExportKind::Global, 0);
     exports.export("rip", ExportKind::Global, 1);
-    exports.export("_start", ExportKind::Func, 1);
+    exports.export("yield_flag", ExportKind::Global, 2);
+    exports.export("exit_flag", ExportKind::Global, 3);
+    exports.export("exit_code", ExportKind::Global, 4);
+    exports.export("rcx", ExportKind::Global, 5);
+    exports.export("rax", ExportKind::Global, 6);
+    exports.export("rdi", ExportKind::Global, 7);
+    exports.export("rsi", ExportKind::Global, 8);
+    exports.export("rdx", ExportKind::Global, 9);
+    exports.export("r10", ExportKind::Global, 10);
+    exports.export("r8", ExportKind::Global, 11);
+    exports.export("r9", ExportKind::Global, 12);
+    exports.export("_start", ExportKind::Func, 0);
     module.section(&exports);
 
     let mut code = CodeSection::new();
     let mut f = Function::new([]);
     for (idx, &(nr, a0, a1, a2, a3, a4, a5)) in calls.iter().enumerate() {
+        f.instruction(&Instruction::GlobalGet(1)); // rip
+        f.instruction(&Instruction::I64Const(idx as i64));
+        f.instruction(&Instruction::I64Eq);
+        f.instruction(&Instruction::If(BlockType::Empty));
         f.instruction(&Instruction::I64Const(nr));
+        f.instruction(&Instruction::GlobalSet(6)); // rax
         f.instruction(&Instruction::I64Const(a0));
+        f.instruction(&Instruction::GlobalSet(7)); // rdi
         f.instruction(&Instruction::I64Const(a1));
+        f.instruction(&Instruction::GlobalSet(8)); // rsi
         f.instruction(&Instruction::I64Const(a2));
+        f.instruction(&Instruction::GlobalSet(9)); // rdx
         f.instruction(&Instruction::I64Const(a3));
+        f.instruction(&Instruction::GlobalSet(10)); // r10
         f.instruction(&Instruction::I64Const(a4));
+        f.instruction(&Instruction::GlobalSet(11)); // r8
         f.instruction(&Instruction::I64Const(a5));
-        f.instruction(&Instruction::Call(0));
-        if idx + 1 < calls.len() {
-            f.instruction(&Instruction::Drop);
-        } else {
-            f.instruction(&Instruction::I32WrapI64);
-        }
+        f.instruction(&Instruction::GlobalSet(12)); // r9
+        f.instruction(&Instruction::I64Const((idx + 1) as i64));
+        f.instruction(&Instruction::GlobalSet(1)); // rip
+        f.instruction(&Instruction::I64Const((idx + 1) as i64));
+        f.instruction(&Instruction::GlobalSet(5)); // rcx
+        f.instruction(&Instruction::I32Const(3)); // YIELD_SYSCALL_PENDING
+        f.instruction(&Instruction::GlobalSet(2)); // yield_flag
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
     }
     if calls.is_empty() {
         f.instruction(&Instruction::I32Const(0));
+    } else {
+        f.instruction(&Instruction::GlobalGet(6)); // rax
+        f.instruction(&Instruction::I32WrapI64);
     }
     f.instruction(&Instruction::End);
     code.function(&f);
@@ -692,12 +737,12 @@ fn test_t5_python3_sandbox_blocks_and_stress() {
         "unexpected stderr: {stderr}"
     );
 
-    // 2. os.fork blocked cleanly (-ENOSYS -> OSError)
+    // 2. os.fork works inside sandboxed multi-process runtime (zero host processes)
     let out = run_py(
-        "import os\ntry:\n os.fork()\nexcept OSError as e:\n print('FORK_BLOCKED', e.errno)",
+        "import os\npid = os.fork()\nif pid == 0:\n os._exit(7)\n_, st = os.waitpid(pid, 0)\nprint('FORK_OK', os.waitstatus_to_exitcode(st))",
     );
-    assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).contains("FORK_BLOCKED 38"));
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("FORK_OK 7"));
 
     // 3. large allocation (triggers glibc anonymous mmap) works inside sandbox
     let out = run_py(
