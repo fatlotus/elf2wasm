@@ -23,6 +23,13 @@ mod tests {
         rcx: i64,
         rip: i64,
         rsp: i64,
+        rax: i64,
+        rdi: i64,
+        rsi: i64,
+        rdx: i64,
+        r10: i64,
+        r8: i64,
+        r9: i64,
         exit_flag: i32,
         exit_code: i32,
         yield_flag: i32,
@@ -38,6 +45,13 @@ mod tests {
                 rcx: 0,
                 rip: 0,
                 rsp: 0,
+                rax: 0,
+                rdi: 0,
+                rsi: 0,
+                rdx: 0,
+                r10: 0,
+                r8: 0,
+                r9: 0,
                 exit_flag: 0,
                 exit_code: 0,
                 yield_flag: 0,
@@ -107,6 +121,30 @@ mod tests {
         }
         fn set_rsp(&mut self, val: i64) {
             self.rsp = val;
+        }
+        fn get_rax(&self) -> i64 {
+            self.rax
+        }
+        fn set_rax(&mut self, val: i64) {
+            self.rax = val;
+        }
+        fn get_rdi(&self) -> i64 {
+            self.rdi
+        }
+        fn get_rsi(&self) -> i64 {
+            self.rsi
+        }
+        fn get_rdx(&self) -> i64 {
+            self.rdx
+        }
+        fn get_r10(&self) -> i64 {
+            self.r10
+        }
+        fn get_r8(&self) -> i64 {
+            self.r8
+        }
+        fn get_r9(&self) -> i64 {
+            self.r9
         }
         fn set_exit(&mut self, code: i32) {
             self.exit_flag = 1;

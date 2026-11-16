@@ -24,6 +24,14 @@ pub trait GuestContext {
     fn get_rcx(&self) -> i64;
     fn set_rip(&mut self, val: i64);
     fn set_rsp(&mut self, val: i64);
+    fn get_rax(&self) -> i64;
+    fn set_rax(&mut self, val: i64);
+    fn get_rdi(&self) -> i64;
+    fn get_rsi(&self) -> i64;
+    fn get_rdx(&self) -> i64;
+    fn get_r10(&self) -> i64;
+    fn get_r8(&self) -> i64;
+    fn get_r9(&self) -> i64;
 
     fn set_exit(&mut self, code: i32);
     fn set_yield_flag(&mut self, val: i32);

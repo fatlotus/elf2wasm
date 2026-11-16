@@ -4,13 +4,14 @@
 //! and cooperative multi-threading to a host/JS shim via `"env"` imports.
 
 use core::cell::UnsafeCell;
-use elf2wasm_core::lifter::CTX_SIZE;
+use elf2wasm_core::lifter::{CTX_SIZE, YIELD_SYSCALL_PENDING};
 use elf2wasm_core::meta::WasmMeta;
 use elf2wasm_runtime_core::context::{GuestContext, HostFsProvider};
+use elf2wasm_runtime_core::scheduler::ThreadState;
 use elf2wasm_runtime_core::stack::setup_guest_stack_ctx;
 use elf2wasm_runtime_core::syscalls::{handle_syscall, HostState, PendingHostAction};
 use elf2wasm_runtime_core::vfs::{
-    path_hash, DirEntry, FileStat, VirtualFs, EFAULT, EINVAL, ENOMEM,
+    path_hash, DirEntry, FileStat, VirtualFs, AT_FDCWD, EFAULT, EINVAL, ENOMEM,
 };
 
 const GLOBAL_ID_FSBASE: u32 = 0;
@@ -22,6 +23,13 @@ const GLOBAL_ID_EXIT_FLAG: u32 = 5;
 const GLOBAL_ID_EXIT_CODE: u32 = 6;
 const GLOBAL_ID_YIELD_FLAG: u32 = 7;
 const GLOBAL_ID_QUANTUM: u32 = 8;
+const GLOBAL_ID_RAX: u32 = 9;
+const GLOBAL_ID_RDI: u32 = 10;
+const GLOBAL_ID_RSI: u32 = 11;
+const GLOBAL_ID_RDX: u32 = 12;
+const GLOBAL_ID_R10: u32 = 13;
+const GLOBAL_ID_R8: u32 = 14;
+const GLOBAL_ID_R9: u32 = 15;
 
 #[link(wasm_import_module = "env")]
 extern "C" {
@@ -248,6 +256,38 @@ impl GuestContext for WasmGuestContext {
         unsafe { host_set_global(GLOBAL_ID_RSP, val) }
     }
 
+    fn get_rax(&self) -> i64 {
+        unsafe { host_get_global(GLOBAL_ID_RAX) }
+    }
+
+    fn set_rax(&mut self, val: i64) {
+        unsafe { host_set_global(GLOBAL_ID_RAX, val) }
+    }
+
+    fn get_rdi(&self) -> i64 {
+        unsafe { host_get_global(GLOBAL_ID_RDI) }
+    }
+
+    fn get_rsi(&self) -> i64 {
+        unsafe { host_get_global(GLOBAL_ID_RSI) }
+    }
+
+    fn get_rdx(&self) -> i64 {
+        unsafe { host_get_global(GLOBAL_ID_RDX) }
+    }
+
+    fn get_r10(&self) -> i64 {
+        unsafe { host_get_global(GLOBAL_ID_R10) }
+    }
+
+    fn get_r8(&self) -> i64 {
+        unsafe { host_get_global(GLOBAL_ID_R8) }
+    }
+
+    fn get_r9(&self) -> i64 {
+        unsafe { host_get_global(GLOBAL_ID_R9) }
+    }
+
     fn set_exit(&mut self, code: i32) {
         unsafe {
             host_set_global(GLOBAL_ID_EXIT_FLAG, 1);
@@ -337,6 +377,31 @@ pub extern "C" fn runtime_add_vfs_file(
 }
 
 #[no_mangle]
+pub extern "C" fn runtime_add_vfs_symlink(
+    path_ptr: *const u8,
+    path_len: usize,
+    target_ptr: *const u8,
+    target_len: usize,
+) -> i32 {
+    let Some(state) = state_mut() else {
+        return -1;
+    };
+    if path_ptr.is_null() || path_len == 0 || target_ptr.is_null() || target_len == 0 {
+        return -1;
+    }
+    let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
+    let Ok(path) = core::str::from_utf8(path_bytes) else {
+        return -1;
+    };
+    let target_bytes = unsafe { core::slice::from_raw_parts(target_ptr, target_len) };
+    let Ok(target) = core::str::from_utf8(target_bytes) else {
+        return -1;
+    };
+    state.vfs.vfs_add_symlink(path, target);
+    0
+}
+
+#[no_mangle]
 pub extern "C" fn runtime_read_vfs_file(
     path_ptr: *const u8,
     path_len: usize,
@@ -362,6 +427,44 @@ pub extern "C" fn runtime_read_vfs_file(
     let len = data.len();
     let ptr = data.as_mut_ptr();
     core::mem::forget(data);
+    unsafe {
+        *out_len_ptr = len;
+    }
+    ptr
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_read_vfs_link(
+    path_ptr: *const u8,
+    path_len: usize,
+    out_len_ptr: *mut usize,
+) -> *mut u8 {
+    if out_len_ptr.is_null() || path_ptr.is_null() || path_len == 0 {
+        return core::ptr::null_mut();
+    }
+    let Some(state) = state_ref() else {
+        unsafe {
+            *out_len_ptr = 0;
+        }
+        return core::ptr::null_mut();
+    };
+    let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
+    let Ok(path) = core::str::from_utf8(path_bytes) else {
+        unsafe {
+            *out_len_ptr = 0;
+        }
+        return core::ptr::null_mut();
+    };
+    let Ok(mut target) = state.vfs.readlink(AT_FDCWD, path) else {
+        unsafe {
+            *out_len_ptr = 0;
+        }
+        return core::ptr::null_mut();
+    };
+    target.shrink_to_fit();
+    let len = target.len();
+    let ptr = target.as_mut_ptr();
+    core::mem::forget(target);
     unsafe {
         *out_len_ptr = len;
     }
@@ -518,15 +621,51 @@ pub extern "C" fn runtime_on_yield() -> i32 {
     if state.is_main_exited() {
         return 0;
     }
-    let yield_flag = unsafe { host_get_global(GLOBAL_ID_YIELD_FLAG) } as i32;
-    let exit_flag = unsafe { host_get_global(GLOBAL_ID_EXIT_FLAG) } as i32;
+    let mut yield_flag = unsafe { host_get_global(GLOBAL_ID_YIELD_FLAG) } as i32;
+    let mut exit_flag = unsafe { host_get_global(GLOBAL_ID_EXIT_FLAG) } as i32;
     if exit_flag != 0 && state.pending_action.is_none() {
         return 0;
+    }
+    let mut ctx = WasmGuestContext;
+    if yield_flag == YIELD_SYSCALL_PENDING {
+        let nr = ctx.get_rax();
+        let a0 = ctx.get_rdi();
+        let a1 = ctx.get_rsi();
+        let a2 = ctx.get_rdx();
+        let a3 = ctx.get_r10();
+        let a4 = ctx.get_r8();
+        let a5 = ctx.get_r9();
+        let ret = handle_syscall(&mut ctx, state, nr, a0, a1, a2, a3, a4, a5);
+        ctx.set_rax(ret);
+
+        if state.is_main_exited() {
+            return 0;
+        }
+        yield_flag = unsafe { host_get_global(GLOBAL_ID_YIELD_FLAG) } as i32;
+        exit_flag = unsafe { host_get_global(GLOBAL_ID_EXIT_FLAG) } as i32;
+        if exit_flag != 0 && state.pending_action.is_none() {
+            return 0;
+        }
+        if yield_flag == YIELD_SYSCALL_PENDING {
+            let other_runnable = !state.scheduler.run_queue.is_empty()
+                || state.has_expired_timed_waiter()
+                || state.processes.iter().any(|(&pid, p)| {
+                    pid != state.active_pid
+                        && !p.exited
+                        && p.scheduler
+                            .threads
+                            .values()
+                            .any(|t| t.state == ThreadState::Runnable)
+                });
+            if !other_runnable {
+                ctx.set_yield_flag(0);
+                return 1;
+            }
+        }
     }
     if yield_flag == 0 && state.pending_action.is_none() {
         return 0;
     }
-    let mut ctx = WasmGuestContext;
     state
         .on_yield_multiproc(&mut ctx, yield_flag)
         .unwrap_or(0)

@@ -322,16 +322,18 @@ impl Scheduler {
     pub fn on_yield(&mut self, ctx: &mut dyn GuestContext, yield_flag: i32) -> Result<bool, i64> {
         if yield_flag == 2 {
             self.virtual_mono_ns = self.virtual_mono_ns.saturating_add(QUANTUM_TIME_STEP_NS);
-            if self.run_queue.is_empty()
-                && self
-                    .threads
-                    .get(&self.current_tid)
-                    .map_or(false, |t| t.state == ThreadState::Runnable)
-            {
-                ctx.set_yield_flag(0);
-                ctx.set_quantum(DEFAULT_QUANTUM);
-                return Ok(true);
-            }
+        }
+        self.wake_timed_waiters(self.virtual_mono_ns);
+        if yield_flag == 2
+            && self.run_queue.is_empty()
+            && self
+                .threads
+                .get(&self.current_tid)
+                .map_or(false, |t| t.state == ThreadState::Runnable)
+        {
+            ctx.set_yield_flag(0);
+            ctx.set_quantum(DEFAULT_QUANTUM);
+            return Ok(true);
         }
 
         // Save current thread context

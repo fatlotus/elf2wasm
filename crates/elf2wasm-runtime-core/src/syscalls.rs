@@ -5,8 +5,8 @@ use crate::scheduler::{
 };
 use crate::stack::setup_guest_stack_ctx;
 use crate::vfs::{
-    normalize_guest_path, FileStat, OpenFile, SoEntry, VirtualFs, AT_FDCWD, AT_REMOVEDIR, EACCES,
-    EAGAIN, EBADF, ECHILD, EFAULT, EINVAL, ENOENT, ENOMEM, ENOSYS, ENOTDIR, ENOTTY, EPIPE, ERANGE,
+    FileStat, OpenFile, SoEntry, VirtualFs, AT_FDCWD, AT_REMOVEDIR, EACCES,
+    EAGAIN, EBADF, ECHILD, EFAULT, EINVAL, ENOENT, ENOMEM, ENOSYS, ENOTTY, EPIPE, ERANGE,
     ESRCH, ETIMEDOUT, O_NONBLOCK, S_IFDIR,
 };
 use elf2wasm_core::elf_loader::{BRK_START, MMAP_START};
@@ -64,6 +64,7 @@ const SYS_RENAME: i64 = 82;
 const SYS_MKDIR: i64 = 83;
 const SYS_RMDIR: i64 = 84;
 const SYS_UNLINK: i64 = 87;
+const SYS_SYMLINK: i64 = 88;
 const SYS_READLINK: i64 = 89;
 const SYS_CHMOD: i64 = 90;
 const SYS_FCHMOD: i64 = 91;
@@ -99,6 +100,7 @@ const SYS_MKDIRAT: i64 = 258;
 const SYS_NEWFSTATAT: i64 = 262;
 const SYS_UNLINKAT: i64 = 263;
 const SYS_RENAMEAT: i64 = 264;
+const SYS_SYMLINKAT: i64 = 266;
 const SYS_READLINKAT: i64 = 267;
 const SYS_FCHMODAT: i64 = 268;
 const SYS_FACCESSAT: i64 = 269;
@@ -870,6 +872,29 @@ impl HostState {
         }
     }
 
+    pub fn has_expired_timed_waiter(&self) -> bool {
+        let now_ns = self.scheduler.virtual_mono_ns;
+        if self.scheduler.min_wake_ns().map_or(false, |w| w <= now_ns) {
+            return true;
+        }
+        self.processes.iter().any(|(&pid, p)| {
+            pid != self.active_pid
+                && !p.exited
+                && p.scheduler.min_wake_ns().map_or(false, |w| w <= now_ns)
+        })
+    }
+
+    pub fn wake_expired_timed_waiters(&mut self) {
+        let now_ns = self.scheduler.virtual_mono_ns;
+        self.scheduler.wake_timed_waiters(now_ns);
+        let active_pid = self.active_pid;
+        for (&pid, p) in self.processes.iter_mut() {
+            if pid != active_pid && !p.exited {
+                p.scheduler.wake_timed_waiters(now_ns);
+            }
+        }
+    }
+
     /// Multi-process scheduler yield handler for `elf2wasm-runtime-wasm`.
     /// Returns:
     /// - `0`: all processes exited or deadlocked
@@ -916,6 +941,7 @@ impl HostState {
                 .scheduler
                 .virtual_mono_ns
                 .saturating_add(QUANTUM_TIME_STEP_NS);
+            self.wake_expired_timed_waiters();
             let other_runnable = self.processes.iter().any(|(&pid, p)| {
                 pid != self.active_pid
                     && !p.exited
@@ -938,12 +964,20 @@ impl HostState {
             }
         }
 
+        let mut preempt_cur = (yield_flag == 2 || yield_flag == 3)
+            && !active_exited
+            && self
+                .scheduler
+                .threads
+                .get(&self.scheduler.current_tid)
+                .map_or(false, |t| t.state == ThreadState::Runnable);
+
         if !active_exited {
             let saved = ctx.save_ctx(self.scheduler.scratch_addr)?;
             let cur_tid = self.scheduler.current_tid;
             if let Some(cur) = self.scheduler.threads.get_mut(&cur_tid) {
                 cur.regs = saved;
-                if cur.state == ThreadState::Runnable {
+                if cur.state == ThreadState::Runnable && !preempt_cur {
                     self.scheduler.run_queue.push_back(cur_tid);
                 }
             }
@@ -951,6 +985,7 @@ impl HostState {
 
         loop {
             self.wake_ready_waiters();
+            self.wake_expired_timed_waiters();
 
             if !self
                 .processes
@@ -958,6 +993,10 @@ impl HostState {
                 .map_or(false, |p| p.exited)
             {
                 if let Some(next_tid) = self.scheduler.pop_next_runnable() {
+                    if preempt_cur {
+                        self.scheduler.run_queue.push_back(self.scheduler.current_tid);
+                        preempt_cur = false;
+                    }
                     self.scheduler.current_tid = next_tid;
                     if !self.complete_pending_wakeup(ctx)? {
                         continue;
@@ -993,9 +1032,26 @@ impl HostState {
             }
 
             if let Some((next_pid, next_tid)) = chosen {
+                if preempt_cur {
+                    self.scheduler.run_queue.push_back(self.scheduler.current_tid);
+                }
                 self.switch_active_process(next_pid);
                 self.scheduler.current_tid = next_tid;
                 return Ok(2);
+            }
+
+            if preempt_cur {
+                let cur_tid = self.scheduler.current_tid;
+                if let Some(t) = self.scheduler.threads.get(&cur_tid) {
+                    if t.state == ThreadState::Runnable {
+                        let regs = t.regs;
+                        ctx.load_ctx(self.scheduler.scratch_addr, &regs)?;
+                        ctx.set_yield_flag(0);
+                        ctx.set_quantum(DEFAULT_QUANTUM);
+                        return Ok(1);
+                    }
+                }
+                preempt_cur = false;
             }
 
             // Fast-forward virtual time to earliest timer across all non-exited processes
@@ -1402,24 +1458,17 @@ fn handle_syscall_inner(
             }
             total
         }
-        SYS_OPEN => {
-            let path = match read_cstr(ctx, a0 as u64) {
+        SYS_OPEN | SYS_OPENAT => {
+            let (dirfd, path_ptr, flags, mode) = if nr == SYS_OPENAT {
+                (a0 as i32, a1 as u64, a2 as i32, a3 as u32)
+            } else {
+                (AT_FDCWD, a0 as u64, a1 as i32, a2 as u32)
+            };
+            let path = match read_cstr(ctx, path_ptr) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            state
-                .vfs
-                .openat_with_mode(AT_FDCWD, &path, a1 as i32, a2 as u32, now_ns)
-        }
-        SYS_OPENAT => {
-            let dirfd = a0 as i32;
-            let path = match read_cstr(ctx, a1 as u64) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            state
-                .vfs
-                .openat_with_mode(dirfd, &path, a2 as i32, a3 as u32, now_ns)
+            state.vfs.openat_with_mode(dirfd, &path, flags, mode, now_ns)
         }
         SYS_CLOSE => {
             let fd = a0 as i32;
@@ -1433,20 +1482,6 @@ fn handle_syscall_inner(
             ret
         }
         SYS_LSEEK => state.vfs.lseek(a0 as i32, a1, a2 as i32),
-        SYS_STAT => {
-            let path = match read_cstr(ctx, a0 as u64) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            let st = match state.vfs.stat_path(AT_FDCWD, &path, 0) {
-                Ok(s) => s,
-                Err(e) => return e,
-            };
-            match write_stat(ctx, a1 as u64, &st) {
-                Ok(()) => 0,
-                Err(e) => e,
-            }
-        }
         SYS_FSTAT => {
             let st = match state.vfs.stat_fd(a0 as i32) {
                 Ok(s) => s,
@@ -1457,107 +1492,78 @@ fn handle_syscall_inner(
                 Err(e) => e,
             }
         }
-        SYS_LSTAT => {
-            let path = match read_cstr(ctx, a0 as u64) {
+        SYS_STAT | SYS_LSTAT | SYS_NEWFSTATAT => {
+            let (dirfd, path_ptr, stat_ptr, flags) = if nr == SYS_NEWFSTATAT {
+                (a0 as i32, a1 as u64, a2 as u64, a3 as i32)
+            } else {
+                let flags = if nr == SYS_LSTAT { 0x100 } else { 0 };
+                (AT_FDCWD, a0 as u64, a1 as u64, flags)
+            };
+            let path = match read_cstr(ctx, path_ptr) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            let st = match state.vfs.stat_path(AT_FDCWD, &path, 0x100) {
-                Ok(s) => s,
-                Err(e) => return e,
-            };
-            match write_stat(ctx, a1 as u64, &st) {
-                Ok(()) => 0,
-                Err(e) => e,
-            }
-        }
-        SYS_NEWFSTATAT => {
-            let dirfd = a0 as i32;
-            let path = match read_cstr(ctx, a1 as u64) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            let flags = a3 as i32;
             let st = match state.vfs.stat_path(dirfd, &path, flags) {
                 Ok(s) => s,
                 Err(e) => return e,
             };
-            match write_stat(ctx, a2 as u64, &st) {
+            match write_stat(ctx, stat_ptr, &st) {
                 Ok(()) => 0,
                 Err(e) => e,
             }
         }
-        SYS_ACCESS => {
-            let path = match read_cstr(ctx, a0 as u64) {
+        SYS_ACCESS | SYS_FACCESSAT | SYS_FACCESSAT2 => {
+            let (dirfd, path_ptr, mode) = if nr == SYS_ACCESS {
+                (AT_FDCWD, a0 as u64, a1 as i32)
+            } else {
+                (a0 as i32, a1 as u64, a2 as i32)
+            };
+            let path = match read_cstr(ctx, path_ptr) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            state.vfs.access(AT_FDCWD, &path, a1 as i32)
+            state.vfs.access(dirfd, &path, mode)
         }
-        SYS_FACCESSAT | SYS_FACCESSAT2 => {
-            let dirfd = a0 as i32;
-            let path = match read_cstr(ctx, a1 as u64) {
+        SYS_MKDIR | SYS_MKDIRAT => {
+            let (dirfd, path_ptr, mode) = if nr == SYS_MKDIRAT {
+                (a0 as i32, a1 as u64, a2 as u32)
+            } else {
+                (AT_FDCWD, a0 as u64, a1 as u32)
+            };
+            let path = match read_cstr(ctx, path_ptr) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            state.vfs.access(dirfd, &path, a2 as i32)
+            state.vfs.mkdirat(dirfd, &path, mode, now_ns)
         }
-        SYS_MKDIR => {
-            let path = match read_cstr(ctx, a0 as u64) {
+        SYS_UNLINK | SYS_RMDIR | SYS_UNLINKAT => {
+            let (dirfd, path_ptr, flags) = if nr == SYS_UNLINKAT {
+                (a0 as i32, a1 as u64, a2 as i32)
+            } else {
+                let flags = if nr == SYS_RMDIR { AT_REMOVEDIR } else { 0 };
+                (AT_FDCWD, a0 as u64, flags)
+            };
+            let path = match read_cstr(ctx, path_ptr) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            state.vfs.mkdirat(AT_FDCWD, &path, a1 as u32, now_ns)
+            state.vfs.unlinkat(dirfd, &path, flags)
         }
-        SYS_MKDIRAT => {
-            let path = match read_cstr(ctx, a1 as u64) {
+        SYS_RENAME | SYS_RENAMEAT | SYS_RENAMEAT2 => {
+            let (olddirfd, old_ptr, newdirfd, new_ptr) = if nr == SYS_RENAME {
+                (AT_FDCWD, a0 as u64, AT_FDCWD, a1 as u64)
+            } else {
+                (a0 as i32, a1 as u64, a2 as i32, a3 as u64)
+            };
+            let oldpath = match read_cstr(ctx, old_ptr) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            state.vfs.mkdirat(a0 as i32, &path, a2 as u32, now_ns)
-        }
-        SYS_UNLINK => {
-            let path = match read_cstr(ctx, a0 as u64) {
+            let newpath = match read_cstr(ctx, new_ptr) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            state.vfs.unlinkat(AT_FDCWD, &path, 0)
-        }
-        SYS_RMDIR => {
-            let path = match read_cstr(ctx, a0 as u64) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            state.vfs.unlinkat(AT_FDCWD, &path, AT_REMOVEDIR)
-        }
-        SYS_UNLINKAT => {
-            let path = match read_cstr(ctx, a1 as u64) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            state.vfs.unlinkat(a0 as i32, &path, a2 as i32)
-        }
-        SYS_RENAME => {
-            let oldpath = match read_cstr(ctx, a0 as u64) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            let newpath = match read_cstr(ctx, a1 as u64) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            state.vfs.renameat(AT_FDCWD, &oldpath, AT_FDCWD, &newpath)
-        }
-        SYS_RENAMEAT | SYS_RENAMEAT2 => {
-            let oldpath = match read_cstr(ctx, a1 as u64) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            let newpath = match read_cstr(ctx, a3 as u64) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            state.vfs.renameat(a0 as i32, &oldpath, a2 as i32, &newpath)
+            state.vfs.renameat(olddirfd, &oldpath, newdirfd, &newpath)
         }
         SYS_TRUNCATE => {
             let path = match read_cstr(ctx, a0 as u64) {
@@ -1567,20 +1573,18 @@ fn handle_syscall_inner(
             state.vfs.truncate_path(&path, a1, now_ns)
         }
         SYS_FTRUNCATE => state.vfs.ftruncate(a0 as i32, a1, now_ns),
-        SYS_CHMOD => {
-            let path = match read_cstr(ctx, a0 as u64) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            state.vfs.chmod_at(AT_FDCWD, &path, a1 as u32)
-        }
         SYS_FCHMOD => state.vfs.fchmod(a0 as i32, a1 as u32),
-        SYS_FCHMODAT => {
-            let path = match read_cstr(ctx, a1 as u64) {
+        SYS_CHMOD | SYS_FCHMODAT => {
+            let (dirfd, path_ptr, mode) = if nr == SYS_FCHMODAT {
+                (a0 as i32, a1 as u64, a2 as u32)
+            } else {
+                (AT_FDCWD, a0 as u64, a1 as u32)
+            };
+            let path = match read_cstr(ctx, path_ptr) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            state.vfs.chmod_at(a0 as i32, &path, a2 as u32)
+            state.vfs.chmod_at(dirfd, &path, mode)
         }
         SYS_UTIMENSAT => {
             let path = if a1 == 0 {
@@ -2381,7 +2385,7 @@ fn handle_syscall_inner(
         }
         SYS_IOCTL => -ENOTTY,
         SYS_DUP => state.vfs.dup(a0 as i32),
-        SYS_DUP2 => {
+        SYS_DUP2 | SYS_DUP3 => {
             let oldfd = a0 as i32;
             let newfd = a1 as i32;
             let displaced_pipe = if oldfd != newfd {
@@ -2389,24 +2393,11 @@ fn handle_syscall_inner(
             } else {
                 None
             };
-            let ret = state.vfs.dup2(oldfd, newfd);
-            if ret >= 0 {
-                if let Some(pid) = displaced_pipe {
-                    state.wake_pipe_waiters(pid);
-                }
-            }
-            ret
-        }
-        SYS_DUP3 => {
-            let oldfd = a0 as i32;
-            let newfd = a1 as i32;
-            let flags = a2 as i32;
-            let displaced_pipe = if oldfd != newfd {
-                state.vfs.get_fd(newfd).and_then(|f| f.pipe_id)
+            let ret = if nr == SYS_DUP3 {
+                state.vfs.dup3(oldfd, newfd, a2 as i32)
             } else {
-                None
+                state.vfs.dup2(oldfd, newfd)
             };
-            let ret = state.vfs.dup3(oldfd, newfd, flags);
             if ret >= 0 {
                 if let Some(pid) = displaced_pipe {
                     state.wake_pipe_waiters(pid);
@@ -2414,30 +2405,9 @@ fn handle_syscall_inner(
             }
             ret
         }
-        SYS_PIPE => {
+        SYS_PIPE | SYS_PIPE2 => {
             let pipefd_addr = a0 as u64;
-            if pipefd_addr == 0 {
-                return -EFAULT;
-            }
-            let (rfd, wfd) = match state.vfs.create_pipe_with_flags(0) {
-                Ok(fds) => fds,
-                Err(e) => return e,
-            };
-            let mut buf = [0u8; 8];
-            buf[0..4].copy_from_slice(&rfd.to_le_bytes());
-            buf[4..8].copy_from_slice(&wfd.to_le_bytes());
-            match write_bytes(ctx, pipefd_addr, &buf) {
-                Ok(()) => 0,
-                Err(e) => {
-                    state.vfs.close(rfd);
-                    state.vfs.close(wfd);
-                    e
-                }
-            }
-        }
-        SYS_PIPE2 => {
-            let pipefd_addr = a0 as u64;
-            let flags = a1 as i32;
+            let flags = if nr == SYS_PIPE2 { a1 as i32 } else { 0 };
             if pipefd_addr == 0 {
                 return -EFAULT;
             }
@@ -2490,38 +2460,32 @@ fn handle_syscall_inner(
                 Err(e) => e,
             }
         }
-        SYS_READLINK => {
-            let path = match read_cstr(ctx, a0 as u64) {
-                Ok(p) => p,
+        SYS_SYMLINK | SYS_SYMLINKAT => {
+            let (target_ptr, dirfd, link_ptr) = if nr == SYS_SYMLINKAT {
+                (a0 as u64, a1 as i32, a2 as u64)
+            } else {
+                (a0 as u64, AT_FDCWD, a1 as u64)
+            };
+            let target = match read_cstr(ctx, target_ptr) {
+                Ok(s) => s,
                 Err(e) => return e,
             };
-            let buf_addr = a1 as u64;
-            let bufsiz_signed = a2 as isize;
-            if bufsiz_signed <= 0 {
-                return -EINVAL;
-            }
-            let bufsiz = bufsiz_signed as usize;
-            match state.vfs.readlink(AT_FDCWD, &path) {
-                Ok(target) => {
-                    let n = target.len().min(bufsiz);
-                    if n > 0 {
-                        if let Err(e) = write_bytes(ctx, buf_addr, &target[..n]) {
-                            return e;
-                        }
-                    }
-                    n as i64
-                }
-                Err(e) => e,
-            }
+            let linkpath = match read_cstr(ctx, link_ptr) {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            state.vfs.symlinkat(&target, dirfd, &linkpath, now_ns)
         }
-        SYS_READLINKAT => {
-            let dirfd = a0 as i32;
-            let path = match read_cstr(ctx, a1 as u64) {
+        SYS_READLINK | SYS_READLINKAT => {
+            let (dirfd, path_ptr, buf_addr, bufsiz_signed) = if nr == SYS_READLINKAT {
+                (a0 as i32, a1 as u64, a2 as u64, a3 as isize)
+            } else {
+                (AT_FDCWD, a0 as u64, a1 as u64, a2 as isize)
+            };
+            let path = match read_cstr(ctx, path_ptr) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            let buf_addr = a2 as u64;
-            let bufsiz_signed = a3 as isize;
             if bufsiz_signed <= 0 {
                 return -EINVAL;
             }
@@ -2837,21 +2801,11 @@ fn do_execve(
         } else {
             return -EBADF;
         }
-    } else if raw_path.starts_with('/') {
-        normalize_guest_path(&raw_path)
-    } else if dirfd == AT_FDCWD {
-        if state.vfs.cwd == "/" {
-            normalize_guest_path(&format!("/{}", raw_path))
-        } else {
-            normalize_guest_path(&format!("{}/{}", state.vfs.cwd, raw_path))
-        }
-    } else if let Some(df) = state.vfs.get_fd(dirfd) {
-        if !df.is_dir {
-            return -ENOTDIR;
-        }
-        normalize_guest_path(&format!("{}/{}", df.guest_path, raw_path))
     } else {
-        return -EBADF;
+        match state.vfs.resolve_path(dirfd, &raw_path, true) {
+            Ok(p) => p,
+            Err(e) => return e,
+        }
     };
 
     match state.vfs.stat_path(AT_FDCWD, &norm_path, 0) {

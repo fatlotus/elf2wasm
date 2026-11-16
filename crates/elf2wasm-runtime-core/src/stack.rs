@@ -246,6 +246,28 @@ pub fn setup_guest_stack(mem: &mut [u8], meta: &WasmMeta, config: &RunConfig) ->
         }
         fn set_rip(&mut self, _val: i64) {}
         fn set_rsp(&mut self, _val: i64) {}
+        fn get_rax(&self) -> i64 {
+            0
+        }
+        fn set_rax(&mut self, _val: i64) {}
+        fn get_rdi(&self) -> i64 {
+            0
+        }
+        fn get_rsi(&self) -> i64 {
+            0
+        }
+        fn get_rdx(&self) -> i64 {
+            0
+        }
+        fn get_r10(&self) -> i64 {
+            0
+        }
+        fn get_r8(&self) -> i64 {
+            0
+        }
+        fn get_r9(&self) -> i64 {
+            0
+        }
         fn set_exit(&mut self, _code: i32) {}
         fn set_yield_flag(&mut self, _val: i32) {}
         fn set_quantum(&mut self, _val: i32) {}

@@ -31,6 +31,7 @@ pub const EPIPE: i64 = 32;
 pub const ERANGE: i64 = 34;
 pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
+pub const ELOOP: i64 = 40;
 pub const ETIMEDOUT: i64 = 110;
 
 pub const MAX_FDS: i32 = 4096;
@@ -51,7 +52,9 @@ pub const O_TRUNC: i32 = 0x200;
 pub const O_APPEND: i32 = 0x400;
 pub const O_NONBLOCK: i32 = 0x800;
 pub const O_DIRECTORY: i32 = 0x10000;
+pub const O_NOFOLLOW: i32 = 0x20000;
 pub const O_CLOEXEC: i32 = 0x80000;
+pub const MAX_SYMLINK_HOPS: usize = 40;
 
 pub const S_IFLNK: u32 = 0o120000;
 pub const S_IFREG: u32 = 0o100000;
@@ -105,6 +108,10 @@ pub enum OverlayNode {
     },
     Dir {
         mode: u32,
+        mtime_ns: u64,
+    },
+    Symlink {
+        target: String,
         mtime_ns: u64,
     },
 }
@@ -383,18 +390,25 @@ impl VirtualFs {
             .collect();
     }
 
-    pub fn vfs_write_file(&mut self, path: &str, bytes: &[u8], mode: u32) {
+    fn resolve_and_ensure_parent(&mut self, path: &str) -> Option<String> {
         let norm = normalize_guest_path(path);
         if norm == "/" {
-            return;
+            return None;
         }
-        // Ensure parent directories exist in overlay
-        let mut cur = String::new();
-        let parts: Vec<&str> = norm.trim_start_matches('/').split('/').collect();
-        for part in &parts[..parts.len().saturating_sub(1)] {
-            if part.is_empty() {
-                continue;
+        let (parent_raw, name) = norm.rsplit_once('/')?;
+        if name.is_empty() {
+            return None;
+        }
+        let resolved_parent = if parent_raw.is_empty() {
+            "/".to_string()
+        } else {
+            match self.resolve_path(AT_FDCWD, parent_raw, true) {
+                Ok(p) => p,
+                Err(_) => parent_raw.to_string(),
             }
+        };
+        let mut cur = String::new();
+        for part in resolved_parent.split('/').filter(|s| !s.is_empty()) {
             cur.push('/');
             cur.push_str(part);
             self.overlay.entry(cur.clone()).or_insert(OverlayNode::Dir {
@@ -402,8 +416,20 @@ impl VirtualFs {
                 mtime_ns: 0,
             });
         }
+        let final_path = if resolved_parent == "/" {
+            format!("/{}", name)
+        } else {
+            format!("{}/{}", resolved_parent, name)
+        };
+        Some(final_path)
+    }
+
+    pub fn vfs_write_file(&mut self, path: &str, bytes: &[u8], mode: u32) {
+        let Some(final_path) = self.resolve_and_ensure_parent(path) else {
+            return;
+        };
         self.overlay.insert(
-            norm,
+            final_path,
             OverlayNode::File {
                 data: Arc::new(bytes.to_vec()),
                 mode: mode & 0o7777,
@@ -412,8 +438,21 @@ impl VirtualFs {
         );
     }
 
+    pub fn vfs_add_symlink(&mut self, path: &str, target: &str) {
+        let Some(final_path) = self.resolve_and_ensure_parent(path) else {
+            return;
+        };
+        self.overlay.insert(
+            final_path,
+            OverlayNode::Symlink {
+                target: target.to_string(),
+                mtime_ns: 0,
+            },
+        );
+    }
+
     pub fn vfs_read_file(&self, path: &str) -> Option<Vec<u8>> {
-        let norm = normalize_guest_path(path);
+        let norm = self.resolve_path(AT_FDCWD, path, true).ok()?;
         if let Some(OverlayNode::File { data, .. }) = self.overlay.get(&norm) {
             return Some(data.as_ref().clone());
         }
@@ -439,27 +478,77 @@ impl VirtualFs {
         Err(-EMFILE)
     }
 
-    fn resolve_guest_path(&self, dirfd: i32, raw_path: &str) -> Result<String, i64> {
+    pub fn resolve_path(
+        &self,
+        dirfd: i32,
+        raw_path: &str,
+        follow_final: bool,
+    ) -> Result<String, i64> {
         if raw_path.is_empty() {
             return Err(-ENOENT);
         }
-        if raw_path.starts_with('/') {
-            Ok(normalize_guest_path(raw_path))
+        let base: &str = if raw_path.starts_with('/') {
+            "/"
         } else if dirfd == AT_FDCWD {
-            if self.cwd == "/" {
-                Ok(normalize_guest_path(&format!("/{}", raw_path)))
-            } else {
-                Ok(normalize_guest_path(&format!("{}/{}", self.cwd, raw_path)))
-            }
+            &self.cwd
         } else if let Some(dir_file) = self.fds.get(&dirfd) {
             if !dir_file.is_dir {
                 return Err(-ENOTDIR);
             }
-            let base = &dir_file.guest_path;
-            Ok(normalize_guest_path(&format!("{}/{}", base, raw_path)))
+            &dir_file.guest_path
         } else {
-            Err(-EBADF)
+            return Err(-EBADF);
+        };
+
+        let has_trailing_slash = raw_path.len() > 1 && raw_path.ends_with('/');
+        let eff_follow_final = follow_final || has_trailing_slash;
+
+        let mut resolved_parts: Vec<String> = base
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        let mut queue: VecDeque<String> = raw_path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        let mut hops = 0usize;
+        while let Some(comp) = queue.pop_front() {
+            if comp == "." {
+                continue;
+            }
+            if comp == ".." {
+                resolved_parts.pop();
+                continue;
+            }
+            resolved_parts.push(comp);
+            let is_last = queue.is_empty();
+            if !is_last || eff_follow_final {
+                let cur_path = format!("/{}", resolved_parts.join("/"));
+                if let Some(OverlayNode::Symlink { target, .. }) = self.overlay.get(&cur_path) {
+                    hops += 1;
+                    if hops > MAX_SYMLINK_HOPS {
+                        return Err(-ELOOP);
+                    }
+                    resolved_parts.pop();
+                    if target.starts_with('/') {
+                        resolved_parts.clear();
+                    }
+                    for part in target.split('/').filter(|s| !s.is_empty()).rev() {
+                        queue.push_front(part.to_string());
+                    }
+                    continue;
+                }
+            }
         }
+
+        Ok(if resolved_parts.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", resolved_parts.join("/"))
+        })
     }
 
     fn find_so(&self, norm_path: &str) -> Option<(usize, &SoEntry)> {
@@ -508,18 +597,45 @@ impl VirtualFs {
     }
 
     fn is_existing_dir(&self, norm_path: &str) -> bool {
-        match self.overlay.get(norm_path) {
+        let check_path = match self.overlay.get(norm_path) {
             Some(OverlayNode::Dir { .. }) => return true,
             Some(OverlayNode::File { .. }) => return false,
-            None => {}
-        }
-        if let Some(st) = self.host_fs.stat_host_ro(norm_path) {
+            Some(OverlayNode::Symlink { .. }) => {
+                let Ok(resolved) = self.resolve_path(AT_FDCWD, norm_path, true) else {
+                    return false;
+                };
+                match self.overlay.get(&resolved) {
+                    Some(OverlayNode::Dir { .. }) => return true,
+                    Some(OverlayNode::File { .. }) | Some(OverlayNode::Symlink { .. }) => {
+                        return false
+                    }
+                    None => resolved,
+                }
+            }
+            None => norm_path.to_string(),
+        };
+        if let Some(st) = self.host_fs.stat_host_ro(&check_path) {
             return (st.st_mode & S_IFDIR) != 0;
         }
-        self.is_virtual_parent_dir(norm_path)
+        self.is_virtual_parent_dir(&check_path)
     }
 
     fn missing_parent_errno(&self, parent: &str) -> i64 {
+        if matches!(self.overlay.get(parent), Some(OverlayNode::Symlink { .. })) {
+            return match self.resolve_path(AT_FDCWD, parent, true) {
+                Ok(resolved) => {
+                    if self.overlay.contains_key(&resolved)
+                        || self.host_fs.stat_host_ro(&resolved).is_some()
+                        || self.is_virtual_parent_dir(&resolved)
+                    {
+                        -ENOTDIR
+                    } else {
+                        -ENOENT
+                    }
+                }
+                Err(e) => e,
+            };
+        }
         if self.overlay.contains_key(parent)
             || self.host_fs.stat_host_ro(parent).is_some()
             || self.find_so(parent).is_some()
@@ -562,6 +678,7 @@ impl VirtualFs {
                     let d_type = match node {
                         OverlayNode::Dir { .. } => DT_DIR,
                         OverlayNode::File { .. } => DT_REG,
+                        OverlayNode::Symlink { .. } => DT_LNK,
                     };
                     entries.push(DirEntry {
                         d_ino: path_hash(path),
@@ -639,7 +756,18 @@ impl VirtualFs {
         mode: u32,
         now_ns: u64,
     ) -> i64 {
-        let norm_path = match self.resolve_guest_path(dirfd, raw_path) {
+        if (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 {
+            if let Ok(no_follow_path) = self.resolve_path(dirfd, raw_path, false) {
+                if matches!(
+                    self.overlay.get(&no_follow_path),
+                    Some(OverlayNode::Symlink { .. })
+                ) {
+                    return -EEXIST;
+                }
+            }
+        }
+        let follow = (flags & O_NOFOLLOW) == 0;
+        let norm_path = match self.resolve_path(dirfd, raw_path, follow) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -697,6 +825,7 @@ impl VirtualFs {
         // Check overlay first
         if let Some(node) = self.overlay.get(&norm_path).cloned() {
             match node {
+                OverlayNode::Symlink { .. } => return -ELOOP,
                 OverlayNode::Dir { .. } => {
                     if (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 {
                         return -EEXIST;
@@ -1373,7 +1502,8 @@ impl VirtualFs {
         if (flags & AT_EMPTY_PATH) != 0 && raw_path.is_empty() {
             return self.stat_fd(dirfd);
         }
-        let norm_path = self.resolve_guest_path(dirfd, raw_path)?;
+        let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+        let norm_path = self.resolve_path(dirfd, raw_path, follow)?;
         if DENY_PATHS.contains(&norm_path.as_str()) {
             return Err(-ENOENT);
         }
@@ -1404,6 +1534,13 @@ impl VirtualFs {
                     st_mode: S_IFREG | *mode,
                     st_nlink: 1,
                     st_size: data.len() as i64,
+                    mtime_ns: *mtime_ns,
+                }),
+                OverlayNode::Symlink { target, mtime_ns } => Ok(FileStat {
+                    st_ino: path_hash(&norm_path),
+                    st_mode: S_IFLNK | 0o777,
+                    st_nlink: 1,
+                    st_size: target.len() as i64,
                     mtime_ns: *mtime_ns,
                 }),
             };
@@ -1458,7 +1595,7 @@ impl VirtualFs {
     }
 
     pub fn readlink(&self, dirfd: i32, raw_path: &str) -> Result<Vec<u8>, i64> {
-        let norm_path = self.resolve_guest_path(dirfd, raw_path)?;
+        let norm_path = self.resolve_path(dirfd, raw_path, false)?;
         if norm_path == "/proc/self/exe"
             || (norm_path.starts_with("/proc/") && norm_path.ends_with("/exe"))
         {
@@ -1469,10 +1606,51 @@ impl VirtualFs {
             };
             return Ok(target.to_vec());
         }
+        if let Some(OverlayNode::Symlink { target, .. }) = self.overlay.get(&norm_path) {
+            return Ok(target.as_bytes().to_vec());
+        }
         if self.stat_path(dirfd, raw_path, AT_SYMLINK_NOFOLLOW).is_ok() {
             return Err(-EINVAL);
         }
         Err(-ENOENT)
+    }
+
+    pub fn symlinkat(&mut self, target: &str, dirfd: i32, raw_linkpath: &str, now_ns: u64) -> i64 {
+        if target.is_empty() {
+            return -ENOENT;
+        }
+        if raw_linkpath.len() > 1 && raw_linkpath.ends_with('/') {
+            return -ENOENT;
+        }
+        let norm_path = match self.resolve_path(dirfd, raw_linkpath, false) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        if norm_path == "/" {
+            return -EEXIST;
+        }
+        if self.is_read_only_path(&norm_path) {
+            return -EACCES;
+        }
+        if self.overlay.contains_key(&norm_path)
+            || self.host_fs.stat_host_ro(&norm_path).is_some()
+            || self.is_virtual_parent_dir(&norm_path)
+            || self.find_so(&norm_path).is_some()
+        {
+            return -EEXIST;
+        }
+        let parent = parent_guest_path(&norm_path);
+        if !self.is_existing_dir(parent) {
+            return self.missing_parent_errno(parent);
+        }
+        self.overlay.insert(
+            norm_path,
+            OverlayNode::Symlink {
+                target: target.to_string(),
+                mtime_ns: now_ns,
+            },
+        );
+        0
     }
 
     pub fn dup(&mut self, oldfd: i32) -> i64 {
@@ -1489,7 +1667,7 @@ impl VirtualFs {
         newfd as i64
     }
 
-    pub fn dup2(&mut self, oldfd: i32, newfd: i32) -> i64 {
+    fn dup_into(&mut self, oldfd: i32, newfd: i32, cloexec: bool) -> i64 {
         if newfd < 0 || newfd >= MAX_FDS {
             return -EBADF;
         }
@@ -1502,7 +1680,7 @@ impl VirtualFs {
         if self.fds.contains_key(&newfd) {
             self.close(newfd);
         }
-        file.cloexec = false;
+        file.cloexec = cloexec;
         self.inc_pipe_ref(&file);
         self.fds.insert(newfd, file);
         if newfd >= self.next_fd {
@@ -1511,29 +1689,15 @@ impl VirtualFs {
         newfd as i64
     }
 
+    pub fn dup2(&mut self, oldfd: i32, newfd: i32) -> i64 {
+        self.dup_into(oldfd, newfd, false)
+    }
+
     pub fn dup3(&mut self, oldfd: i32, newfd: i32, flags: i32) -> i64 {
-        if (flags & !O_CLOEXEC) != 0 {
+        if (flags & !O_CLOEXEC) != 0 || oldfd == newfd {
             return -EINVAL;
         }
-        if oldfd == newfd {
-            return -EINVAL;
-        }
-        if newfd < 0 || newfd >= MAX_FDS {
-            return -EBADF;
-        }
-        let Some(mut file) = self.fds.get(&oldfd).cloned() else {
-            return -EBADF;
-        };
-        if self.fds.contains_key(&newfd) {
-            self.close(newfd);
-        }
-        file.cloexec = (flags & O_CLOEXEC) != 0;
-        self.inc_pipe_ref(&file);
-        self.fds.insert(newfd, file);
-        if newfd >= self.next_fd {
-            self.next_fd = newfd + 1;
-        }
-        newfd as i64
+        self.dup_into(oldfd, newfd, (flags & O_CLOEXEC) != 0)
     }
 
     pub fn dup_from(&mut self, oldfd: i32, min_fd: i32, cloexec: bool) -> i64 {
@@ -1627,21 +1791,23 @@ impl VirtualFs {
     }
 
     pub fn access(&self, dirfd: i32, raw_path: &str, mode: i32) -> i64 {
-        let norm_path = match self.resolve_guest_path(dirfd, raw_path) {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
-        if (mode & 2) != 0 && self.is_read_only_path(&norm_path) {
-            return -EACCES;
+        if let Err(e) = self.stat_path(dirfd, raw_path, 0) {
+            return e;
         }
-        match self.stat_path(dirfd, raw_path, 0) {
-            Ok(_) => 0,
-            Err(e) => e,
+        if (mode & 2) != 0 {
+            let norm_path = match self.resolve_path(dirfd, raw_path, true) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            if self.is_read_only_path(&norm_path) {
+                return -EACCES;
+            }
         }
+        0
     }
 
     pub fn mkdirat(&mut self, dirfd: i32, raw_path: &str, mode: u32, now_ns: u64) -> i64 {
-        let norm_path = match self.resolve_guest_path(dirfd, raw_path) {
+        let norm_path = match self.resolve_path(dirfd, raw_path, false) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1672,7 +1838,7 @@ impl VirtualFs {
     }
 
     pub fn unlinkat(&mut self, dirfd: i32, raw_path: &str, flags: i32) -> i64 {
-        let norm_path = match self.resolve_guest_path(dirfd, raw_path) {
+        let norm_path = match self.resolve_path(dirfd, raw_path, false) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1700,7 +1866,7 @@ impl VirtualFs {
                     return -ENOTEMPTY;
                 }
             }
-            Some(OverlayNode::File { .. }) => {
+            Some(OverlayNode::File { .. }) | Some(OverlayNode::Symlink { .. }) => {
                 if (flags & AT_REMOVEDIR) != 0 {
                     return -ENOTDIR;
                 }
@@ -1724,11 +1890,11 @@ impl VirtualFs {
         newdirfd: i32,
         newpath: &str,
     ) -> i64 {
-        let old_norm = match self.resolve_guest_path(olddirfd, oldpath) {
+        let old_norm = match self.resolve_path(olddirfd, oldpath, false) {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let new_norm = match self.resolve_guest_path(newdirfd, newpath) {
+        let new_norm = match self.resolve_path(newdirfd, newpath, false) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1766,8 +1932,14 @@ impl VirtualFs {
         // Check target compatibility if it exists
         if let Some(existing) = self.overlay.get(&new_norm) {
             match (&node, existing) {
-                (OverlayNode::Dir { .. }, OverlayNode::File { .. }) => return -ENOTDIR,
-                (OverlayNode::File { .. }, OverlayNode::Dir { .. }) => return -EISDIR,
+                (
+                    OverlayNode::Dir { .. },
+                    OverlayNode::File { .. } | OverlayNode::Symlink { .. },
+                ) => return -ENOTDIR,
+                (
+                    OverlayNode::File { .. } | OverlayNode::Symlink { .. },
+                    OverlayNode::Dir { .. },
+                ) => return -EISDIR,
                 (OverlayNode::Dir { .. }, OverlayNode::Dir { .. }) => {
                     let new_prefix = format!("{}/", new_norm);
                     if self.overlay.keys().any(|k| k.starts_with(&new_prefix)) {
@@ -1829,7 +2001,7 @@ impl VirtualFs {
         if length < 0 {
             return -EINVAL;
         }
-        let norm_path = match self.resolve_guest_path(AT_FDCWD, raw_path) {
+        let norm_path = match self.resolve_path(AT_FDCWD, raw_path, true) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1845,6 +2017,7 @@ impl VirtualFs {
                 0
             }
             Some(OverlayNode::Dir { .. }) => -EISDIR,
+            Some(OverlayNode::Symlink { .. }) => -ELOOP,
             None => {
                 if self.host_fs.stat_host_ro(&norm_path).is_some() {
                     -EACCES
@@ -1891,7 +2064,7 @@ impl VirtualFs {
     }
 
     pub fn chmod_at(&mut self, dirfd: i32, raw_path: &str, mode: u32) -> i64 {
-        let norm_path = match self.resolve_guest_path(dirfd, raw_path) {
+        let norm_path = match self.resolve_path(dirfd, raw_path, true) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1903,6 +2076,7 @@ impl VirtualFs {
                 *m = mode & 0o7777;
                 0
             }
+            Some(OverlayNode::Symlink { .. }) => -ELOOP,
             None => {
                 if self.host_fs.stat_host_ro(&norm_path).is_some() {
                     -EACCES
@@ -1932,13 +2106,14 @@ impl VirtualFs {
                 *m = mode & 0o7777;
                 0
             }
+            Some(OverlayNode::Symlink { .. }) => -ELOOP,
             None => -EACCES,
         }
     }
 
     pub fn utimensat(&mut self, dirfd: i32, raw_path: Option<&str>, now_ns: u64) -> i64 {
         let norm_path = match raw_path {
-            Some(p) => match self.resolve_guest_path(dirfd, p) {
+            Some(p) => match self.resolve_path(dirfd, p, true) {
                 Ok(np) => np,
                 Err(e) => return e,
             },
@@ -1956,6 +2131,7 @@ impl VirtualFs {
                 *mtime_ns = now_ns;
                 0
             }
+            Some(OverlayNode::Symlink { .. }) => -ELOOP,
             None => {
                 if self.host_fs.stat_host_ro(&norm_path).is_some() {
                     -EACCES
@@ -1967,7 +2143,7 @@ impl VirtualFs {
     }
 
     pub fn chdir(&mut self, raw_path: &str) -> i64 {
-        let norm_path = match self.resolve_guest_path(AT_FDCWD, raw_path) {
+        let norm_path = match self.resolve_path(AT_FDCWD, raw_path, true) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1990,5 +2166,242 @@ impl VirtualFs {
         }
         self.cwd = file.guest_path.clone();
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_test_vfs() -> VirtualFs {
+        VirtualFs::new_in_memory(&[])
+    }
+
+    #[test]
+    fn test_symlink_relative_and_absolute() {
+        let mut vfs = new_test_vfs();
+        vfs.vfs_write_file("/usr/bin/python3.11", b"ELF_PY", 0o755);
+        vfs.vfs_add_symlink("/usr/bin/python3", "python3.11");
+        vfs.vfs_add_symlink("/bin/py", "/usr/bin/python3");
+
+        assert_eq!(vfs.vfs_read_file("/usr/bin/python3").unwrap(), b"ELF_PY");
+        assert_eq!(vfs.vfs_read_file("/bin/py").unwrap(), b"ELF_PY");
+        assert_eq!(
+            vfs.readlink(AT_FDCWD, "/usr/bin/python3").unwrap(),
+            b"python3.11"
+        );
+        assert_eq!(
+            vfs.readlink(AT_FDCWD, "/bin/py").unwrap(),
+            b"/usr/bin/python3"
+        );
+    }
+
+    #[test]
+    fn test_symlink_parent_dir_traversal() {
+        let mut vfs = new_test_vfs();
+        vfs.vfs_write_file("/usr/lib/x86_64-linux-gnu/libc.so.6", b"LIBC", 0o755);
+        vfs.vfs_add_symlink("/lib64", "/usr/lib/x86_64-linux-gnu");
+
+        assert_eq!(
+            vfs.vfs_read_file("/lib64/libc.so.6").unwrap(),
+            b"LIBC"
+        );
+        let fd = vfs.openat(AT_FDCWD, "/lib64/libc.so.6", O_RDONLY);
+        assert!(fd >= 3);
+        vfs.close(fd as i32);
+    }
+
+    #[test]
+    fn test_symlink_lstat_vs_stat_and_nofollow() {
+        let mut vfs = new_test_vfs();
+        vfs.vfs_write_file("/tmp/target.txt", b"hello", 0o644);
+        vfs.vfs_add_symlink("/tmp/link.txt", "target.txt");
+
+        let lst = vfs
+            .stat_path(AT_FDCWD, "/tmp/link.txt", AT_SYMLINK_NOFOLLOW)
+            .unwrap();
+        assert_eq!(lst.st_mode & S_IFLNK, S_IFLNK);
+        assert_eq!(lst.st_size, "target.txt".len() as i64);
+
+        let st = vfs.stat_path(AT_FDCWD, "/tmp/link.txt", 0).unwrap();
+        assert_eq!(st.st_mode & S_IFREG, S_IFREG);
+        assert_eq!(st.st_size, 5);
+
+        let err = vfs.openat(AT_FDCWD, "/tmp/link.txt", O_RDONLY | O_NOFOLLOW);
+        assert_eq!(err, -ELOOP);
+    }
+
+    #[test]
+    fn test_symlink_eloop() {
+        let mut vfs = new_test_vfs();
+        vfs.vfs_add_symlink("/tmp/a", "b");
+        vfs.vfs_add_symlink("/tmp/b", "a");
+
+        assert_eq!(
+            vfs.resolve_path(AT_FDCWD, "/tmp/a", true),
+            Err(-ELOOP)
+        );
+        assert_eq!(vfs.openat(AT_FDCWD, "/tmp/a", O_RDONLY), -ELOOP);
+    }
+
+    #[test]
+    fn test_symlinkat_and_unlinkat() {
+        let mut vfs = new_test_vfs();
+        vfs.vfs_write_file("/tmp/orig", b"data", 0o644);
+        assert_eq!(vfs.symlinkat("orig", AT_FDCWD, "/tmp/sym", 123), 0);
+        assert_eq!(vfs.symlinkat("orig", AT_FDCWD, "/tmp/sym", 123), -EEXIST);
+        assert_eq!(vfs.vfs_read_file("/tmp/sym").unwrap(), b"data");
+
+        // unlinkat with AT_REMOVEDIR on symlink fails with ENOTDIR
+        assert_eq!(vfs.unlinkat(AT_FDCWD, "/tmp/sym", AT_REMOVEDIR), -ENOTDIR);
+        // unlinkat without AT_REMOVEDIR removes the symlink, not target
+        assert_eq!(vfs.unlinkat(AT_FDCWD, "/tmp/sym", 0), 0);
+        assert!(vfs.readlink(AT_FDCWD, "/tmp/sym").is_err());
+        assert_eq!(vfs.vfs_read_file("/tmp/orig").unwrap(), b"data");
+    }
+
+    #[test]
+    fn test_vfs_sandbox_denials_and_embedded_so() {
+        let so = MetaSoFile {
+            guest_paths: vec!["/lib/x86_64-linux-gnu/libtest.so.1".to_string()],
+            base_addr: 0x0200_0000,
+            bytes: b"\x7fELFtest_so_payload".to_vec(),
+        };
+        let mut vfs = VirtualFs::new_in_memory(&[so]);
+
+        assert_eq!(vfs.openat(AT_FDCWD, "/etc/ld.so.preload", O_RDONLY), -ENOENT);
+        assert_eq!(vfs.openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY), -ENOENT);
+        assert_eq!(
+            vfs.openat(AT_FDCWD, "/usr/lib/locale/locale-archive", O_RDONLY),
+            -ENOENT
+        );
+
+        assert_eq!(
+            vfs.openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libtest.so.1", O_WRONLY),
+            -EACCES
+        );
+        assert_eq!(
+            vfs.openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libtest.so.1", O_CREAT),
+            -EACCES
+        );
+
+        let fd = vfs.openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libtest.so.1", O_RDONLY) as i32;
+        assert!(fd >= 3);
+        let f = vfs.get_fd(fd).unwrap();
+        assert_eq!(f.so_base_addr, Some(0x0200_0000));
+        assert_eq!(vfs.pread64(fd, 4, 4).unwrap(), b"test");
+        assert_eq!(vfs.stat_fd(fd).unwrap().st_size, 19);
+        assert_eq!(vfs.close(fd), 0);
+        assert_eq!(vfs.close(fd), -EBADF);
+    }
+
+    #[test]
+    fn test_vfs_stdin_and_dup0() {
+        let mut vfs = VirtualFs::new_in_memory(&[]);
+        vfs.stdin_data = b"hello_world".to_vec();
+
+        assert_eq!(vfs.read(0, 5).unwrap(), b"hello");
+
+        let dup_fd = vfs.dup(0) as i32;
+        assert!(dup_fd >= 3);
+        assert_eq!(vfs.read(dup_fd, 1).unwrap(), b"_");
+
+        assert_eq!(vfs.read(0, 64).unwrap(), b"world");
+        assert_eq!(vfs.read(dup_fd, 64).unwrap(), b"");
+        assert_eq!(vfs.read(0, 64).unwrap(), b"");
+
+        assert_eq!(vfs.read(1, 10), Err(-EBADF));
+        assert_eq!(vfs.read(2, 10), Err(-EBADF));
+    }
+
+    #[cfg(feature = "std-fs")]
+    use std::fs;
+
+    #[cfg(feature = "std-fs")]
+    #[test]
+    fn test_vfs_ro_mount_and_traversal_block() {
+        let dir = std::env::temp_dir().join(format!("elf2wasm_vfs_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let file = dir.join("hello.txt");
+        fs::write(&file, b"sandbox_ok").unwrap();
+
+        let mut vfs = VirtualFs::new(&[], &[(dir.clone(), "/mnt/ro".to_string())]);
+        let fd = vfs.openat(AT_FDCWD, "/mnt/ro/hello.txt", O_RDONLY) as i32;
+        assert!(fd >= 3);
+        assert_eq!(vfs.read(fd, 64).unwrap(), b"sandbox_ok");
+        assert_eq!(vfs.close(fd), 0);
+
+        assert_eq!(
+            vfs.openat(AT_FDCWD, "/mnt/ro/../../etc/passwd", O_RDONLY),
+            -ENOENT
+        );
+
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[cfg(feature = "std-fs")]
+    #[test]
+    fn test_proc_self_exe_lstat_vs_stat() {
+        let mut vfs = VirtualFs::new(&[], &[]);
+        vfs.elf_path = "/usr/bin/python3.11".to_string();
+
+        let lstat = vfs
+            .stat_path(AT_FDCWD, "/proc/self/exe", AT_SYMLINK_NOFOLLOW)
+            .unwrap();
+        assert_eq!(lstat.st_mode, S_IFLNK | 0o777);
+        assert_eq!(lstat.st_nlink, 1);
+        assert_eq!(lstat.st_size, "/usr/bin/python3.11".len() as i64);
+
+        let stat = vfs.stat_path(AT_FDCWD, "/proc/self/exe", 0).unwrap();
+        assert_eq!(stat.st_mode, S_IFREG | 0o755);
+        assert_eq!(stat.st_nlink, 1);
+        let expected_size = fs::metadata("/usr/bin/python3.11")
+            .map(|m| m.len() as i64)
+            .unwrap_or(0);
+        assert_eq!(stat.st_size, expected_size);
+
+        vfs.elf_path.clear();
+        let pid_lstat = vfs
+            .stat_path(AT_FDCWD, "/proc/1234/exe", AT_SYMLINK_NOFOLLOW)
+            .unwrap();
+        assert_eq!(pid_lstat.st_mode, S_IFLNK | 0o777);
+        assert_eq!(pid_lstat.st_size, "/usr/bin/python3.11".len() as i64);
+        assert_eq!(
+            vfs.readlink(AT_FDCWD, "/proc/self/exe").unwrap(),
+            b"/usr/bin/python3.11"
+        );
+    }
+
+    #[test]
+    fn test_vfs_write_file_and_add_symlink_resolve_parent_symlinks() {
+        let mut vfs = VirtualFs::new_in_memory(&[]);
+        vfs.vfs_add_symlink("/lib64", "/usr/lib64");
+        vfs.vfs_write_file("/lib64/sub/hello.txt", b"world", 0o644);
+        assert_eq!(
+            vfs.vfs_read_file("/usr/lib64/sub/hello.txt").unwrap(),
+            b"world"
+        );
+        assert_eq!(
+            vfs.vfs_read_file("/lib64/sub/hello.txt").unwrap(),
+            b"world"
+        );
+
+        vfs.vfs_add_symlink("/lib64/sub/link.txt", "hello.txt");
+        assert_eq!(
+            vfs.readlink(AT_FDCWD, "/usr/lib64/sub/link.txt").unwrap(),
+            b"hello.txt"
+        );
+        assert_eq!(
+            vfs.vfs_read_file("/usr/lib64/sub/link.txt").unwrap(),
+            b"world"
+        );
+    }
+
+    #[test]
+    fn test_access_nonexistent_so_returns_enoent_for_w_ok() {
+        let vfs = VirtualFs::new_in_memory(&[]);
+        assert_eq!(vfs.access(AT_FDCWD, "/nonexistent.so", 2), -ENOENT);
+        assert_eq!(vfs.access(AT_FDCWD, "/nonexistent.so", 0), -ENOENT);
     }
 }
