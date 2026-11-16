@@ -12,9 +12,9 @@ use iced_x86::Mnemonic;
 use std::borrow::Cow;
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, CustomSection, DataSection, ElementSection, Elements,
-    EntityType, ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType,
-    ImportSection, Instruction as WInst, MemArg, MemorySection, MemoryType, Module, RefType,
-    TableSection, TableType, TypeSection, ValType,
+    ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType,
+    Instruction as WInst, MemArg, MemorySection, MemoryType, Module, RefType, TableSection,
+    TableType, TypeSection, ValType,
 };
 
 pub const DISPATCH_HASH_ADDR: u32 = 0x0C00_0000;
@@ -360,9 +360,9 @@ fn emit_start_function(num_chunks: u32, hash_mask: u32) -> Function {
                 func.instruction(&WInst::I32Const(10));
                 func.instruction(&WInst::I32ShrU);
 
-                // call_indirect type 1 (chunk_fn), table 0
+                // call_indirect type 0 (chunk_fn), table 0
                 func.instruction(&WInst::CallIndirect {
-                    type_index: 1,
+                    type_index: 0,
                     table_index: 0,
                 });
                 // br $trampoline (depth 2: out of if -> out of $probe -> $trampoline)
@@ -561,24 +561,18 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
 
     // Type Section
     let mut types = TypeSection::new();
-    types.ty().function([ValType::I64; 7], [ValType::I64]); // 0: syscall
-    types.ty().function([ValType::I32], []); // 1: chunk_fn
-    types.ty().function([], [ValType::I32]); // 2: _start
+    types.ty().function([ValType::I32], []); // 0: chunk_fn, save_ctx, load_ctx
+    types.ty().function([], [ValType::I32]); // 1: _start
     module.section(&types);
-
-    // Import Section
-    let mut imports = ImportSection::new();
-    imports.import("env", "syscall", EntityType::Function(0));
-    module.section(&imports);
 
     // Function Section
     let mut functions = FunctionSection::new();
     for _ in 0..num_chunks {
-        functions.function(1);
+        functions.function(0);
     }
-    functions.function(2); // _start
-    functions.function(1); // save_ctx
-    functions.function(1); // load_ctx
+    functions.function(1); // _start
+    functions.function(0); // save_ctx
+    functions.function(0); // load_ctx
     module.section(&functions);
 
     // Table Section
@@ -718,9 +712,9 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
     module.section(&globals);
 
     // Export Section
-    let start_func_idx = 1 + num_chunks;
-    let save_ctx_func_idx = 2 + num_chunks;
-    let load_ctx_func_idx = 3 + num_chunks;
+    let start_func_idx = num_chunks;
+    let save_ctx_func_idx = 1 + num_chunks;
+    let load_ctx_func_idx = 2 + num_chunks;
     let mut exports = ExportSection::new();
     exports.export("memory", ExportKind::Memory, 0);
     exports.export("_start", ExportKind::Func, start_func_idx);
@@ -741,7 +735,7 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
     // Element Section
     if num_chunks > 0 {
         let mut elements = ElementSection::new();
-        let func_indices: Vec<u32> = (1..1 + num_chunks).collect();
+        let func_indices: Vec<u32> = (0..num_chunks).collect();
         elements.active(
             Some(0),
             &ConstExpr::i32_const(0),
@@ -812,11 +806,12 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
 #[cfg(all(test, not(target_arch = "wasm32"), feature = "std-fs"))]
 mod tests {
     use super::*;
+    use crate::lifter::YIELD_SYSCALL_PENDING;
     use std::collections::HashMap;
     use crate::decoder::discover_code;
     use crate::elf_loader::{load_elf_and_sos, ExecSegment, STACK_TOP};
     use std::path::Path;
-    use wasmtime::{Caller, Engine, Linker, Module as WasmModule, Store};
+    use wasmtime::{Engine, Instance, Module as WasmModule, Store};
 
     fn make_synthetic_image(code: Vec<u8>) -> LoadedImage {
         LoadedImage {
@@ -845,45 +840,17 @@ mod tests {
 
     fn run_snippet(code: Vec<u8>, fsbase_init: i64) -> (i32, HashMap<String, i64>, Vec<u8>, TestHost) {
         let image = make_synthetic_image(code);
-        let prog = discover_code(&image).expect("discover_code failed");
+        let mut prog = discover_code(&image).expect("discover_code failed");
+        crate::decoder::split_indirect_targets(&image, &mut prog);
         let wasm_bytes = emit_wasm(&image, &prog).expect("emit_wasm failed");
 
         let engine = Engine::default();
         WasmModule::validate(&engine, &wasm_bytes).expect("wasm validation failed");
         let module = WasmModule::new(&engine, &wasm_bytes).expect("wasm compile failed");
-
-        let mut linker = Linker::new(&engine);
-        linker
-            .func_wrap(
-                "env",
-                "syscall",
-                |mut caller: Caller<'_, TestHost>,
-                 nr: i64,
-                 a0: i64,
-                 a1: i64,
-                 a2: i64,
-                 a3: i64,
-                 a4: i64,
-                 a5: i64|
-                 -> i64 {
-                    caller.data_mut().syscalls.push((nr, a0, a1, a2, a3, a4, a5));
-                    if nr == 60 || nr == 231 {
-                        // exit / exit_group
-                        if let Some(ext) = caller.get_export("exit_flag").and_then(|e| e.into_global()) {
-                            let _ = ext.set(&mut caller, wasmtime::Val::I32(1));
-                        }
-                        if let Some(ext) = caller.get_export("exit_code").and_then(|e| e.into_global()) {
-                            let _ = ext.set(&mut caller, wasmtime::Val::I32(a0 as i32));
-                        }
-                        return 0;
-                    }
-                    42
-                },
-            )
-            .unwrap();
+        assert_eq!(module.imports().len(), 0, "translated module must have zero imports");
 
         let mut store = Store::new(&engine, TestHost::default());
-        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let instance = Instance::new(&mut store, &module, &[]).unwrap();
 
         // Initialize RSP to STACK_TOP and push 0 return address so `ret` exits cleanly
         let mem = instance.get_memory(&mut store, "memory").unwrap();
@@ -906,7 +873,40 @@ mod tests {
         let start = instance
             .get_typed_func::<(), i32>(&mut store, "_start")
             .unwrap();
-        let exit_code = start.call(&mut store, ()).unwrap();
+        let exit_code = loop {
+            let code = start.call(&mut store, ()).unwrap();
+            let yield_flag = instance
+                .get_global(&mut store, "yield_flag")
+                .unwrap()
+                .get(&mut store)
+                .i32()
+                .unwrap();
+            if yield_flag == YIELD_SYSCALL_PENDING {
+                let nr = instance.get_global(&mut store, "rax").unwrap().get(&mut store).i64().unwrap();
+                let a0 = instance.get_global(&mut store, "rdi").unwrap().get(&mut store).i64().unwrap();
+                let a1 = instance.get_global(&mut store, "rsi").unwrap().get(&mut store).i64().unwrap();
+                let a2 = instance.get_global(&mut store, "rdx").unwrap().get(&mut store).i64().unwrap();
+                let a3 = instance.get_global(&mut store, "r10").unwrap().get(&mut store).i64().unwrap();
+                let a4 = instance.get_global(&mut store, "r8").unwrap().get(&mut store).i64().unwrap();
+                let a5 = instance.get_global(&mut store, "r9").unwrap().get(&mut store).i64().unwrap();
+                store.data_mut().syscalls.push((nr, a0, a1, a2, a3, a4, a5));
+                if nr == 60 || nr == 231 {
+                    instance.get_global(&mut store, "exit_flag").unwrap().set(&mut store, wasmtime::Val::I32(1)).unwrap();
+                    instance.get_global(&mut store, "exit_code").unwrap().set(&mut store, wasmtime::Val::I32(a0 as i32)).unwrap();
+                    instance.get_global(&mut store, "yield_flag").unwrap().set(&mut store, wasmtime::Val::I32(0)).unwrap();
+                    break a0 as i32;
+                } else {
+                    instance.get_global(&mut store, "rax").unwrap().set(&mut store, wasmtime::Val::I64(42)).unwrap();
+                    instance.get_global(&mut store, "yield_flag").unwrap().set(&mut store, wasmtime::Val::I32(0)).unwrap();
+                    instance.get_global(&mut store, "quantum").unwrap().set(&mut store, wasmtime::Val::I32(DEFAULT_QUANTUM)).unwrap();
+                }
+            } else if yield_flag == 2 {
+                instance.get_global(&mut store, "yield_flag").unwrap().set(&mut store, wasmtime::Val::I32(0)).unwrap();
+                instance.get_global(&mut store, "quantum").unwrap().set(&mut store, wasmtime::Val::I32(DEFAULT_QUANTUM)).unwrap();
+            } else {
+                break code;
+            }
+        };
 
         let mut regs = HashMap::new();
         for name in GPR_NAMES {
@@ -974,6 +974,7 @@ mod tests {
         let wasm_bytes = emit_wasm(&image, &prog).unwrap();
         let engine = Engine::default();
         WasmModule::validate(&engine, &wasm_bytes).expect("true .wasm failed validation");
+        assert_eq!(WasmModule::new(&engine, &wasm_bytes).unwrap().imports().len(), 0);
 
         let meta_sec = extract_custom_section(&wasm_bytes, "elf2wasm_meta").unwrap();
         let meta = WasmMeta::decode(meta_sec).unwrap();
@@ -1371,12 +1372,8 @@ mod tests {
         let wasm_bytes = emit_wasm(&image, &prog).unwrap();
         let engine = wasmtime::Engine::default();
         let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
-        let mut linker: wasmtime::Linker<()> = wasmtime::Linker::new(&engine);
-        linker
-            .func_wrap("env", "syscall", |_: i64, _: i64, _: i64, _: i64, _: i64, _: i64, _: i64| -> i64 { 0 })
-            .unwrap();
         let mut store = wasmtime::Store::new(&engine, ());
-        let inst = linker.instantiate(&mut store, &module).unwrap();
+        let inst = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
         inst.get_global(&mut store, "rip")
             .unwrap()
             .set(&mut store, wasmtime::Val::I64(0x0010_0000))
@@ -1427,67 +1424,22 @@ mod tests {
         let wasm_bytes = emit_wasm(&image, &prog).unwrap();
         let engine = Engine::default();
         let module = WasmModule::new(&engine, &wasm_bytes).unwrap();
-        let mut linker: Linker<()> = Linker::new(&engine);
-        linker
-            .func_wrap(
-                "env",
-                "syscall",
-                |mut caller: Caller<'_, ()>,
-                 nr: i64,
-                 a0: i64,
-                 _: i64,
-                 _: i64,
-                 _: i64,
-                 _: i64,
-                 _: i64|
-                 -> i64 {
-                    if nr == 100 {
-                        caller
-                            .get_export("yield_flag")
-                            .unwrap()
-                            .into_global()
-                            .unwrap()
-                            .set(&mut caller, wasmtime::Val::I32(1))
-                            .unwrap();
-                        return 42;
-                    }
-                    if nr == 60 {
-                        caller
-                            .get_export("exit_code")
-                            .unwrap()
-                            .into_global()
-                            .unwrap()
-                            .set(&mut caller, wasmtime::Val::I32(a0 as i32))
-                            .unwrap();
-                        caller
-                            .get_export("exit_flag")
-                            .unwrap()
-                            .into_global()
-                            .unwrap()
-                            .set(&mut caller, wasmtime::Val::I32(1))
-                            .unwrap();
-                        return 0;
-                    }
-                    -38
-                },
-            )
-            .unwrap();
         let mut store = Store::new(&engine, ());
-        let inst = linker.instantiate(&mut store, &module).unwrap();
+        let inst = Instance::new(&mut store, &module, &[]).unwrap();
         inst.get_global(&mut store, "rsp")
             .unwrap()
             .set(&mut store, wasmtime::Val::I64(STACK_TOP as i64))
             .unwrap();
 
         let start = inst.get_typed_func::<(), i32>(&mut store, "_start").unwrap();
-        // First slice: yields on syscall 100
+        // First slice: yields on syscall 100 with yield_flag == 3
         let _ = start.call(&mut store, ()).unwrap();
         assert_eq!(
             inst.get_global(&mut store, "yield_flag")
                 .unwrap()
                 .get(&mut store)
                 .i32(),
-            Some(1)
+            Some(YIELD_SYSCALL_PENDING)
         );
         assert_eq!(
             inst.get_global(&mut store, "exit_flag")
@@ -1504,14 +1456,25 @@ mod tests {
             Some(0x0010_0009)
         );
         assert_eq!(
+            inst.get_global(&mut store, "rcx")
+                .unwrap()
+                .get(&mut store)
+                .i64(),
+            Some(0x0010_0009)
+        );
+        assert_eq!(
             inst.get_global(&mut store, "rax")
                 .unwrap()
                 .get(&mut store)
                 .i64(),
-            Some(42)
+            Some(100)
         );
 
-        // Resume: clear yield_flag, reset quantum, call _start again
+        // Simulate kernel handling syscall 100 -> returns 42, resume
+        inst.get_global(&mut store, "rax")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I64(42))
+            .unwrap();
         inst.get_global(&mut store, "yield_flag")
             .unwrap()
             .set(&mut store, wasmtime::Val::I32(0))
@@ -1519,6 +1482,42 @@ mod tests {
         inst.get_global(&mut store, "quantum")
             .unwrap()
             .set(&mut store, wasmtime::Val::I32(DEFAULT_QUANTUM))
+            .unwrap();
+        let _ = start.call(&mut store, ()).unwrap();
+        assert_eq!(
+            inst.get_global(&mut store, "yield_flag")
+                .unwrap()
+                .get(&mut store)
+                .i32(),
+            Some(YIELD_SYSCALL_PENDING)
+        );
+        assert_eq!(
+            inst.get_global(&mut store, "rax")
+                .unwrap()
+                .get(&mut store)
+                .i64(),
+            Some(60)
+        );
+        assert_eq!(
+            inst.get_global(&mut store, "rdi")
+                .unwrap()
+                .get(&mut store)
+                .i64(),
+            Some(47)
+        );
+
+        // Simulate kernel handling exit(47)
+        inst.get_global(&mut store, "exit_code")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I32(47))
+            .unwrap();
+        inst.get_global(&mut store, "exit_flag")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I32(1))
+            .unwrap();
+        inst.get_global(&mut store, "yield_flag")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I32(0))
             .unwrap();
         let code = start.call(&mut store, ()).unwrap();
         assert_eq!(code, 47);
@@ -1569,43 +1568,8 @@ mod tests {
         let wasm_bytes = emit_wasm(&image, &prog).unwrap();
         let engine = Engine::default();
         let module = WasmModule::new(&engine, &wasm_bytes).unwrap();
-        let mut linker: Linker<()> = Linker::new(&engine);
-        linker
-            .func_wrap(
-                "env",
-                "syscall",
-                |mut caller: Caller<'_, ()>,
-                 nr: i64,
-                 a0: i64,
-                 _: i64,
-                 _: i64,
-                 _: i64,
-                 _: i64,
-                 _: i64|
-                 -> i64 {
-                    if nr == 60 {
-                        caller
-                            .get_export("exit_code")
-                            .unwrap()
-                            .into_global()
-                            .unwrap()
-                            .set(&mut caller, wasmtime::Val::I32(a0 as i32))
-                            .unwrap();
-                        caller
-                            .get_export("exit_flag")
-                            .unwrap()
-                            .into_global()
-                            .unwrap()
-                            .set(&mut caller, wasmtime::Val::I32(1))
-                            .unwrap();
-                        return 0;
-                    }
-                    -38
-                },
-            )
-            .unwrap();
         let mut store = Store::new(&engine, ());
-        let inst = linker.instantiate(&mut store, &module).unwrap();
+        let inst = Instance::new(&mut store, &module, &[]).unwrap();
         inst.get_global(&mut store, "rsp")
             .unwrap()
             .set(&mut store, wasmtime::Val::I64(STACK_TOP as i64))
@@ -1633,6 +1597,23 @@ mod tests {
         let mut slices = 1;
         let mut exit_code = 0;
         loop {
+            let yf = inst
+                .get_global(&mut store, "yield_flag")
+                .unwrap()
+                .get(&mut store)
+                .i32()
+                .unwrap();
+            if yf == YIELD_SYSCALL_PENDING {
+                let nr = inst.get_global(&mut store, "rax").unwrap().get(&mut store).i64().unwrap();
+                let a0 = inst.get_global(&mut store, "rdi").unwrap().get(&mut store).i64().unwrap();
+                assert_eq!(nr, 60);
+                assert_eq!(a0, 99);
+                exit_code = a0 as i32;
+                inst.get_global(&mut store, "exit_code").unwrap().set(&mut store, wasmtime::Val::I32(exit_code)).unwrap();
+                inst.get_global(&mut store, "exit_flag").unwrap().set(&mut store, wasmtime::Val::I32(1)).unwrap();
+                inst.get_global(&mut store, "yield_flag").unwrap().set(&mut store, wasmtime::Val::I32(0)).unwrap();
+                break;
+            }
             let ef = inst
                 .get_global(&mut store, "exit_flag")
                 .unwrap()
@@ -1697,43 +1678,8 @@ mod tests {
         let wasm_bytes = emit_wasm(&image, &prog).unwrap();
         let engine = Engine::default();
         let module = WasmModule::new(&engine, &wasm_bytes).unwrap();
-        let mut linker: Linker<()> = Linker::new(&engine);
-        linker
-            .func_wrap(
-                "env",
-                "syscall",
-                |mut caller: Caller<'_, ()>,
-                 nr: i64,
-                 a0: i64,
-                 _: i64,
-                 _: i64,
-                 _: i64,
-                 _: i64,
-                 _: i64|
-                 -> i64 {
-                    if nr == 60 {
-                        caller
-                            .get_export("exit_code")
-                            .unwrap()
-                            .into_global()
-                            .unwrap()
-                            .set(&mut caller, wasmtime::Val::I32(a0 as i32))
-                            .unwrap();
-                        caller
-                            .get_export("exit_flag")
-                            .unwrap()
-                            .into_global()
-                            .unwrap()
-                            .set(&mut caller, wasmtime::Val::I32(1))
-                            .unwrap();
-                        return 0;
-                    }
-                    -38
-                },
-            )
-            .unwrap();
         let mut store = Store::new(&engine, ());
-        let inst = linker.instantiate(&mut store, &module).unwrap();
+        let inst = Instance::new(&mut store, &module, &[]).unwrap();
         inst.get_global(&mut store, "fsbase")
             .unwrap()
             .set(&mut store, wasmtime::Val::I64(0x1234_5678))

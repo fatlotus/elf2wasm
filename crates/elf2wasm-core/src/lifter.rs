@@ -40,7 +40,11 @@ pub const GLOBAL_XMM_BASE: u32 = 28; // 28..=43 (16 v128)
 pub const GLOBAL_MXCSR: u32 = 44; // i32, init 0x1F80
 pub const GLOBAL_TSC: u32 = 45; // i64, monotonic counter for rdtsc
 pub const GLOBAL_X87_CW: u32 = 46; // i32, init 0x037F
-pub const GLOBAL_YIELD_FLAG: u32 = 47; // i32, init 0 (0=running, 1=syscall yield, 2=quantum preempt)
+pub const GLOBAL_YIELD_FLAG: u32 = 47; // i32, init 0 (0=running, 1=blocked/yield, 2=quantum preempt, 3=syscall pending)
+pub const YIELD_NONE: i32 = 0;
+pub const YIELD_BLOCKED: i32 = 1;
+pub const YIELD_QUANTUM: i32 = 2;
+pub const YIELD_SYSCALL_PENDING: i32 = 3;
 pub const GLOBAL_QUANTUM: u32 = 48; // i32, init DEFAULT_QUANTUM
 pub const DEFAULT_QUANTUM: i32 = 128;
 pub const CTX_SIZE: usize = 464;
@@ -84,8 +88,6 @@ pub const LOCAL_V128_1: u32 = 26;
 pub const LOCAL_V128_2: u32 = 27;
 pub const LOCAL_V128_3: u32 = 28;
 
-/// Imported syscall function index (always index 0 in the emitted module).
-pub const FN_IMPORT_SYSCALL: u32 = 0;
 
 // ============================================================================
 // Register Mapping Helpers
@@ -1736,32 +1738,19 @@ impl<'a> Lifter<'a> {
             // System / Misc
             // ----------------------------------------------------------------
             Mnemonic::Syscall => {
-                // rcx = next_ip; r11 = rflags; rax = env.syscall(rax, rdi, rsi, rdx, r10, r8, r9)
-                self.emit(WInst::I64Const(instr.next_ip() as u32 as u64 as i64));
+                // CPS syscall ABI:
+                // rcx = next_ip; r11 = rflags; rip = next_ip;
+                // yield_flag = YIELD_SYSCALL_PENDING (3); return from chunk -> _start returns
+                let next_ip = instr.next_ip() as u32 as u64 as i64;
+                self.emit(WInst::I64Const(next_ip));
                 self.emit(WInst::GlobalSet(GLOBAL_RCX));
                 self.emit_pack_rflags();
                 self.emit(WInst::GlobalSet(GLOBAL_R11));
-
-                self.emit(WInst::GlobalGet(GLOBAL_RAX));
-                self.emit(WInst::GlobalGet(GLOBAL_RDI));
-                self.emit(WInst::GlobalGet(GLOBAL_RSI));
-                self.emit(WInst::GlobalGet(GLOBAL_RDX));
-                self.emit(WInst::GlobalGet(GLOBAL_R10));
-                self.emit(WInst::GlobalGet(GLOBAL_R8));
-                self.emit(WInst::GlobalGet(GLOBAL_R9));
-                self.emit(WInst::Call(FN_IMPORT_SYSCALL));
-                self.emit(WInst::GlobalSet(GLOBAL_RAX));
-                self.emit(WInst::GlobalGet(GLOBAL_EXIT_FLAG));
-                self.emit(WInst::If(BlockType::Empty));
-                self.emit(WInst::Return);
-                self.emit(WInst::End);
-
-                self.emit(WInst::GlobalGet(GLOBAL_YIELD_FLAG));
-                self.emit(WInst::If(BlockType::Empty));
-                self.emit(WInst::I64Const(instr.next_ip() as u32 as u64 as i64));
+                self.emit(WInst::I64Const(next_ip));
                 self.emit(WInst::GlobalSet(GLOBAL_RIP));
+                self.emit(WInst::I32Const(YIELD_SYSCALL_PENDING));
+                self.emit(WInst::GlobalSet(GLOBAL_YIELD_FLAG));
                 self.emit(WInst::Return);
-                self.emit(WInst::End);
             }
             Mnemonic::Rdtsc => {
                 self.emit(WInst::GlobalGet(GLOBAL_TSC));
@@ -3564,15 +3553,15 @@ impl<'a> Lifter<'a> {
             Mnemonic::Psllq => self.emit_v128_shift(instr, 64, false, WInst::I64x2Shl),
 
             // Scalar FP (f64)
-            Mnemonic::Addsd => self.emit_scalar_f64_binop(instr, WInst::F64Add),
-            Mnemonic::Subsd => self.emit_scalar_f64_binop(instr, WInst::F64Sub),
-            Mnemonic::Mulsd => self.emit_scalar_f64_binop(instr, WInst::F64Mul),
-            Mnemonic::Divsd => self.emit_scalar_f64_binop(instr, WInst::F64Div),
-            Mnemonic::Minsd => self.emit_scalar_f64_binop(instr, WInst::F64Min),
-            Mnemonic::Maxsd => self.emit_scalar_f64_binop(instr, WInst::F64Max),
+            Mnemonic::Addsd => self.emit_scalar_fp_binop(instr, true, WInst::F64Add),
+            Mnemonic::Subsd => self.emit_scalar_fp_binop(instr, true, WInst::F64Sub),
+            Mnemonic::Mulsd => self.emit_scalar_fp_binop(instr, true, WInst::F64Mul),
+            Mnemonic::Divsd => self.emit_scalar_fp_binop(instr, true, WInst::F64Div),
+            Mnemonic::Minsd => self.emit_scalar_fp_binop(instr, true, WInst::F64Min),
+            Mnemonic::Maxsd => self.emit_scalar_fp_binop(instr, true, WInst::F64Max),
             Mnemonic::Sqrtsd => {
                 self.read_xmm(instr.op0_register());
-                self.read_op_f64(instr, 1);
+                self.read_op_fp(instr, 1, true);
                 self.emit(WInst::F64Sqrt);
                 self.emit(WInst::F64x2ReplaceLane(0));
                 self.write_xmm(instr.op0_register());
@@ -3585,22 +3574,22 @@ impl<'a> Lifter<'a> {
                 self.read_xmm(instr.op0_register());
                 self.read_xmm(instr.op0_register());
                 self.emit(WInst::F64x2ExtractLane(0));
-                self.read_op_f64(instr, 1);
-                self.emit_f64_cmp_mask(pred);
+                self.read_op_fp(instr, 1, true);
+                self.emit_fp_cmp_mask(pred, true);
                 self.emit(WInst::I64x2ReplaceLane(0));
                 self.write_xmm(instr.op0_register());
             }
 
             // Scalar FP (f32)
-            Mnemonic::Addss => self.emit_scalar_f32_binop(instr, WInst::F32Add),
-            Mnemonic::Subss => self.emit_scalar_f32_binop(instr, WInst::F32Sub),
-            Mnemonic::Mulss => self.emit_scalar_f32_binop(instr, WInst::F32Mul),
-            Mnemonic::Divss => self.emit_scalar_f32_binop(instr, WInst::F32Div),
-            Mnemonic::Minss => self.emit_scalar_f32_binop(instr, WInst::F32Min),
-            Mnemonic::Maxss => self.emit_scalar_f32_binop(instr, WInst::F32Max),
+            Mnemonic::Addss => self.emit_scalar_fp_binop(instr, false, WInst::F32Add),
+            Mnemonic::Subss => self.emit_scalar_fp_binop(instr, false, WInst::F32Sub),
+            Mnemonic::Mulss => self.emit_scalar_fp_binop(instr, false, WInst::F32Mul),
+            Mnemonic::Divss => self.emit_scalar_fp_binop(instr, false, WInst::F32Div),
+            Mnemonic::Minss => self.emit_scalar_fp_binop(instr, false, WInst::F32Min),
+            Mnemonic::Maxss => self.emit_scalar_fp_binop(instr, false, WInst::F32Max),
             Mnemonic::Sqrtss => {
                 self.read_xmm(instr.op0_register());
-                self.read_op_f32(instr, 1);
+                self.read_op_fp(instr, 1, false);
                 self.emit(WInst::F32Sqrt);
                 self.emit(WInst::F32x4ReplaceLane(0));
                 self.write_xmm(instr.op0_register());
@@ -3610,8 +3599,8 @@ impl<'a> Lifter<'a> {
                 self.read_xmm(instr.op0_register());
                 self.read_xmm(instr.op0_register());
                 self.emit(WInst::F32x4ExtractLane(0));
-                self.read_op_f32(instr, 1);
-                self.emit_f32_cmp_mask(pred);
+                self.read_op_fp(instr, 1, false);
+                self.emit_fp_cmp_mask(pred, false);
                 self.emit(WInst::I32x4ReplaceLane(0));
                 self.write_xmm(instr.op0_register());
             }
@@ -3631,7 +3620,7 @@ impl<'a> Lifter<'a> {
                 self.read_xmm(instr.op0_register());
                 self.emit(WInst::F64x2ExtractLane(0));
                 self.emit(WInst::LocalSet(LOCAL_F64_0));
-                self.read_op_f64(instr, 1);
+                self.read_op_fp(instr, 1, true);
                 self.emit(WInst::LocalSet(LOCAL_F64_1));
                 self.emit_fp_flags_f64();
             }
@@ -3640,7 +3629,7 @@ impl<'a> Lifter<'a> {
                 self.emit(WInst::F32x4ExtractLane(0));
                 self.emit(WInst::F64PromoteF32);
                 self.emit(WInst::LocalSet(LOCAL_F64_0));
-                self.read_op_f32(instr, 1);
+                self.read_op_fp(instr, 1, false);
                 self.emit(WInst::F64PromoteF32);
                 self.emit(WInst::LocalSet(LOCAL_F64_1));
                 self.emit_fp_flags_f64();
@@ -3667,7 +3656,7 @@ impl<'a> Lifter<'a> {
             }
             Mnemonic::Cvttsd2si => {
                 let w = self.operand_width_bytes(instr, 0);
-                self.read_op_f64(instr, 1);
+                self.read_op_fp(instr, 1, true);
                 if w == 8 {
                     self.emit(WInst::I64TruncSatF64S);
                 } else {
@@ -3678,7 +3667,7 @@ impl<'a> Lifter<'a> {
             }
             Mnemonic::Cvtsd2si => {
                 let w = self.operand_width_bytes(instr, 0);
-                self.read_op_f64(instr, 1);
+                self.read_op_fp(instr, 1, true);
                 self.emit(WInst::F64Nearest);
                 if w == 8 {
                     self.emit(WInst::I64TruncSatF64S);
@@ -3690,7 +3679,7 @@ impl<'a> Lifter<'a> {
             }
             Mnemonic::Cvttss2si => {
                 let w = self.operand_width_bytes(instr, 0);
-                self.read_op_f32(instr, 1);
+                self.read_op_fp(instr, 1, false);
                 if w == 8 {
                     self.emit(WInst::I64TruncSatF32S);
                 } else {
@@ -3701,7 +3690,7 @@ impl<'a> Lifter<'a> {
             }
             Mnemonic::Cvtss2si => {
                 let w = self.operand_width_bytes(instr, 0);
-                self.read_op_f32(instr, 1);
+                self.read_op_fp(instr, 1, false);
                 self.emit(WInst::F32Nearest);
                 if w == 8 {
                     self.emit(WInst::I64TruncSatF32S);
@@ -3713,14 +3702,14 @@ impl<'a> Lifter<'a> {
             }
             Mnemonic::Cvtss2sd => {
                 self.read_xmm(instr.op0_register());
-                self.read_op_f32(instr, 1);
+                self.read_op_fp(instr, 1, false);
                 self.emit(WInst::F64PromoteF32);
                 self.emit(WInst::F64x2ReplaceLane(0));
                 self.write_xmm(instr.op0_register());
             }
             Mnemonic::Cvtsd2ss => {
                 self.read_xmm(instr.op0_register());
-                self.read_op_f64(instr, 1);
+                self.read_op_fp(instr, 1, true);
                 self.emit(WInst::F32DemoteF64);
                 self.emit(WInst::F32x4ReplaceLane(0));
                 self.write_xmm(instr.op0_register());
@@ -3827,158 +3816,120 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    fn read_op_f64(&mut self, instr: &X86Inst, op_idx: u32) {
+    fn read_op_fp(&mut self, instr: &X86Inst, op_idx: u32, is_f64: bool) {
         match instr.op_kind(op_idx) {
             OpKind::Register => {
                 self.read_xmm(instr.op_register(op_idx));
-                self.emit(WInst::F64x2ExtractLane(0));
+                self.emit(if is_f64 {
+                    WInst::F64x2ExtractLane(0)
+                } else {
+                    WInst::F32x4ExtractLane(0)
+                });
             }
             OpKind::Memory => {
                 self.compute_ea_i32(instr);
-                self.emit(WInst::F64Load(memarg(0, 0)));
+                self.emit(if is_f64 {
+                    WInst::F64Load(memarg(0, 0))
+                } else {
+                    WInst::F32Load(memarg(0, 0))
+                });
             }
             _ => {
                 self.emit(WInst::Unreachable);
-                self.emit(WInst::F64Const(0.0));
+                self.emit(if is_f64 {
+                    WInst::F64Const(0.0)
+                } else {
+                    WInst::F32Const(0.0)
+                });
             }
         }
     }
 
-    fn read_op_f32(&mut self, instr: &X86Inst, op_idx: u32) {
-        match instr.op_kind(op_idx) {
-            OpKind::Register => {
-                self.read_xmm(instr.op_register(op_idx));
-                self.emit(WInst::F32x4ExtractLane(0));
-            }
-            OpKind::Memory => {
-                self.compute_ea_i32(instr);
-                self.emit(WInst::F32Load(memarg(0, 0)));
-            }
-            _ => {
-                self.emit(WInst::Unreachable);
-                self.emit(WInst::F32Const(0.0));
-            }
-        }
-    }
-
-    fn emit_scalar_f64_binop(&mut self, instr: &X86Inst, op: WInst<'static>) {
+    fn emit_scalar_fp_binop(&mut self, instr: &X86Inst, is_f64: bool, op: WInst<'static>) {
         self.read_xmm(instr.op0_register());
         self.read_xmm(instr.op0_register());
-        self.emit(WInst::F64x2ExtractLane(0));
-        self.read_op_f64(instr, 1);
+        self.emit(if is_f64 {
+            WInst::F64x2ExtractLane(0)
+        } else {
+            WInst::F32x4ExtractLane(0)
+        });
+        self.read_op_fp(instr, 1, is_f64);
         self.emit(op);
-        self.emit(WInst::F64x2ReplaceLane(0));
+        self.emit(if is_f64 {
+            WInst::F64x2ReplaceLane(0)
+        } else {
+            WInst::F32x4ReplaceLane(0)
+        });
         self.write_xmm(instr.op0_register());
     }
 
-    fn emit_scalar_f32_binop(&mut self, instr: &X86Inst, op: WInst<'static>) {
-        self.read_xmm(instr.op0_register());
-        self.read_xmm(instr.op0_register());
-        self.emit(WInst::F32x4ExtractLane(0));
-        self.read_op_f32(instr, 1);
-        self.emit(op);
-        self.emit(WInst::F32x4ReplaceLane(0));
-        self.write_xmm(instr.op0_register());
-    }
-
-    fn emit_f64_cmp_mask(&mut self, pred: u8) {
-        self.emit(WInst::LocalSet(LOCAL_F64_1));
-        self.emit(WInst::LocalSet(LOCAL_F64_0));
-        self.emit(WInst::LocalGet(LOCAL_F64_0));
-        self.emit(WInst::LocalGet(LOCAL_F64_1));
+    fn emit_fp_cmp_mask(&mut self, pred: u8, is_f64: bool) {
+        let (l0, l1) = if is_f64 {
+            (LOCAL_F64_0, LOCAL_F64_1)
+        } else {
+            (LOCAL_F32_0, LOCAL_F32_1)
+        };
+        let (eq, lt, le, ne) = if is_f64 {
+            (WInst::F64Eq, WInst::F64Lt, WInst::F64Le, WInst::F64Ne)
+        } else {
+            (WInst::F32Eq, WInst::F32Lt, WInst::F32Le, WInst::F32Ne)
+        };
+        self.emit(WInst::LocalSet(l1));
+        self.emit(WInst::LocalSet(l0));
+        self.emit(WInst::LocalGet(l0));
+        self.emit(WInst::LocalGet(l1));
         match pred {
-            0 => self.emit(WInst::F64Eq),
-            1 => self.emit(WInst::F64Lt),
-            2 => self.emit(WInst::F64Le),
-            4 => self.emit(WInst::F64Ne),
+            0 => self.emit(eq),
+            1 => self.emit(lt),
+            2 => self.emit(le),
+            4 => self.emit(ne),
             5 => {
-                self.emit(WInst::F64Lt);
+                self.emit(lt);
                 self.emit(WInst::I32Eqz);
             }
             6 => {
-                self.emit(WInst::F64Le);
+                self.emit(le);
                 self.emit(WInst::I32Eqz);
             }
             3 => {
                 // unordered: a != a || b != b
                 self.emit(WInst::Drop);
                 self.emit(WInst::Drop);
-                self.emit(WInst::LocalGet(LOCAL_F64_0));
-                self.emit(WInst::LocalGet(LOCAL_F64_0));
-                self.emit(WInst::F64Ne);
-                self.emit(WInst::LocalGet(LOCAL_F64_1));
-                self.emit(WInst::LocalGet(LOCAL_F64_1));
-                self.emit(WInst::F64Ne);
+                self.emit(WInst::LocalGet(l0));
+                self.emit(WInst::LocalGet(l0));
+                self.emit(ne.clone());
+                self.emit(WInst::LocalGet(l1));
+                self.emit(WInst::LocalGet(l1));
+                self.emit(ne);
                 self.emit(WInst::I32Or);
             }
             7 => {
                 // ordered: a == a && b == b
                 self.emit(WInst::Drop);
                 self.emit(WInst::Drop);
-                self.emit(WInst::LocalGet(LOCAL_F64_0));
-                self.emit(WInst::LocalGet(LOCAL_F64_0));
-                self.emit(WInst::F64Eq);
-                self.emit(WInst::LocalGet(LOCAL_F64_1));
-                self.emit(WInst::LocalGet(LOCAL_F64_1));
-                self.emit(WInst::F64Eq);
+                self.emit(WInst::LocalGet(l0));
+                self.emit(WInst::LocalGet(l0));
+                self.emit(eq.clone());
+                self.emit(WInst::LocalGet(l1));
+                self.emit(WInst::LocalGet(l1));
+                self.emit(eq);
                 self.emit(WInst::I32And);
             }
             _ => unreachable!(),
         }
-        self.emit(WInst::If(BlockType::Result(wasm_encoder::ValType::I64)));
-        self.emit(WInst::I64Const(-1));
-        self.emit(WInst::Else);
-        self.emit(WInst::I64Const(0));
-        self.emit(WInst::End);
-    }
-
-    fn emit_f32_cmp_mask(&mut self, pred: u8) {
-        self.emit(WInst::LocalSet(LOCAL_F32_1));
-        self.emit(WInst::LocalSet(LOCAL_F32_0));
-        self.emit(WInst::LocalGet(LOCAL_F32_0));
-        self.emit(WInst::LocalGet(LOCAL_F32_1));
-        match pred {
-            0 => self.emit(WInst::F32Eq),
-            1 => self.emit(WInst::F32Lt),
-            2 => self.emit(WInst::F32Le),
-            4 => self.emit(WInst::F32Ne),
-            5 => {
-                self.emit(WInst::F32Lt);
-                self.emit(WInst::I32Eqz);
-            }
-            6 => {
-                self.emit(WInst::F32Le);
-                self.emit(WInst::I32Eqz);
-            }
-            3 => {
-                self.emit(WInst::Drop);
-                self.emit(WInst::Drop);
-                self.emit(WInst::LocalGet(LOCAL_F32_0));
-                self.emit(WInst::LocalGet(LOCAL_F32_0));
-                self.emit(WInst::F32Ne);
-                self.emit(WInst::LocalGet(LOCAL_F32_1));
-                self.emit(WInst::LocalGet(LOCAL_F32_1));
-                self.emit(WInst::F32Ne);
-                self.emit(WInst::I32Or);
-            }
-            7 => {
-                self.emit(WInst::Drop);
-                self.emit(WInst::Drop);
-                self.emit(WInst::LocalGet(LOCAL_F32_0));
-                self.emit(WInst::LocalGet(LOCAL_F32_0));
-                self.emit(WInst::F32Eq);
-                self.emit(WInst::LocalGet(LOCAL_F32_1));
-                self.emit(WInst::LocalGet(LOCAL_F32_1));
-                self.emit(WInst::F32Eq);
-                self.emit(WInst::I32And);
-            }
-            _ => unreachable!(),
+        if is_f64 {
+            self.emit(WInst::If(BlockType::Result(wasm_encoder::ValType::I64)));
+            self.emit(WInst::I64Const(-1));
+            self.emit(WInst::Else);
+            self.emit(WInst::I64Const(0));
+            self.emit(WInst::End);
+        } else {
+            self.emit(WInst::If(BlockType::Result(wasm_encoder::ValType::I32)));
+            self.emit(WInst::I32Const(-1));
+            self.emit(WInst::Else);
+            self.emit(WInst::I32Const(0));
+            self.emit(WInst::End);
         }
-        self.emit(WInst::If(BlockType::Result(wasm_encoder::ValType::I32)));
-        self.emit(WInst::I32Const(-1));
-        self.emit(WInst::Else);
-        self.emit(WInst::I32Const(0));
-        self.emit(WInst::End);
     }
 
     fn emit_fp_flags_f64(&mut self) {
