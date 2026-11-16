@@ -1,24 +1,23 @@
-# TEST_READY: `elf2wasm` E2E Test Suite
+# Phase 2 E2E Test Suite Ready (`TEST_READY.md`)
 
-**Status:** READY
-**Track:** `sub_orch_e2e` (E2E Testing Track)
-**Specification:** [TEST_INFRA.md](/home/antigravity/elf2wasm/TEST_INFRA.md)
+## Test Runner Command
+```bash
+./e2e_v2/run_phase2.sh
+```
 
-## Summary
-The opaque-box, requirement-driven E2E test suite for `elf2wasm` is complete, verified, and ready for Milestone M5 (and incremental M3/M4 verification).
+Individual requirement tests can also be run directly with Node.js (`v24+`):
+```bash
+node e2e_v2/test_r1_cps_preemption.mjs
+node e2e_v2/test_r2_readme_abi.mjs
+node e2e_v2/test_r3_web_ui_python.mjs
+node e2e_v2/test_r4_cleanliness.mjs
+```
 
-- **Total E2E Tests:** `144` (covering all 13 features in `PROJECT.md § Feature Inventory` across Tiers 1–4):
-  - **Tier 1 (`e2e/test_tier1.py`)**: 65 tests (5 per feature across Features 1–13)
-  - **Tier 2 (`e2e/test_tier2.py`)**: 65 tests (5 per feature across Features 1–13, boundary & corner cases)
-  - **Tier 3 (`e2e/test_tier3.py`)**: 8 tests (cross-feature pairwise & multi-feature combinations)
-  - **Tier 4 (`e2e/test_tier4.py`)**: 6 tests (real-world byte-for-byte differential parity vs native `/usr/bin/true`, `/usr/bin/echo`, `/usr/bin/python3`, plus sandbox isolation verification)
-- **Non-Interference:** `cargo test --offline` passes (`4 ignored` in `tests/e2e_suite.rs`, `0 failed`). `src/`, `Cargo.toml`, `Cargo.lock`, and `PROJECT.md` were not modified.
+## Coverage Summary
 
-## How to Run (once M3/M4 CLI & runtime are implemented)
-- Standalone runner: `./e2e/run_e2e.sh` (or `./e2e/run_e2e.sh tier1`, `tier2`, `tier3`, `tier4`)
-- Via Cargo: `cargo test --offline --test e2e_suite -- --ignored`
-
-## Verification Sign-Off
-- **Reviewers:** 2/2 `APPROVE`
-- **Challengers:** 2/2 `CONFIRM` (verified assertion failure on wrong stdout/stderr/exit code and sandbox escape detection)
-- **Forensic Auditor:** `CLEAN` (zero cheating, zero `src/` coupling, genuine differential & sandbox checks)
+| Requirement | Test File | What It Verifies (Opaque-Box) |
+|---|---|---|
+| **R1: CPS Syscall ABI & Kernel Preemption** | `e2e_v2/test_r1_cps_preemption.mjs` | Compiles C programs with `gcc` and translates via `elf2wasm translate`; inspects `.wasm` via `WebAssembly.Module` for 0 imports (`env.syscall` removed), all required ABI exports (`memory`, `_start`, `save_ctx`, `load_ctx`, `yield_flag`, `quantum`, `rip`, `exit_flag`, `exit_code`, `fsbase`, `gsbase`, `rax`..`r15`), and `elf2wasm_meta` custom section; instantiates directly in Node to verify `_start()` CPS return (`yield_flag` 2/3, `rip != 0`); runs a two-subprocess `fork()` + `nanosleep()` + `waitpid()` program (Child A 50ms, Child B 10ms) via both `elf2wasm run` and `node js/cli.mjs run`, asserting exit code 0, deterministic `CHILD_B_DONE` before `CHILD_A_DONE` before `PARENT_DONE`, and identical stdout across repeated runs. |
+| **R2: `README.md` & Exhaustive WASM ABI Docs** | `e2e_v2/test_r2_readme_abi.mjs` | Verifies `README.md` exists and documents the core goal (deterministic, Linux-compatible OS running unmodified x86/x86-64 programs), build/install instructions (`wasm32-unknown-unknown`, `cargo build`, `.wasm` modules), and run instructions; dynamically extracts all `WebAssembly.Module.imports` and `WebAssembly.Module.exports` from `elf2wasm_compiler_wasm.wasm`, `elf2wasm_runtime_wasm.wasm`, and a freshly translated guest `.wasm`, asserting every import and export symbol is documented in `README.md`. |
+| **R3: VFS Symlinks, `.tar.gz` Overlay & HTML Web UI + Python** | `e2e_v2/test_r3_web_ui_python.mjs` | Packages a real `.tar.gz` overlay from host `/usr/bin/python3.11`, its `.so` dependencies (`libc.so.6`, `libm.so.6`, `libexpat.so.1`, `libz.so.1`, `ld-linux-x86-64.so.2`), symlinks (`/usr/bin/python3 -> python3.11`, `/lib64/ld-linux-x86-64.so.2 -> /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2`), and minimal `/usr/lib/python3.11` stdlib; verifies `js/elf2wasm_shim.mjs` (`extractTarGzToVfs`, `runFromVfs`, symlink resolution); serves the repo via HTTP, launches headless `/usr/bin/chromium` over CDP, loads `/web/index.html` with zero uncaught page errors, uploads the `.tar.gz` overlay via `DOM.setFileInputFiles`, runs `/usr/bin/python3 -S -c "print(6 * 7)"`, and asserts stdout contains `42`. |
+| **R4: Codebase Simplification & Cleanup** | `e2e_v2/test_r4_cleanliness.mjs` | Verifies obsolete/redundant files (`src/syscalls.rs`, `src/vfs.rs`, `tests/m2_runtime.rs`, `tests/m3_true_echo.rs`, `tests/m4_python3.rs`, `TEST_READY_V2.md`) are deleted, root `Cargo.toml` `[dependencies]` no longer contains unused `goblin`, `iced-x86`, or `wasm-encoder`, and `cargo test --workspace` exits `0`. |

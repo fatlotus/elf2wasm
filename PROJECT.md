@@ -60,63 +60,42 @@ Every feature from the Survey phase is assigned a milestone below:
 
 | # | Feature | Description | Milestone | Source |
 |---|---------|-------------|-----------|--------|
-| 1 | ELF64 PIE & non-PIE + `.so` loading | Load `ET_DYN` (`true`/`echo`), `ET_EXEC` (`python3` at `0x400000`+), `ld-linux-x86-64.so.2`, and `.so` list into 32-bit guest VA layout | M1 (wire existing `elf_loader.rs`/`meta.rs`) | Survey 1, 2, 3 |
-| 2 | x86-64 code discovery & decoding | Decode `PF_X` segments with `iced-x86` (recursive descent + linear sweep) to map all blocks, functions, and indirect targets | M1 | Survey 2 |
-| 3 | CPU state & flags lifting | 16 GPRs, `rip`, `rflags` (CF/ZF/SF/OF/PF/AF), `fsbase`/`gsbase`, 16 XMM (`v128`), `cmovcc`/`setcc`/`jcc`/`adc`/`sbb` | M2 | Survey 2, 3 |
-| 4 | Baseline x86-64 + `rep`/`lock`/`endbr64` | Full `x86-64-baseline` integer/control-flow, `rep movs/stos/scas/cmps`, `lock` RMW, `endbr64` NOP, `rdtsc` | M2 | Survey 2, 3 |
-| 5 | SSE/SSE2 & `cpuid`/`xgetbv` masking | Mask `cpuid`/`xgetbv` to baseline x86-64 + SSE2 (disable AVX/AVX2/AVX-512/BMI) so `ld.so`/`libc` pick SSE2 IFUNCs; lift SSE/SSE2 ops | M2 | Survey 2, 3 |
-| 6 | Indirect dispatch & WASM module emission | Trampoline or `return_call_indirect` dispatch (no WASM stack overflow), `wasm-encoder` emission + `elf2wasm_meta` custom section | M2 | Survey 2 |
-| 7 | `wasmtime` host & Linux stack/auxv init | Load `.wasm`, decode `elf2wasm_meta`, populate `STACK_TOP` (`argc`, `argv`, `envp`, `auxv` without `AT_SYSINFO_EHDR`), run `_start` | M3 | Survey 2, 3 |
-| 8 | Tier 1 memory & process syscalls (`true`/`echo`) | `brk`, `.so`-aware `mmap`, `mprotect`, `munmap`, `mremap`, `arch_prctl(ARCH_SET_FS)`, `set_tid_address`, `set_robust_list`, `rseq`, `prlimit64`, `getrandom`, `futex`, `exit`/`exit_group` | M3 | Survey 2, 3 |
-| 9 | Tier 1 VFS & I/O syscalls (`true`/`echo`) | FD table (stdin/stdout/stderr capture), `openat` (embedded `.so`s + locale/gconv + `-ENOENT` for `/etc/ld.so.preload`), `close`, `read`, `pread64`, `write`, `writev`, `newfstatat`, `access` | M3 | Survey 2, 3 |
-| 10 | CLI (`translate` & `run`) | `clap` CLI to translate ELF+`.so`s to `.wasm` and run `.wasm` with args and sandboxed VFS mounts | M3 | Survey 1, 2 |
-| 11 | Python 3 syscalls & signals/time/ids | `lseek`, `getdents64`, `fcntl`, `ioctl(TCGETS -> -ENOTTY)`, `rt_sigaction`, `rt_sigprocmask`, `sigaltstack`, `readlink`/`readlinkat`, `getcwd`, `sysinfo`, `getuid`/`geteuid`/`getgid`/`getegid`/`getpid`/`gettid`, `uname`, `clock_gettime`, `gettimeofday`, `sched_getaffinity`, `dup*`/`pipe2` | M4 | Survey 2, 3 |
-| 12 | Python 3 stdlib VFS & x87/SSE4.2 edge ops | Read-only VFS mapping for `/usr/lib/python3.11/**`, `/usr/lib/python3/dist-packages/**`, user `.py` scripts; any x87 FPU / SSE4.2 ops hit by `libm.so.6`/`libz.so.1`/`python3` | M4 | Survey 3 |
-| 13 | Differential verification & E2E test suite | Verify identical exit code, stdout, stderr between native and WASM for `true`, `echo`, and `python3` programs under sandbox | M5 (and E2E Track) | Survey 1, 2, 3 |
+| R1 | CPS Syscall ABI & Kernel Preemption | Remove `env.syscall` import from translated guest `.wasm`; return from `_start` with `yield_flag = 3` (`YIELD_SYSCALL_PENDING`), `rip = next_ip`, and syscall args in exported globals (`rax, rdi, rsi, rdx, r10, r8, r9`). Kernel/host dispatches syscall, preempts/switches processes, and resumes. Verify with two subprocesses waiting for deterministic amounts of time. | M1 | Survey 1, 3 |
+| R2 | `README.md` & Exhaustive WASM ABI Docs | Create `README.md` stating the core goal (deterministic, Linux-compatible OS running unmodified x86 programs), how to install/build `.wasm` modules (`compiler.wasm`, `runtime.wasm`, guest `.wasm`), how to run them, and exhaustive ABI docs for `compiler.wasm`, `runtime.wasm`, and translated guest executables. | M3 | Survey 2, 3 |
+| R3 | VFS Symlinks, `.tar.gz`/Docker Overlay & HTML Web UI | Add `OverlayNode::Symlink` + `symlink`/`symlinkat`/`readlink` + symlink resolution in JS `_resolveElfSos`; add `.tar.gz`/`.zip` overlay extraction into VFS and `runFromVfs`; build HTML web page to upload Linux binaries & `.tar.gz`/`.zip` overlays and run them; verify uploading a Python runtime and running Python code. | M2 | Survey 2, 3 |
+| R4 | Codebase Simplification & Cleanup | Remove unused root `Cargo.toml` deps (`goblin`, `iced-x86`, `wasm-encoder`), trivial wrappers (`src/syscalls.rs`, `src/vfs.rs`), redundant slow tests (`m2_runtime.rs`, `m3_true_echo.rs`, `m4_python3.rs`), stale docs (`TEST_READY_V2.md`), and any dead/duplicated code found by the background simplification agent. | M4 | Survey 3 |
+
+*(Note: Prior M1–M6 baseline x86-64→WASM, `wasmtime` host, Python 3 support, `compiler-wasm`, `runtime-wasm`, and `js/elf2wasm_shim.mjs` are already complete and verified passing 73/73 workspace tests.)*
 
 ## Milestones
 
 | # | Name | Scope | Dependencies | Status |
 |---|------|-------|-------------|--------|
-| M1 | `decoder` (Code Discovery & CFG) | `src/decoder.rs` + wire `mod`s in `src/main.rs`; decode `PF_X` segments of `true`, `echo`, `python3`, `ld.so`, `libc.so.6` with unit tests | none | DONE (`src/decoder.rs`, 9/9 tests) |
-| M2 | `lifter` & `wasm_emit` (x86-64 → WASM) | `src/lifter.rs`, `src/wasm_emit.rs`; lift baseline x86-64 + SSE2 + masked `cpuid`/`xgetbv` + `syscall` import + overflow-safe dispatch; validate emitted `.wasm` | M1 | DONE (`src/lifter.rs`, `src/wasm_emit.rs`, 20/20 tests) |
-| M3 | `runtime` & Tier 1 Syscalls (`true`, `echo`) | `src/runtime.rs`, `src/syscalls.rs`, `src/vfs.rs`, `src/main.rs` CLI; execute `/usr/bin/true` and `/usr/bin/echo` identically to native | M2 | DONE (`src/runtime.rs`, `src/syscalls.rs`, `src/vfs.rs`, `src/main.rs`, 22 unit + 2 diff tests) |
-| M4 | Python 3 Support (`python3`) | Extend `syscalls.rs`, `vfs.rs`, and `lifter.rs` (x87/extra ops if hit) to execute `/usr/bin/python3` basic programs identically to native | M3 | DONE (`tests/m4_python3.rs` + `23` unit + `2` m3 tests) |
-| M5 | Final Milestone (E2E Pass + Tier 5 Hardening) | Pass 100% of E2E tests (Tiers 1–4) after `TEST_READY.md`, then run Tier 5 adversarial coverage hardening | M4, TEST_READY.md | DONE (144/144 E2E + 9/9 Tier 5 + 26/26 unit + m3/m4) |
-| M6 | Git History & Remote Push (`fatlotus/elf2wasm`) | Create small, self-contained git commits (excluding `target/`, `.agents/`), set remote `origin` to `fatlotus/elf2wasm`, and push | M5 | DONE (`m6_worker`) |
+| M1 | CPS Syscall ABI & Kernel Preemption | `crates/elf2wasm-core`, `crates/elf2wasm-runtime-core`, `crates/elf2wasm-runtime-wasm`, `src/runtime.rs`, `js/elf2wasm_shim.mjs`; build `wasm32-unknown-unknown` `.wasm` modules; verify deterministic two-subprocess wait preemption | none | DONE (`sub_orch_m1` gate passed) |
+| M2 | VFS Symlinks, `.tar.gz` Overlay & HTML Web UI | `crates/elf2wasm-runtime-core/src/{vfs,syscalls}.rs`, `js/elf2wasm_shim.mjs`, `web/index.html`; verify uploading Python runtime `.tar.gz` and running Python in headless Chromium | M1 | DONE (`sub_orch_m2` gate passed) |
+| M3 | `README.md` & Exhaustive WASM ABI Docs | `README.md` at repo root | M1, M2 | DONE (`sub_orch_m3` gate passed) |
+| M4 | Codebase Simplification & Cleanup | `Cargo.toml`, `src/{syscalls,vfs}.rs`, `tests/`, stale docs, and background simplification findings | M1, M2 | DONE (`sub_orch_m4` gate passed) |
+| M5 | Final Milestone (E2E Pass + Tier 5 Hardening) | Pass 100% of E2E test suite (`TEST_READY.md`) + Tier 5 adversarial hardening | M1, M2, M3, M4, TEST_READY.md | DONE (`sub_orch_m5` gate passed) |
 
 ## Interface Contracts
 
 ### `elf_loader` ↔ `decoder`
 - `elf_loader::load_elf_and_sos_bytes(main_path: &str, main_bytes: &[u8], sos: &[(&str, &[u8])]) -> Result<LoadedImage>` performs pure in-memory ELF64 + `.so` loading with dynamic `LD_BASE` / `SO_BASE_START` placement above `main_end` (zero `std::fs`).
-- `elf_loader::load_elf_and_sos(main_path: &Path, so_paths: &[PathBuf]) -> Result<LoadedImage>` (`std-fs` feature) wraps `load_elf_and_sos_bytes` with host file reading and symlink canonicalization.
-- `decoder::discover_code(image: &LoadedImage) -> Result<DecodedProgram>` and `decoder::split_indirect_targets(image: &LoadedImage, prog: &mut DecodedProgram)` discover basic blocks and indirect jump/call targets, seed `DT_INIT`/`DT_FINI` from `PT_DYNAMIC` of loaded `.so`s, and split blocks between non-stack memory reads and subsequent writes (`split_mem_read_write_blocks`).
+- `decoder::discover_code(image: &LoadedImage) -> Result<DecodedProgram>` and `decoder::split_indirect_targets(image: &LoadedImage, prog: &mut DecodedProgram)` discover basic blocks and indirect jump/call targets, including post-`Syscall` block splits.
 
-### `decoder` ↔ `lifter` / `wasm_emit`
-- `wasm_emit::emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>>` produces a valid `.wasm` binary containing:
-  - Import: `("env", "syscall", [i64, i64, i64, i64, i64, i64, i64] -> [i64])`
-  - Exports: `"memory"` (Memory, `>= 4096` pages dynamically sized to cover `DISPATCH_HASH_ADDR = 0x0C00_0000` + dispatch hash table), `"_start"` (`[] -> [i32]`), `"save_ctx"` / `"load_ctx"` (`[i32] -> []`, 464-byte CPU context), `"yield_flag"` (`i32`), `"quantum"` (`i32`, `DEFAULT_QUANTUM = 128`), GPRs, `"rip"`, `"exit_flag"`, `"exit_code"`, `"fsbase"`, `"gsbase"`.
-  - Custom section: `"elf2wasm_meta"` encoded by `WasmMeta::encode()`.
+### Translated Guest Executable ↔ Kernel/Host (CPS Syscall ABI)
+- **Imports**: None (zero-import WASM module).
+- **Exports**: `"memory"` (`>= 4096` pages), `"_start"` (`[] -> [i32]`), `"save_ctx"` / `"load_ctx"` (`[i32] -> []`, 464-byte `CTX_SIZE` layout), `"yield_flag"` (`i32`: `0=running`, `1=blocked/yield`, `2=quantum preempt`, `3=syscall pending`), `"quantum"` (`i32`, `DEFAULT_QUANTUM = 128`), GPRs (`"rax"`, `"rcx"`, `"rdx"`, `"rbx"`, `"rsp"`, `"rbp"`, `"rsi"`, `"rdi"`, `"r8"`..`"r15"`), `"rip"`, `"exit_flag"`, `"exit_code"`, `"fsbase"`, `"gsbase"`.
+- **CPS Syscall Convention**: On `Mnemonic::Syscall`, guest sets `rcx = next_ip`, `r11 = rflags`, `rip = next_ip`, `yield_flag = 3` (`YIELD_SYSCALL_PENDING`), and returns from `_start`. Syscall number is in `rax`, args in `rdi, rsi, rdx, r10, r8, r9`. Kernel/host reads args, executes syscall, writes return value to `rax`, clears `yield_flag` (unless blocked/exited), and may preempt/switch processes before resuming `_start()`.
+- **Custom section**: `"elf2wasm_meta"` encoded by `WasmMeta::encode()`.
 
 ### `elf2wasm-compiler-wasm` (WASM C-ABI)
-- Exports `alloc(len: usize) -> *mut u8`, `dealloc(ptr: *mut u8, len: usize)`, and `compile_bundle(ptr: *const u8, len: usize, out_len_ptr: *mut usize) -> *mut u8`.
-- Input bundle: `b"E2WB"` magic + `u32 main_path_len` + `main_path` + `u32 main_bytes_len` + `main_bytes` + `u32 num_sos` + `[u32 path_len + path + u32 bytes_len + bytes]...` (little-endian `u32`).
-- Output buffer: byte `0` == `0x00` + `.wasm` bytes on success, or `0x01` + UTF-8 error message on failure.
+- Zero imports. Exports `memory`, `alloc(len: usize) -> *mut u8`, `dealloc(ptr: *mut u8, len: usize)`, `compile_bundle(ptr: *const u8, len: usize, out_len_ptr: *mut usize) -> *mut u8` (`E2WB` input → `0x00` + `.wasm` or `0x01` + UTF-8 error).
 
 ### `elf2wasm-runtime-wasm` (WASM C-ABI)
 - Imports from `"env"`: `host_mem_size`, `host_read_guest`, `host_write_guest`, `host_zero_guest`, `host_get_global`, `host_set_global`, `host_save_ctx`, `host_load_ctx`, `host_vfs_is_ro_mount`, `host_vfs_stat_ro`, `host_vfs_read_ro`, `host_vfs_list_dir_ro`, `host_vfs_is_virtual_parent`.
-- Exports: `alloc`, `dealloc`, `runtime_new`, `runtime_add_vfs_file`, `runtime_read_vfs_file`, `runtime_init_guest_stack`, `runtime_handle_syscall`, `runtime_on_yield` (`0`=done, `1`=continue, `2`=switch pid, `3`=NeedFork, `4`=NeedExec), `runtime_get_active_pid`, `runtime_get_pending_child_pid`, `runtime_get_pending_scratch_addr`, `runtime_ack_fork`, `runtime_resume_active`, `runtime_get_exec_info`, `runtime_complete_exec`, `runtime_is_exited`, `runtime_get_stdout`, `runtime_get_stderr`, `runtime_get_exit_code`, `runtime_get_virtual_time_ns`.
+- Exports: `memory`, `alloc`, `dealloc`, `runtime_new`, `runtime_add_vfs_file`, `runtime_add_vfs_symlink` (M2), `runtime_read_vfs_file`, `runtime_init_guest_stack`, `runtime_handle_syscall`, `runtime_on_yield` (`0`=done, `1`=continue, `2`=switch pid, `3`=NeedFork, `4`=NeedExec), `runtime_get_active_pid`, `runtime_get_pending_child_pid`, `runtime_get_pending_scratch_addr`, `runtime_ack_fork`, `runtime_resume_active`, `runtime_get_exec_info`, `runtime_complete_exec`, `runtime_is_exited`, `runtime_get_stdout`, `runtime_get_stderr`, `runtime_get_exit_code`, `runtime_get_virtual_time_ns`.
 
-### `elf2wasm-runtime-core` Multi-Process Support (F10)
-- `ProcessState` & `HostState` manage per-process FD tables, `cwd`, `elf_path`, `so_entries`, `brk_curr`, `mmap_cursor`, and `Scheduler`, alongside shared `PipeBuffer`s (`64 KiB` capacity, reader/writer refcounting across `dup`/`dup2`/`dup3`/`close`/`fork`) and shared writable VFS overlay.
-- F10 syscalls: `fork`, `vfork`, `clone` (process & thread modes), `execve`, `execveat`, `wait4`, `waitid`, `pipe`, `pipe2`, `dup3`, `fcntl` (`F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL`), `poll`, `ppoll`, `select`, `pselect6`, `getpid`, `getppid`, `getpgid`, `setpgid`, `getpgrp`.
-- `HostState::multiproc_enabled` gates `fork`/`vfork`/`execve`/`wait4`/`waitid` (defaults to `false` so native `wasmtime` continues returning `-ENOSYS` for `fork` under `tier5_adversarial`; enabled in `elf2wasm-runtime-wasm::runtime_new`).
-
-### `js/elf2wasm_shim.mjs` & `js/cli.mjs` (F11 ESM JS Shim)
-- Zero-dependency pure ESM module (`Elf2WasmSystem`, `VirtualSystem`, `compileElfToWasm`, `compileBundle`, `runElf`, `compileAndRunInVfs`) compatible with Node.js and browsers via `WebAssembly.instantiate` (lazy dynamic `node:fs`/`node:path` import only when `vfsRo`/`vfsRw` mounts are passed).
-- Handles `NeedFork` (cloning guest `WebAssembly.Instance` memory and exported globals) and `NeedExec` (pure-JS ELF64 `PT_INTERP`/`DT_NEEDED` + `argv` `.so` plugin resolution from VFS, cached `compiler.wasm` compilation, and `runtime_complete_exec`). `DEFAULT_RO_ALLOWLIST` includes `/usr/lib/x86_64-linux-gnu`.
-- `js/cli.mjs`: Node CLI wrapper supporting `compile` and `run`.
-
-### `wasm_emit` ↔ `runtime` / `syscalls` / `vfs`
-- `runtime::run_wasm(wasm_bytes: &[u8], config: RunConfig) -> Result<RunOutput>` decodes `"elf2wasm_meta"`, compiles/loads via `wasmtime` (`OptLevel::None` + `.cwasm` cache), initializes `STACK_TOP` with `argc`/`argv`/`envp`/`auxv`, runs `_start` in a slice loop delegating yields to `Scheduler::on_yield` (cooperative thread switching + virtual-time fast-forward), and returns `RunOutput { exit_code: i32, stdout: Vec<u8>, stderr: Vec<u8> }`.
-- `syscalls::handle_syscall(ctx: &mut dyn GuestContext, state: &mut HostState, nr, a0..a5) -> i64` accesses guest linear memory and CPU state via `GuestContext`, `.so` payloads (including `PROT_EXEC` `mmap` guard) and RW overlay via `vfs::VirtualFs`, and virtual time / threads via `scheduler::Scheduler`.
+### `js/elf2wasm_shim.mjs` & `web/`
+- Zero-dependency pure ESM module (`Elf2WasmSystem`, `compileElfToWasm`, `runElf`, `runFromVfs`, `extractTarGzToVfs`) compatible with Node.js and browsers.
+- `web/index.html`: Static HTML/JS UI using `elf2wasm_shim.mjs` to upload binaries or `.tar.gz`/`.zip` overlays into VFS and execute them.
