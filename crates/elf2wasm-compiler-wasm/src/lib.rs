@@ -136,8 +136,9 @@ fn compile_bundle_inner(bundle: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("{:#}", e))?;
     let mut prog = decoder::discover_code(&image).map_err(|e| format!("{:#}", e))?;
     decoder::split_indirect_targets(&image, &mut prog);
-    let wasm_bytes = wasm_emit::emit_wasm(&image, &prog).map_err(|e| format!("{:#}", e))?;
-    Ok(wasm_bytes)
+    let wasm_with_status = wasm_emit::emit_wasm_with_prefix(&image, &prog, &[0x00])
+        .map_err(|e| format!("{:#}", e))?;
+    Ok(wasm_with_status)
 }
 
 #[no_mangle]
@@ -154,12 +155,7 @@ pub extern "C" fn compile_bundle(
     }
     let bundle = unsafe { core::slice::from_raw_parts(ptr, len) };
     match compile_bundle_inner(bundle) {
-        Ok(wasm_bytes) => {
-            let mut out = Vec::with_capacity(1 + wasm_bytes.len());
-            out.push(0x00);
-            out.extend_from_slice(&wasm_bytes);
-            write_output(out_len_ptr, out)
-        }
+        Ok(out) => write_output(out_len_ptr, out),
         Err(msg) => err_output(out_len_ptr, &msg),
     }
 }

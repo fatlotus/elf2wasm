@@ -106,6 +106,22 @@ pub fn emit_x87_functions(code: &mut CodeSection, helper_base: u32) {
     code.function(&emit_f80_rndint(helper_base));
 }
 
+pub fn emit_x87_functions_into(out: &mut Vec<u8>, helper_base: u32) {
+    use wasm_encoder::Encode;
+    emit_f64_to_f80().encode(out);
+    emit_f80_to_f64().encode(out);
+    emit_i64_to_f80().encode(out);
+    emit_f80_to_i64().encode(out);
+    emit_round_pack().encode(out);
+    emit_f80_add(helper_base).encode(out);
+    emit_f80_mul(helper_base).encode(out);
+    emit_f80_div(helper_base).encode(out);
+    emit_f80_cmp().encode(out);
+    emit_f80_rem(helper_base).encode(out);
+    emit_f80_scale(helper_base).encode(out);
+    emit_f80_rndint(helper_base).encode(out);
+}
+
 /// 0: f64_to_f80(val: f64) -> (mant: i64, se: i32)
 fn emit_f64_to_f80() -> Function {
     // param 0: val (f64)

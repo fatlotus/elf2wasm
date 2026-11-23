@@ -48,7 +48,7 @@ pub const YIELD_BLOCKED: i32 = 1;
 pub const YIELD_QUANTUM: i32 = 2;
 pub const YIELD_SYSCALL_PENDING: i32 = 3;
 pub const GLOBAL_QUANTUM: u32 = 48; // i32, init DEFAULT_QUANTUM
-pub const DEFAULT_QUANTUM: i32 = 128;
+pub const DEFAULT_QUANTUM: i32 = 65536;
 pub const GLOBAL_X87_ST_BASE: u32 = 49; // 49..=56 (8 i64 physical mantissa registers)
 pub const GLOBAL_X87_TOP: u32 = 57; // i32, init 0 (0..7)
 pub const GLOBAL_X87_SW: u32 = 58; // i32, init 0 (x87 status word)
@@ -1081,6 +1081,14 @@ impl<'a> Lifter<'a> {
     /// Terminators (`Jcc`, `Jmp`, `Call`, `Ret`, `Trap`) are handled by `wasm_emit.rs`
     /// using `DecodedBlock::terminator` (with `Lifter::emit_condition` / `compute_ea_i64` etc.).
     pub fn lift_instruction(&mut self, instr: &X86Inst) {
+        self.lift_instruction_with_flags(instr, false);
+    }
+
+    /// Lifts a single non-terminating x86-64 instruction.
+    /// When `skip_flags` is true, arithmetic flag updates (`CF/OF/AF/ZF/SF/PF`)
+    /// are omitted for unconditional full-flag writers (`Add`, `Sub`, `Cmp`,
+    /// `And`, `Test`, `Or`, `Xor`, `Neg`).
+    pub fn lift_instruction_with_flags(&mut self, instr: &X86Inst, skip_flags: bool) {
         match instr.mnemonic() {
             // ----------------------------------------------------------------
             // NOPs & Hints
@@ -1332,21 +1340,29 @@ impl<'a> Lifter<'a> {
             // ----------------------------------------------------------------
             Mnemonic::Add => {
                 let w = self.operand_width_bytes(instr, 0);
-                self.read_op_i64(instr, 0, w);
-                self.mask_i64(w);
-                self.emit(WInst::LocalSet(LOCAL_I64_0));
-                self.read_op_i64(instr, 1, w);
-                self.mask_i64(w);
-                self.emit(WInst::LocalSet(LOCAL_I64_1));
+                if skip_flags {
+                    self.read_op_i64(instr, 0, w);
+                    self.read_op_i64(instr, 1, w);
+                    self.emit(WInst::I64Add);
+                    self.mask_i64(w);
+                    self.write_op_i64(instr, 0, w);
+                } else {
+                    self.read_op_i64(instr, 0, w);
+                    self.mask_i64(w);
+                    self.emit(WInst::LocalSet(LOCAL_I64_0));
+                    self.read_op_i64(instr, 1, w);
+                    self.mask_i64(w);
+                    self.emit(WInst::LocalSet(LOCAL_I64_1));
 
-                self.emit(WInst::LocalGet(LOCAL_I64_0));
-                self.emit(WInst::LocalGet(LOCAL_I64_1));
-                self.emit(WInst::I64Add);
-                self.mask_i64(w);
-                self.emit(WInst::LocalTee(LOCAL_I64_2));
-                self.write_op_i64(instr, 0, w);
+                    self.emit(WInst::LocalGet(LOCAL_I64_0));
+                    self.emit(WInst::LocalGet(LOCAL_I64_1));
+                    self.emit(WInst::I64Add);
+                    self.mask_i64(w);
+                    self.emit(WInst::LocalTee(LOCAL_I64_2));
+                    self.write_op_i64(instr, 0, w);
 
-                self.set_add_flags(LOCAL_I64_0, LOCAL_I64_1, LOCAL_I64_2, w, true, None);
+                    self.set_add_flags(LOCAL_I64_0, LOCAL_I64_1, LOCAL_I64_2, w, true, None);
+                }
             }
             Mnemonic::Adc => {
                 let w = self.operand_width_bytes(instr, 0);
@@ -1397,24 +1413,34 @@ impl<'a> Lifter<'a> {
             Mnemonic::Sub | Mnemonic::Cmp => {
                 let w = self.operand_width_bytes(instr, 0);
                 let is_sub = instr.mnemonic() == Mnemonic::Sub;
-                self.read_op_i64(instr, 0, w);
-                self.mask_i64(w);
-                self.emit(WInst::LocalSet(LOCAL_I64_0));
-                self.read_op_i64(instr, 1, w);
-                self.mask_i64(w);
-                self.emit(WInst::LocalSet(LOCAL_I64_1));
+                if skip_flags {
+                    if is_sub {
+                        self.read_op_i64(instr, 0, w);
+                        self.read_op_i64(instr, 1, w);
+                        self.emit(WInst::I64Sub);
+                        self.mask_i64(w);
+                        self.write_op_i64(instr, 0, w);
+                    }
+                } else {
+                    self.read_op_i64(instr, 0, w);
+                    self.mask_i64(w);
+                    self.emit(WInst::LocalSet(LOCAL_I64_0));
+                    self.read_op_i64(instr, 1, w);
+                    self.mask_i64(w);
+                    self.emit(WInst::LocalSet(LOCAL_I64_1));
 
-                self.emit(WInst::LocalGet(LOCAL_I64_0));
-                self.emit(WInst::LocalGet(LOCAL_I64_1));
-                self.emit(WInst::I64Sub);
-                self.mask_i64(w);
-                self.emit(WInst::LocalSet(LOCAL_I64_2));
+                    self.emit(WInst::LocalGet(LOCAL_I64_0));
+                    self.emit(WInst::LocalGet(LOCAL_I64_1));
+                    self.emit(WInst::I64Sub);
+                    self.mask_i64(w);
+                    self.emit(WInst::LocalSet(LOCAL_I64_2));
 
-                if is_sub {
-                    self.emit(WInst::LocalGet(LOCAL_I64_2));
-                    self.write_op_i64(instr, 0, w);
+                    if is_sub {
+                        self.emit(WInst::LocalGet(LOCAL_I64_2));
+                        self.write_op_i64(instr, 0, w);
+                    }
+                    self.set_sub_flags(LOCAL_I64_0, LOCAL_I64_1, LOCAL_I64_2, w, true, None);
                 }
-                self.set_sub_flags(LOCAL_I64_0, LOCAL_I64_1, LOCAL_I64_2, w, true, None);
             }
             Mnemonic::Sbb => {
                 let w = self.operand_width_bytes(instr, 0);
@@ -1468,41 +1494,75 @@ impl<'a> Lifter<'a> {
             Mnemonic::And | Mnemonic::Test => {
                 let w = self.operand_width_bytes(instr, 0);
                 let is_and = instr.mnemonic() == Mnemonic::And;
-                self.read_op_i64(instr, 0, w);
-                self.mask_i64(w);
-                self.read_op_i64(instr, 1, w);
-                self.mask_i64(w);
-                self.emit(WInst::I64And);
-                self.emit(WInst::LocalSet(LOCAL_I64_2));
-                if is_and {
-                    self.emit(WInst::LocalGet(LOCAL_I64_2));
-                    self.write_op_i64(instr, 0, w);
+                if skip_flags {
+                    if is_and {
+                        self.read_op_i64(instr, 0, w);
+                        self.read_op_i64(instr, 1, w);
+                        self.emit(WInst::I64And);
+                        self.mask_i64(w);
+                        self.write_op_i64(instr, 0, w);
+                    }
+                } else {
+                    self.read_op_i64(instr, 0, w);
+                    self.mask_i64(w);
+                    self.read_op_i64(instr, 1, w);
+                    self.mask_i64(w);
+                    self.emit(WInst::I64And);
+                    self.emit(WInst::LocalSet(LOCAL_I64_2));
+                    if is_and {
+                        self.emit(WInst::LocalGet(LOCAL_I64_2));
+                        self.write_op_i64(instr, 0, w);
+                    }
+                    self.set_logic_flags(LOCAL_I64_2, w);
                 }
-                self.set_logic_flags(LOCAL_I64_2, w);
             }
             Mnemonic::Or => {
                 let w = self.operand_width_bytes(instr, 0);
-                self.read_op_i64(instr, 0, w);
-                self.mask_i64(w);
-                self.read_op_i64(instr, 1, w);
-                self.mask_i64(w);
-                self.emit(WInst::I64Or);
-                self.emit(WInst::LocalSet(LOCAL_I64_2));
-                self.emit(WInst::LocalGet(LOCAL_I64_2));
-                self.write_op_i64(instr, 0, w);
-                self.set_logic_flags(LOCAL_I64_2, w);
+                if skip_flags {
+                    self.read_op_i64(instr, 0, w);
+                    self.read_op_i64(instr, 1, w);
+                    self.emit(WInst::I64Or);
+                    self.mask_i64(w);
+                    self.write_op_i64(instr, 0, w);
+                } else {
+                    self.read_op_i64(instr, 0, w);
+                    self.mask_i64(w);
+                    self.read_op_i64(instr, 1, w);
+                    self.mask_i64(w);
+                    self.emit(WInst::I64Or);
+                    self.emit(WInst::LocalSet(LOCAL_I64_2));
+                    self.emit(WInst::LocalGet(LOCAL_I64_2));
+                    self.write_op_i64(instr, 0, w);
+                    self.set_logic_flags(LOCAL_I64_2, w);
+                }
             }
             Mnemonic::Xor => {
                 let w = self.operand_width_bytes(instr, 0);
-                self.read_op_i64(instr, 0, w);
-                self.mask_i64(w);
-                self.read_op_i64(instr, 1, w);
-                self.mask_i64(w);
-                self.emit(WInst::I64Xor);
-                self.emit(WInst::LocalSet(LOCAL_I64_2));
-                self.emit(WInst::LocalGet(LOCAL_I64_2));
-                self.write_op_i64(instr, 0, w);
-                self.set_logic_flags(LOCAL_I64_2, w);
+                if skip_flags {
+                    if instr.op0_kind() == OpKind::Register
+                        && instr.op1_kind() == OpKind::Register
+                        && instr.op0_register() == instr.op1_register()
+                    {
+                        self.emit(WInst::I64Const(0));
+                        self.write_op_i64(instr, 0, w);
+                    } else {
+                        self.read_op_i64(instr, 0, w);
+                        self.read_op_i64(instr, 1, w);
+                        self.emit(WInst::I64Xor);
+                        self.mask_i64(w);
+                        self.write_op_i64(instr, 0, w);
+                    }
+                } else {
+                    self.read_op_i64(instr, 0, w);
+                    self.mask_i64(w);
+                    self.read_op_i64(instr, 1, w);
+                    self.mask_i64(w);
+                    self.emit(WInst::I64Xor);
+                    self.emit(WInst::LocalSet(LOCAL_I64_2));
+                    self.emit(WInst::LocalGet(LOCAL_I64_2));
+                    self.write_op_i64(instr, 0, w);
+                    self.set_logic_flags(LOCAL_I64_2, w);
+                }
             }
             Mnemonic::Not => {
                 let w = self.operand_width_bytes(instr, 0);
@@ -1514,20 +1574,28 @@ impl<'a> Lifter<'a> {
             }
             Mnemonic::Neg => {
                 let w = self.operand_width_bytes(instr, 0);
-                self.emit(WInst::I64Const(0));
-                self.emit(WInst::LocalSet(LOCAL_I64_0));
-                self.read_op_i64(instr, 0, w);
-                self.mask_i64(w);
-                self.emit(WInst::LocalSet(LOCAL_I64_1));
+                if skip_flags {
+                    self.emit(WInst::I64Const(0));
+                    self.read_op_i64(instr, 0, w);
+                    self.emit(WInst::I64Sub);
+                    self.mask_i64(w);
+                    self.write_op_i64(instr, 0, w);
+                } else {
+                    self.emit(WInst::I64Const(0));
+                    self.emit(WInst::LocalSet(LOCAL_I64_0));
+                    self.read_op_i64(instr, 0, w);
+                    self.mask_i64(w);
+                    self.emit(WInst::LocalSet(LOCAL_I64_1));
 
-                self.emit(WInst::I64Const(0));
-                self.emit(WInst::LocalGet(LOCAL_I64_1));
-                self.emit(WInst::I64Sub);
-                self.mask_i64(w);
-                self.emit(WInst::LocalTee(LOCAL_I64_2));
-                self.write_op_i64(instr, 0, w);
+                    self.emit(WInst::I64Const(0));
+                    self.emit(WInst::LocalGet(LOCAL_I64_1));
+                    self.emit(WInst::I64Sub);
+                    self.mask_i64(w);
+                    self.emit(WInst::LocalTee(LOCAL_I64_2));
+                    self.write_op_i64(instr, 0, w);
 
-                self.set_sub_flags(LOCAL_I64_0, LOCAL_I64_1, LOCAL_I64_2, w, true, None);
+                    self.set_sub_flags(LOCAL_I64_0, LOCAL_I64_1, LOCAL_I64_2, w, true, None);
+                }
             }
             Mnemonic::Inc => {
                 let w = self.operand_width_bytes(instr, 0);
@@ -3501,10 +3569,18 @@ impl<'a> Lifter<'a> {
             Mnemonic::Paddw => self.emit_v128_binop(instr, WInst::I16x8Add),
             Mnemonic::Paddd => self.emit_v128_binop(instr, WInst::I32x4Add),
             Mnemonic::Paddq => self.emit_v128_binop(instr, WInst::I64x2Add),
+            Mnemonic::Paddsb => self.emit_v128_binop(instr, WInst::I8x16AddSatS),
+            Mnemonic::Paddsw => self.emit_v128_binop(instr, WInst::I16x8AddSatS),
+            Mnemonic::Paddusb => self.emit_v128_binop(instr, WInst::I8x16AddSatU),
+            Mnemonic::Paddusw => self.emit_v128_binop(instr, WInst::I16x8AddSatU),
             Mnemonic::Psubb => self.emit_v128_binop(instr, WInst::I8x16Sub),
             Mnemonic::Psubw => self.emit_v128_binop(instr, WInst::I16x8Sub),
             Mnemonic::Psubd => self.emit_v128_binop(instr, WInst::I32x4Sub),
             Mnemonic::Psubq => self.emit_v128_binop(instr, WInst::I64x2Sub),
+            Mnemonic::Psubsb => self.emit_v128_binop(instr, WInst::I8x16SubSatS),
+            Mnemonic::Psubsw => self.emit_v128_binop(instr, WInst::I16x8SubSatS),
+            Mnemonic::Psubusb => self.emit_v128_binop(instr, WInst::I8x16SubSatU),
+            Mnemonic::Psubusw => self.emit_v128_binop(instr, WInst::I16x8SubSatU),
             Mnemonic::Pminub => self.emit_v128_binop(instr, WInst::I8x16MinU),
             Mnemonic::Pmaxub => self.emit_v128_binop(instr, WInst::I8x16MaxU),
             Mnemonic::Pxor | Mnemonic::Xorpd | Mnemonic::Xorps => {

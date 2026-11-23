@@ -1,5 +1,7 @@
-use crate::decoder::{BlockTerminator, DecodedBlock, DecodedProgram, FastHashMap};
-use crate::elf_loader::{LoadedImage, INITIAL_MEM_PAGES};
+use crate::decoder::{
+    decode_block_instructions_into, BlockTerminator, DecodedBlock, DecodedProgram, FastHashMap,
+};
+use crate::elf_loader::{ExecSegment, LoadedImage, INITIAL_MEM_PAGES};
 use crate::lifter::{
     Lifter, DEFAULT_QUANTUM, GLOBAL_CF, GLOBAL_DF, GLOBAL_EXIT_CODE, GLOBAL_EXIT_FLAG,
     GLOBAL_FSBASE, GLOBAL_GSBASE, GLOBAL_MXCSR, GLOBAL_QUANTUM, GLOBAL_RAX, GLOBAL_RIP, GLOBAL_RSP,
@@ -7,20 +9,22 @@ use crate::lifter::{
     GLOBAL_X87_TOP, GLOBAL_XMM_BASE, GLOBAL_YIELD_FLAG, GPR_NAMES, LOCAL_I64_0, LOCAL_PC_IDX,
 };
 use crate::meta::{MetaSoFile, WasmMeta};
-use crate::x87::{emit_x87_functions, register_x87_functions, register_x87_types};
+use crate::x87::{
+    emit_x87_functions_into, register_x87_functions, register_x87_types, X87_HELPER_COUNT,
+};
 use anyhow::Result;
-use iced_x86::Mnemonic;
+use iced_x86::{Instruction, Mnemonic};
 use std::borrow::Cow;
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, CustomSection, DataSection, ElementSection, Elements,
-    ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType,
-    Instruction as WInst, MemArg, MemorySection, MemoryType, Module, RefType, TableSection,
-    TableType, TypeSection, ValType,
+    BlockType, ConstExpr, CustomSection, ElementSection, Elements, Encode, ExportKind,
+    ExportSection, Function, FunctionSection, GlobalSection, GlobalType, Instruction as WInst,
+    MemArg, MemorySection, MemoryType, RefType, Section, SectionId, TableSection, TableType,
+    TypeSection, ValType,
 };
 
 pub const DISPATCH_HASH_ADDR: u32 = 0x0C00_0000;
-const CHUNK_MAX_BLOCKS: usize = 512;
-const CHUNK_MAX_INSTRS: usize = 4096;
+const CHUNK_MAX_BLOCKS: usize = 64;
+const CHUNK_MAX_INSTRS: usize = 512;
 
 fn make_chunk_function() -> Function {
     // Param 0 is i32 ($pc_idx) from function type.
@@ -34,32 +38,152 @@ fn make_chunk_function() -> Function {
     ])
 }
 
+#[inline]
+fn lookup_block_target(
+    blocks_flat: &[&DecodedBlock],
+    chunk_ranges: &[(usize, usize)],
+    target_va: u32,
+) -> Option<(u32, u32)> {
+    if target_va == 0 {
+        return None;
+    }
+    let block_idx = blocks_flat
+        .binary_search_by_key(&target_va, |b| b.start_va)
+        .ok()?;
+    let chunk_idx = chunk_ranges.partition_point(|&(_, end)| end <= block_idx);
+    let (chunk_start, _) = chunk_ranges[chunk_idx];
+    Some((chunk_idx as u32, (block_idx - chunk_start) as u32))
+}
+
+/// Strictly intra-block backward dead-flag analysis over `body_instrs`.
+/// Assumes all arithmetic flags (`CF/OF/AF/ZF/SF/PF`) are live at block exit.
+/// Marks `skip_flags[i] = true` only for instructions that unconditionally
+/// overwrite all 6 arithmetic flags without reading any flag when no subsequent
+/// instruction in the block reads them before another full overwrite.
+fn compute_skip_flags(body_instrs: &[Instruction], skip_flags: &mut Vec<bool>) {
+    skip_flags.clear();
+    skip_flags.resize(body_instrs.len(), false);
+    let mut flags_live = true;
+
+    for i in (0..body_instrs.len()).rev() {
+        match body_instrs[i].mnemonic() {
+            // Unconditionally overwrite all 6 arithmetic flags (CF/OF/AF/ZF/SF/PF)
+            // without reading any arithmetic flag.
+            Mnemonic::Add
+            | Mnemonic::Sub
+            | Mnemonic::And
+            | Mnemonic::Or
+            | Mnemonic::Xor
+            | Mnemonic::Cmp
+            | Mnemonic::Test
+            | Mnemonic::Neg => {
+                if !flags_live {
+                    skip_flags[i] = true;
+                }
+                flags_live = false;
+            }
+            // Strictly flag-transparent instructions (neither read nor write CF/OF/AF/ZF/SF/PF).
+            Mnemonic::Mov
+            | Mnemonic::Movzx
+            | Mnemonic::Movsx
+            | Mnemonic::Movsxd
+            | Mnemonic::Lea
+            | Mnemonic::Push
+            | Mnemonic::Pop
+            | Mnemonic::Nop
+            | Mnemonic::Endbr64
+            | Mnemonic::Endbr32
+            | Mnemonic::Pause
+            | Mnemonic::Sfence
+            | Mnemonic::Lfence
+            | Mnemonic::Mfence
+            | Mnemonic::Prefetcht0
+            | Mnemonic::Prefetcht1
+            | Mnemonic::Prefetcht2
+            | Mnemonic::Prefetchnta
+            | Mnemonic::Prefetchw
+            | Mnemonic::Wait
+            | Mnemonic::Xchg
+            | Mnemonic::Bswap
+            | Mnemonic::Not
+            | Mnemonic::Cdq
+            | Mnemonic::Cqo
+            | Mnemonic::Cdqe
+            | Mnemonic::Cwde
+            | Mnemonic::Cbw
+            | Mnemonic::Cwd
+            | Mnemonic::Movaps
+            | Mnemonic::Movups
+            | Mnemonic::Movapd
+            | Mnemonic::Movupd
+            | Mnemonic::Movdqa
+            | Mnemonic::Movdqu
+            | Mnemonic::Movss
+            | Mnemonic::Movd
+            | Mnemonic::Movq
+            | Mnemonic::Movlpd
+            | Mnemonic::Movhpd
+            | Mnemonic::Movlps
+            | Mnemonic::Movhps
+            | Mnemonic::Pxor
+            | Mnemonic::Xorps
+            | Mnemonic::Xorpd
+            | Mnemonic::Por
+            | Mnemonic::Pand
+            | Mnemonic::Pandn => {}
+            // Conservative: anything else may read or partially modify flags.
+            _ => {
+                flags_live = true;
+            }
+        }
+    }
+}
+
+fn emit_quantum_backedge_check(func: &mut Function, target_va: u32) {
+    func.instruction(&WInst::GlobalGet(GLOBAL_QUANTUM));
+    func.instruction(&WInst::I32Const(1));
+    func.instruction(&WInst::I32Sub);
+    func.instruction(&WInst::GlobalSet(GLOBAL_QUANTUM));
+
+    func.instruction(&WInst::GlobalGet(GLOBAL_QUANTUM));
+    func.instruction(&WInst::I32Const(0));
+    func.instruction(&WInst::I32LeS);
+    func.instruction(&WInst::If(BlockType::Empty));
+    func.instruction(&WInst::I64Const(target_va as i64));
+    func.instruction(&WInst::GlobalSet(GLOBAL_RIP));
+    func.instruction(&WInst::I32Const(2));
+    func.instruction(&WInst::GlobalSet(GLOBAL_YIELD_FLAG));
+    func.instruction(&WInst::Return);
+    func.instruction(&WInst::End);
+}
+
 fn emit_jump_target(
     func: &mut Function,
     target_va: u32,
+    current_va: u32,
     chunk_block_map: &FastHashMap<u32, u32>,
+    blocks_flat: &[&DecodedBlock],
+    chunk_ranges: &[(usize, usize)],
     dispatch_depth: u32,
+    current_idx: u32,
 ) {
     if let Some(&local_idx) = chunk_block_map.get(&target_va) {
-        func.instruction(&WInst::GlobalGet(GLOBAL_QUANTUM));
-        func.instruction(&WInst::I32Const(1));
-        func.instruction(&WInst::I32Sub);
-        func.instruction(&WInst::GlobalSet(GLOBAL_QUANTUM));
-
-        func.instruction(&WInst::GlobalGet(GLOBAL_QUANTUM));
-        func.instruction(&WInst::I32Const(0));
-        func.instruction(&WInst::I32LeS);
-        func.instruction(&WInst::If(BlockType::Empty));
-        func.instruction(&WInst::I64Const(target_va as i64));
-        func.instruction(&WInst::GlobalSet(GLOBAL_RIP));
-        func.instruction(&WInst::I32Const(2));
-        func.instruction(&WInst::GlobalSet(GLOBAL_YIELD_FLAG));
-        func.instruction(&WInst::Return);
-        func.instruction(&WInst::End);
+        if local_idx <= current_idx {
+            emit_quantum_backedge_check(func, target_va);
+        }
 
         func.instruction(&WInst::I32Const(local_idx as i32));
         func.instruction(&WInst::LocalSet(LOCAL_PC_IDX));
         func.instruction(&WInst::Br(dispatch_depth));
+    } else if let Some((target_chunk, target_local)) =
+        lookup_block_target(blocks_flat, chunk_ranges, target_va)
+    {
+        if target_va <= current_va {
+            emit_quantum_backedge_check(func, target_va);
+        }
+
+        func.instruction(&WInst::I32Const(target_local as i32));
+        func.instruction(&WInst::ReturnCall(target_chunk));
     } else {
         func.instruction(&WInst::I64Const(target_va as i64));
         func.instruction(&WInst::GlobalSet(GLOBAL_RIP));
@@ -84,9 +208,14 @@ fn emit_push_ret_addr(func: &mut Function, ret_va: u32) {
 }
 
 fn emit_chunk_function(
+    exec_segments: &[ExecSegment],
     chunk: &[&DecodedBlock],
     chunk_block_map: &FastHashMap<u32, u32>,
+    blocks_flat: &[&DecodedBlock],
+    chunk_ranges: &[(usize, usize)],
     x87_helper_base: u32,
+    instr_buf: &mut Vec<Instruction>,
+    skip_flags_buf: &mut Vec<bool>,
 ) -> Function {
     let mut func = make_chunk_function();
     let n = chunk.len() as u32;
@@ -113,7 +242,8 @@ fn emit_chunk_function(
         func.instruction(&WInst::End); // closes $b_{idx}
         let dispatch_depth = (n - 1) - (idx as u32);
 
-        let instrs = &block.instructions;
+        decode_block_instructions_into(exec_segments, block, instr_buf);
+        let instrs = instr_buf.as_slice();
         let has_term_instr = match block.terminator {
             BlockTerminator::Fallthrough(_) => false,
             BlockTerminator::Trap => instrs.last().is_some_and(|i| {
@@ -135,16 +265,26 @@ fn emit_chunk_function(
             instrs.len()
         };
 
+        compute_skip_flags(&instrs[..body_len], skip_flags_buf);
         {
             let mut lifter = Lifter::new(&mut func, x87_helper_base);
-            for instr in &instrs[..body_len] {
-                lifter.lift_instruction(instr);
+            for (i, instr) in instrs[..body_len].iter().enumerate() {
+                lifter.lift_instruction_with_flags(instr, skip_flags_buf[i]);
             }
         }
 
         match block.terminator {
             BlockTerminator::Fallthrough(next_va) | BlockTerminator::DirectJump(next_va) => {
-                emit_jump_target(&mut func, next_va, chunk_block_map, dispatch_depth);
+                emit_jump_target(
+                    &mut func,
+                    next_va,
+                    block.start_va,
+                    chunk_block_map,
+                    blocks_flat,
+                    chunk_ranges,
+                    dispatch_depth,
+                    idx as u32,
+                );
             }
             BlockTerminator::ConditionalBranch { taken, fallthrough } => {
                 if let Some(last) = instrs.last() {
@@ -164,9 +304,27 @@ fn emit_chunk_function(
                         }
                     }
                     func.instruction(&WInst::If(BlockType::Empty));
-                    emit_jump_target(&mut func, taken, chunk_block_map, dispatch_depth + 1);
+                    emit_jump_target(
+                        &mut func,
+                        taken,
+                        block.start_va,
+                        chunk_block_map,
+                        blocks_flat,
+                        chunk_ranges,
+                        dispatch_depth + 1,
+                        idx as u32,
+                    );
                     func.instruction(&WInst::End);
-                    emit_jump_target(&mut func, fallthrough, chunk_block_map, dispatch_depth);
+                    emit_jump_target(
+                        &mut func,
+                        fallthrough,
+                        block.start_va,
+                        chunk_block_map,
+                        blocks_flat,
+                        chunk_ranges,
+                        dispatch_depth,
+                        idx as u32,
+                    );
                 } else {
                     func.instruction(&WInst::Unreachable);
                 }
@@ -176,7 +334,16 @@ fn emit_chunk_function(
                 fallthrough,
             } => {
                 emit_push_ret_addr(&mut func, fallthrough);
-                emit_jump_target(&mut func, target, chunk_block_map, dispatch_depth);
+                emit_jump_target(
+                    &mut func,
+                    target,
+                    block.start_va,
+                    chunk_block_map,
+                    blocks_flat,
+                    chunk_ranges,
+                    dispatch_depth,
+                    idx as u32,
+                );
             }
             BlockTerminator::IndirectCall { fallthrough } => {
                 if let Some(last) = instrs.last() {
@@ -248,9 +415,9 @@ fn emit_chunk_function(
     func
 }
 
-fn emit_start_function(num_chunks: u32, hash_mask: u32) -> Function {
-    // Locals: 0=$va(i32), 1=$slot(i32), 2=$slot_va(i32), 3=$packed(i32)
-    let mut func = Function::new([(4, ValType::I32)]);
+fn emit_start_function(num_chunks: u32, hash_mask: u32, dispatch_hash_addr: u32) -> Function {
+    // Locals: 0=$va(i32), 1=$slot(i32), 2=$slot_va(i32), 3=$tmp(i32), 4=$entry_or_rip(i64)
+    let mut func = Function::new([(4, ValType::I32), (1, ValType::I64)]);
 
     if num_chunks == 0 {
         func.instruction(&WInst::GlobalGet(GLOBAL_EXIT_CODE));
@@ -262,51 +429,54 @@ fn emit_start_function(num_chunks: u32, hash_mask: u32) -> Function {
     // loop $trampoline
     func.instruction(&WInst::Loop(BlockType::Empty));
     {
-        // if exit_flag != 0 { return exit_code }
+        // Merged exit_flag | yield_flag check
         func.instruction(&WInst::GlobalGet(GLOBAL_EXIT_FLAG));
-        func.instruction(&WInst::If(BlockType::Empty));
-        func.instruction(&WInst::GlobalGet(GLOBAL_EXIT_CODE));
-        func.instruction(&WInst::Return);
-        func.instruction(&WInst::End);
-
-        // if yield_flag != 0 { return exit_code }
         func.instruction(&WInst::GlobalGet(GLOBAL_YIELD_FLAG));
+        func.instruction(&WInst::I32Or);
         func.instruction(&WInst::If(BlockType::Empty));
         func.instruction(&WInst::GlobalGet(GLOBAL_EXIT_CODE));
         func.instruction(&WInst::Return);
         func.instruction(&WInst::End);
 
-        // if rip == 0 { return exit_code }
+        // Merged rip == 0 / (rip >> 32) != 0 check:
+        // (rip - 1) >=u 0xFFFF_FFFF iff rip == 0 or rip >= 0x1_0000_0000
         func.instruction(&WInst::GlobalGet(GLOBAL_RIP));
-        func.instruction(&WInst::I64Eqz);
+        func.instruction(&WInst::LocalTee(4));
+        func.instruction(&WInst::I64Const(1));
+        func.instruction(&WInst::I64Sub);
+        func.instruction(&WInst::I64Const(0xFFFF_FFFFu32 as i64));
+        func.instruction(&WInst::I64GeU);
         func.instruction(&WInst::If(BlockType::Empty));
-        func.instruction(&WInst::GlobalGet(GLOBAL_EXIT_CODE));
-        func.instruction(&WInst::Return);
+        {
+            func.instruction(&WInst::LocalGet(4));
+            func.instruction(&WInst::I64Eqz);
+            func.instruction(&WInst::If(BlockType::Empty));
+            func.instruction(&WInst::GlobalGet(GLOBAL_EXIT_CODE));
+            func.instruction(&WInst::Return);
+            func.instruction(&WInst::End);
+            func.instruction(&WInst::Unreachable);
+        }
         func.instruction(&WInst::End);
 
-        // if (rip >> 32) != 0 { unreachable (trap) }
-        func.instruction(&WInst::GlobalGet(GLOBAL_RIP));
-        func.instruction(&WInst::I64Const(32));
-        func.instruction(&WInst::I64ShrU);
-        func.instruction(&WInst::I64Const(0));
-        func.instruction(&WInst::I64Ne);
-        func.instruction(&WInst::If(BlockType::Empty));
-        func.instruction(&WInst::Unreachable);
-        func.instruction(&WInst::End);
-
-        // if quantum <= 0 { yield_flag = 2; return exit_code }
+        // Decrement & check quantum once via local.tee:
+        // q = quantum - 1; if q < 0 { yield_flag = 2; return exit_code } else { quantum = q }
         func.instruction(&WInst::GlobalGet(GLOBAL_QUANTUM));
+        func.instruction(&WInst::I32Const(1));
+        func.instruction(&WInst::I32Sub);
+        func.instruction(&WInst::LocalTee(3));
         func.instruction(&WInst::I32Const(0));
-        func.instruction(&WInst::I32LeS);
+        func.instruction(&WInst::I32LtS);
         func.instruction(&WInst::If(BlockType::Empty));
         func.instruction(&WInst::I32Const(2));
         func.instruction(&WInst::GlobalSet(GLOBAL_YIELD_FLAG));
         func.instruction(&WInst::GlobalGet(GLOBAL_EXIT_CODE));
         func.instruction(&WInst::Return);
         func.instruction(&WInst::End);
+        func.instruction(&WInst::LocalGet(3));
+        func.instruction(&WInst::GlobalSet(GLOBAL_QUANTUM));
 
-        // va = rip as i32
-        func.instruction(&WInst::GlobalGet(GLOBAL_RIP));
+        // va = rip as i32 (reusing local 4)
+        func.instruction(&WInst::LocalGet(4));
         func.instruction(&WInst::I32WrapI64);
         func.instruction(&WInst::LocalTee(0));
 
@@ -320,15 +490,17 @@ fn emit_start_function(num_chunks: u32, hash_mask: u32) -> Function {
         // loop $probe
         func.instruction(&WInst::Loop(BlockType::Empty));
         {
-            // byte_off = slot << 3 -> local 2 (temporarily), load slot_va
+            // Single i64.load (align 3) for (slot_va | (packed << 32))
             func.instruction(&WInst::LocalGet(1));
             func.instruction(&WInst::I32Const(3));
             func.instruction(&WInst::I32Shl);
-            func.instruction(&WInst::I32Load(MemArg {
-                offset: DISPATCH_HASH_ADDR as u64,
-                align: 2,
+            func.instruction(&WInst::I64Load(MemArg {
+                offset: dispatch_hash_addr as u64,
+                align: 3,
                 memory_index: 0,
             }));
+            func.instruction(&WInst::LocalTee(4));
+            func.instruction(&WInst::I32WrapI64);
             func.instruction(&WInst::LocalTee(2));
 
             // if slot_va == va
@@ -336,21 +508,11 @@ fn emit_start_function(num_chunks: u32, hash_mask: u32) -> Function {
             func.instruction(&WInst::I32Eq);
             func.instruction(&WInst::If(BlockType::Empty));
             {
-                // Consume 1 quantum for this block dispatch
-                func.instruction(&WInst::GlobalGet(GLOBAL_QUANTUM));
-                func.instruction(&WInst::I32Const(1));
-                func.instruction(&WInst::I32Sub);
-                func.instruction(&WInst::GlobalSet(GLOBAL_QUANTUM));
-
-                // packed = i32.load(offset = DISPATCH_HASH_ADDR + 4)(slot << 3)
-                func.instruction(&WInst::LocalGet(1));
-                func.instruction(&WInst::I32Const(3));
-                func.instruction(&WInst::I32Shl);
-                func.instruction(&WInst::I32Load(MemArg {
-                    offset: (DISPATCH_HASH_ADDR + 4) as u64,
-                    align: 2,
-                    memory_index: 0,
-                }));
+                // packed = (entry >> 32) as i32
+                func.instruction(&WInst::LocalGet(4));
+                func.instruction(&WInst::I64Const(32));
+                func.instruction(&WInst::I64ShrU);
+                func.instruction(&WInst::I32WrapI64);
                 func.instruction(&WInst::LocalTee(3));
 
                 // local_idx = packed & 0x3FF
@@ -525,135 +687,296 @@ fn emit_load_ctx_function() -> Function {
     func
 }
 
-pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> {
-    // 1. Partition blocks into chunks
-    let est_chunks = (prog.blocks.len() / CHUNK_MAX_BLOCKS).max(16);
-    let mut chunks: Vec<(Vec<&DecodedBlock>, FastHashMap<u32, u32>)> = Vec::with_capacity(est_chunks);
-    let mut cur_blocks: Vec<&DecodedBlock> = Vec::with_capacity(CHUNK_MAX_BLOCKS);
-    let mut cur_map: FastHashMap<u32, u32> =
-        FastHashMap::with_capacity_and_hasher(CHUNK_MAX_BLOCKS, Default::default());
-    let mut cur_instrs: usize = 0;
+const ZERO_RUN_THRESHOLD: usize = 4096;
 
-    for (&va, block) in &prog.blocks {
-        if !cur_blocks.is_empty()
-            && (cur_blocks.len() >= CHUNK_MAX_BLOCKS
-                || cur_instrs + block.instructions.len() > CHUNK_MAX_INSTRS)
-        {
-            chunks.push((
-                std::mem::replace(&mut cur_blocks, Vec::with_capacity(CHUNK_MAX_BLOCKS)),
-                std::mem::replace(
-                    &mut cur_map,
-                    FastHashMap::with_capacity_and_hasher(CHUNK_MAX_BLOCKS, Default::default()),
-                ),
-            ));
-            cur_instrs = 0;
+#[inline]
+fn write_leb_u32(out: &mut Vec<u8>, mut val: u32) {
+    loop {
+        let byte = (val & 0x7f) as u8;
+        val >>= 7;
+        if val == 0 {
+            out.push(byte);
+            break;
         }
-        let local_idx = cur_blocks.len() as u32;
-        cur_map.insert(va, local_idx);
-        cur_blocks.push(block);
-        cur_instrs += block.instructions.len();
+        out.push(byte | 0x80);
     }
-    if !cur_blocks.is_empty() {
-        chunks.push((cur_blocks, cur_map));
+}
+
+#[inline]
+fn write_leb_i32(out: &mut Vec<u8>, mut val: i32) {
+    loop {
+        let byte = (val & 0x7f) as u8;
+        val >>= 7;
+        let done = (val == 0 && (byte & 0x40) == 0) || (val == -1 && (byte & 0x40) != 0);
+        if done {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
     }
+}
 
-    let num_chunks = chunks.len() as u32;
+#[inline]
+fn write_leb_u32_5byte(dst: &mut [u8], val: u32) {
+    dst[0] = ((val & 0x7f) as u8) | 0x80;
+    dst[1] = (((val >> 7) & 0x7f) as u8) | 0x80;
+    dst[2] = (((val >> 14) & 0x7f) as u8) | 0x80;
+    dst[3] = (((val >> 21) & 0x7f) as u8) | 0x80;
+    dst[4] = ((val >> 28) & 0x0f) as u8;
+}
 
-    // 2. Build open-addressed dispatch hash table
-    let table_slots = (prog.blocks.len() * 2).max(16).next_power_of_two();
-    let table_bytes_len = table_slots * 8;
-    let needed_bytes = (DISPATCH_HASH_ADDR as usize) + table_bytes_len;
-    let mem_pages = INITIAL_MEM_PAGES.max(((needed_bytes + 65535) / 65536) as u32);
-
-    let hash_mask = (table_slots - 1) as u32;
-    let mut hash_bytes = vec![0u8; table_bytes_len];
-    for (chunk_idx, (blocks, _)) in chunks.iter().enumerate() {
-        for (local_idx, block) in blocks.iter().enumerate() {
-            let va = block.start_va;
-            if va == 0 {
-                continue;
-            }
-            let packed = ((chunk_idx as u32) << 10) | (local_idx as u32);
-            let mut slot = va.wrapping_mul(0x9E37_79B1) & hash_mask;
-            loop {
-                let off = (slot as usize) * 8;
-                let existing = u32::from_le_bytes(hash_bytes[off..off + 4].try_into().unwrap());
-                if existing == 0 {
-                    hash_bytes[off..off + 4].copy_from_slice(&va.to_le_bytes());
-                    hash_bytes[off + 4..off + 8].copy_from_slice(&packed.to_le_bytes());
+fn push_nonzero_slices<'a>(vaddr: u32, data: &'a [u8], out: &mut Vec<(u32, &'a [u8])>) {
+    let mut pos = 0usize;
+    let len = data.len();
+    while pos < len {
+        let z_start = pos;
+        while pos < len && data[pos] == 0 {
+            pos += 1;
+        }
+        if pos - z_start >= ZERO_RUN_THRESHOLD {
+            continue;
+        }
+        if pos == len {
+            break;
+        }
+        let slice_start = z_start;
+        let mut slice_end = pos;
+        while pos < len {
+            if data[pos] != 0 {
+                pos += 1;
+                slice_end = pos;
+            } else {
+                let run_start = pos;
+                while pos < len && data[pos] == 0 {
+                    pos += 1;
+                }
+                if pos - run_start >= ZERO_RUN_THRESHOLD {
                     break;
                 }
-                slot = (slot + 1) & hash_mask;
+                if pos < len {
+                    slice_end = pos;
+                }
             }
         }
+        if slice_end > slice_start {
+            out.push((vaddr + slice_start as u32, &data[slice_start..slice_end]));
+        }
+    }
+}
+
+fn write_active_data_segment(out: &mut Vec<u8>, vaddr: u32, payload: &[u8]) {
+    // Active segment in memory 0: flags=0x00, i32.const vaddr, end (0x0b), byte vec
+    out.push(0x00);
+    out.push(0x41);
+    write_leb_i32(out, vaddr as i32);
+    out.push(0x0b);
+    write_leb_u32(out, payload.len() as u32);
+    out.extend_from_slice(payload);
+}
+
+pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> {
+    emit_wasm_with_prefix(image, prog, &[])
+}
+
+pub fn emit_wasm_with_prefix(
+    image: &LoadedImage,
+    prog: &DecodedProgram,
+    prefix: &[u8],
+) -> Result<Vec<u8>> {
+    // 1. Partition blocks into chunk ranges over a compact flat slice of references
+    let blocks_flat: Vec<&DecodedBlock> = prog.blocks.values().collect();
+    let est_chunks = (blocks_flat.len() / CHUNK_MAX_BLOCKS).max(16);
+    let mut chunk_ranges: Vec<(usize, usize)> = Vec::with_capacity(est_chunks);
+    let mut chunk_start = 0usize;
+    let mut cur_instrs = 0usize;
+
+    for (i, block) in blocks_flat.iter().enumerate() {
+        let b_instrs = block.instr_count as usize;
+        if i > chunk_start
+            && ((i - chunk_start) >= CHUNK_MAX_BLOCKS || cur_instrs + b_instrs > CHUNK_MAX_INSTRS)
+        {
+            chunk_ranges.push((chunk_start, i));
+            chunk_start = i;
+            cur_instrs = 0;
+        }
+        cur_instrs += b_instrs;
+    }
+    if chunk_start < blocks_flat.len() {
+        chunk_ranges.push((chunk_start, blocks_flat.len()));
     }
 
-    // 3. Assemble WASM Sections
-    let mut module = Module::new();
+    let num_chunks = chunk_ranges.len() as u32;
 
-    // Type Section
-    let mut types = TypeSection::new();
-    types.ty().function([ValType::I32], []); // 0: chunk_fn, save_ctx, load_ctx
-    types.ty().function([], [ValType::I32]); // 1: _start
-    let x87_types = register_x87_types(&mut types, 2);
-    module.section(&types);
+    // 2. Compute dispatch hash table sizing (<=66.7% load factor) without allocating yet
+    let table_slots = (blocks_flat.len() + blocks_flat.len() / 2)
+        .max(16)
+        .next_power_of_two();
+    let table_bytes_len = table_slots * 8;
+    let dispatch_hash_addr = image.dispatch_hash_addr;
+    let needed_bytes = (dispatch_hash_addr as usize)
+        .checked_add(table_bytes_len)
+        .ok_or_else(|| anyhow::anyhow!("Dispatch table exceeds 32-bit guest memory"))?;
+    let mem_pages = INITIAL_MEM_PAGES.max(((needed_bytes + 65535) / 65536) as u32);
+    let hash_mask = (table_slots - 1) as u32;
 
-    // Function Section
-    let mut functions = FunctionSection::new();
-    for _ in 0..num_chunks {
-        functions.function(0);
+    // Pre-size single output buffer to avoid 512 MiB -> 1024 MiB Vec doubling
+    let total_exec_bytes: usize = image.exec_segments.iter().map(|s| s.data.len()).sum();
+    let total_data_bytes: usize = image.data_segments.iter().map(|s| s.data.len()).sum();
+    let meta_est: usize = image.so_files.iter().map(|s| s.bytes.len() + 256).sum::<usize>() + 1024;
+    let est_cap = prefix
+        .len()
+        .saturating_add(total_exec_bytes.saturating_mul(7))
+        .saturating_add(total_data_bytes)
+        .saturating_add(table_bytes_len)
+        .saturating_add(meta_est)
+        .saturating_add(65536);
+
+    let mut out = Vec::with_capacity(est_cap);
+    out.extend_from_slice(prefix);
+    out.extend_from_slice(b"\0asm\x01\x00\x00\x00");
+
+    // 3. Emit small sections directly into `out` and drop immediately
+    let x87_types = {
+        let mut types = TypeSection::new();
+        types.ty().function([ValType::I32], []); // 0: chunk_fn, save_ctx, load_ctx
+        types.ty().function([], [ValType::I32]); // 1: _start
+        let x87_types = register_x87_types(&mut types, 2);
+        types.append_to(&mut out);
+        x87_types
+    };
+
+    {
+        let mut functions = FunctionSection::new();
+        for _ in 0..num_chunks {
+            functions.function(0);
+        }
+        functions.function(1); // _start
+        functions.function(0); // save_ctx
+        functions.function(0); // load_ctx
+        register_x87_functions(&mut functions, &x87_types);
+        functions.append_to(&mut out);
     }
-    functions.function(1); // _start
-    functions.function(0); // save_ctx
-    functions.function(0); // load_ctx
-    register_x87_functions(&mut functions, &x87_types);
-    module.section(&functions);
 
-    // Table Section
-    let mut tables = TableSection::new();
-    tables.table(TableType {
-        element_type: RefType::FUNCREF,
-        table64: false,
-        minimum: num_chunks as u64,
-        maximum: Some(num_chunks as u64),
-        shared: false,
-    });
-    module.section(&tables);
+    {
+        let mut tables = TableSection::new();
+        tables.table(TableType {
+            element_type: RefType::FUNCREF,
+            table64: false,
+            minimum: num_chunks as u64,
+            maximum: Some(num_chunks as u64),
+            shared: false,
+        });
+        tables.append_to(&mut out);
+    }
 
-    // Memory Section
-    let mut memories = MemorySection::new();
-    memories.memory(MemoryType {
-        minimum: mem_pages as u64,
-        maximum: Some(mem_pages as u64),
-        memory64: false,
-        shared: false,
-        page_size_log2: None,
-    });
-    module.section(&memories);
+    {
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: mem_pages as u64,
+            maximum: Some(mem_pages as u64),
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        memories.append_to(&mut out);
+    }
 
-    // Global Section (exact order matching lifter.rs GLOBAL_* constants)
-    let mut globals = GlobalSection::new();
-    for _ in 0..16 {
+    {
+        // Global Section (exact order matching lifter.rs GLOBAL_* constants)
+        let mut globals = GlobalSection::new();
+        for _ in 0..16 {
+            globals.global(
+                GlobalType {
+                    val_type: ValType::I64,
+                    mutable: true,
+                    shared: false,
+                },
+                &ConstExpr::i64_const(0),
+            );
+        }
+        // 16: rip
         globals.global(
             GlobalType {
                 val_type: ValType::I64,
                 mutable: true,
                 shared: false,
             },
-            &ConstExpr::i64_const(0),
+            &ConstExpr::i64_const(image.entry_rip as i64),
         );
-    }
-    // 16: rip
-    globals.global(
-        GlobalType {
-            val_type: ValType::I64,
-            mutable: true,
-            shared: false,
-        },
-        &ConstExpr::i64_const(image.entry_rip as i64),
-    );
-    // 17: exit_flag, 18: exit_code
-    for _ in 17..=18 {
+        // 17: exit_flag, 18: exit_code
+        for _ in 17..=18 {
+            globals.global(
+                GlobalType {
+                    val_type: ValType::I32,
+                    mutable: true,
+                    shared: false,
+                },
+                &ConstExpr::i32_const(0),
+            );
+        }
+        // 19: fsbase, 20: gsbase
+        for _ in 19..=20 {
+            globals.global(
+                GlobalType {
+                    val_type: ValType::I64,
+                    mutable: true,
+                    shared: false,
+                },
+                &ConstExpr::i64_const(0),
+            );
+        }
+        // 21..=27: cf, pf, af, zf, sf, of, df
+        for _ in 21..=27 {
+            globals.global(
+                GlobalType {
+                    val_type: ValType::I32,
+                    mutable: true,
+                    shared: false,
+                },
+                &ConstExpr::i32_const(0),
+            );
+        }
+        // 28..=43: xmm0..xmm15
+        for _ in GLOBAL_XMM_BASE..GLOBAL_XMM_BASE + 16 {
+            globals.global(
+                GlobalType {
+                    val_type: ValType::V128,
+                    mutable: true,
+                    shared: false,
+                },
+                &ConstExpr::v128_const(0),
+            );
+        }
+        // 44: mxcsr
+        globals.global(
+            GlobalType {
+                val_type: ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(0x1F80),
+        );
+        // 45: tsc
+        globals.global(
+            GlobalType {
+                val_type: ValType::I64,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i64_const(1000),
+        );
+        let _ = GLOBAL_TSC;
+        // 46: x87_cw
+        globals.global(
+            GlobalType {
+                val_type: ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(0x037F),
+        );
+        let _ = GLOBAL_X87_CW;
+        // 47: yield_flag
         globals.global(
             GlobalType {
                 val_type: ValType::I32,
@@ -662,20 +985,27 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
             },
             &ConstExpr::i32_const(0),
         );
-    }
-    // 19: fsbase, 20: gsbase
-    for _ in 19..=20 {
+        // 48: quantum
         globals.global(
             GlobalType {
-                val_type: ValType::I64,
+                val_type: ValType::I32,
                 mutable: true,
                 shared: false,
             },
-            &ConstExpr::i64_const(0),
+            &ConstExpr::i32_const(DEFAULT_QUANTUM),
         );
-    }
-    // 21..=27: cf, pf, af, zf, sf, of, df
-    for _ in 21..=27 {
+        // 49..=56: x87_st0..x87_st7 (i64 mantissas)
+        for _ in GLOBAL_X87_ST_BASE..GLOBAL_X87_ST_BASE + 8 {
+            globals.global(
+                GlobalType {
+                    val_type: ValType::I64,
+                    mutable: true,
+                    shared: false,
+                },
+                &ConstExpr::i64_const(0),
+            );
+        }
+        // 57: x87_top
         globals.global(
             GlobalType {
                 val_type: ValType::I32,
@@ -684,96 +1014,7 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
             },
             &ConstExpr::i32_const(0),
         );
-    }
-    // 28..=43: xmm0..xmm15
-    for _ in GLOBAL_XMM_BASE..GLOBAL_XMM_BASE + 16 {
-        globals.global(
-            GlobalType {
-                val_type: ValType::V128,
-                mutable: true,
-                shared: false,
-            },
-            &ConstExpr::v128_const(0),
-        );
-    }
-    // 44: mxcsr
-    globals.global(
-        GlobalType {
-            val_type: ValType::I32,
-            mutable: true,
-            shared: false,
-        },
-        &ConstExpr::i32_const(0x1F80),
-    );
-    // 45: tsc
-    globals.global(
-        GlobalType {
-            val_type: ValType::I64,
-            mutable: true,
-            shared: false,
-        },
-        &ConstExpr::i64_const(1000),
-    );
-    let _ = GLOBAL_TSC;
-    // 46: x87_cw
-    globals.global(
-        GlobalType {
-            val_type: ValType::I32,
-            mutable: true,
-            shared: false,
-        },
-        &ConstExpr::i32_const(0x037F),
-    );
-    let _ = GLOBAL_X87_CW;
-    // 47: yield_flag
-    globals.global(
-        GlobalType {
-            val_type: ValType::I32,
-            mutable: true,
-            shared: false,
-        },
-        &ConstExpr::i32_const(0),
-    );
-    // 48: quantum
-    globals.global(
-        GlobalType {
-            val_type: ValType::I32,
-            mutable: true,
-            shared: false,
-        },
-        &ConstExpr::i32_const(DEFAULT_QUANTUM),
-    );
-    // 49..=56: x87_st0..x87_st7 (i64 mantissas)
-    for _ in GLOBAL_X87_ST_BASE..GLOBAL_X87_ST_BASE + 8 {
-        globals.global(
-            GlobalType {
-                val_type: ValType::I64,
-                mutable: true,
-                shared: false,
-            },
-            &ConstExpr::i64_const(0),
-        );
-    }
-    // 57: x87_top
-    globals.global(
-        GlobalType {
-            val_type: ValType::I32,
-            mutable: true,
-            shared: false,
-        },
-        &ConstExpr::i32_const(0),
-    );
-    // 58: x87_sw
-    globals.global(
-        GlobalType {
-            val_type: ValType::I32,
-            mutable: true,
-            shared: false,
-        },
-        &ConstExpr::i32_const(0),
-    );
-    // 59..=66: x87_se0..x87_se7 (i32 sign+exponent)
-    for _ in GLOBAL_X87_SE_BASE..GLOBAL_X87_SE_BASE + 8 {
+        // 58: x87_sw
         globals.global(
             GlobalType {
                 val_type: ValType::I32,
@@ -782,46 +1023,58 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
             },
             &ConstExpr::i32_const(0),
         );
+        // 59..=66: x87_se0..x87_se7 (i32 sign+exponent)
+        for _ in GLOBAL_X87_SE_BASE..GLOBAL_X87_SE_BASE + 8 {
+            globals.global(
+                GlobalType {
+                    val_type: ValType::I32,
+                    mutable: true,
+                    shared: false,
+                },
+                &ConstExpr::i32_const(0),
+            );
+        }
+        globals.append_to(&mut out);
     }
-    module.section(&globals);
 
-    // Export Section
-    let start_func_idx = num_chunks;
-    let save_ctx_func_idx = 1 + num_chunks;
-    let load_ctx_func_idx = 2 + num_chunks;
-    let mut exports = ExportSection::new();
-    exports.export("memory", ExportKind::Memory, 0);
-    exports.export("_start", ExportKind::Func, start_func_idx);
-    exports.export("save_ctx", ExportKind::Func, save_ctx_func_idx);
-    exports.export("load_ctx", ExportKind::Func, load_ctx_func_idx);
-    for (i, name) in GPR_NAMES.iter().enumerate() {
-        exports.export(name, ExportKind::Global, GLOBAL_RAX + i as u32);
+    {
+        // Export Section
+        let start_func_idx = num_chunks;
+        let save_ctx_func_idx = 1 + num_chunks;
+        let load_ctx_func_idx = 2 + num_chunks;
+        let mut exports = ExportSection::new();
+        exports.export("memory", ExportKind::Memory, 0);
+        exports.export("_start", ExportKind::Func, start_func_idx);
+        exports.export("save_ctx", ExportKind::Func, save_ctx_func_idx);
+        exports.export("load_ctx", ExportKind::Func, load_ctx_func_idx);
+        for (i, name) in GPR_NAMES.iter().enumerate() {
+            exports.export(name, ExportKind::Global, GLOBAL_RAX + i as u32);
+        }
+        exports.export("rip", ExportKind::Global, GLOBAL_RIP);
+        exports.export("exit_flag", ExportKind::Global, GLOBAL_EXIT_FLAG);
+        exports.export("exit_code", ExportKind::Global, GLOBAL_EXIT_CODE);
+        exports.export("fsbase", ExportKind::Global, GLOBAL_FSBASE);
+        exports.export("gsbase", ExportKind::Global, GLOBAL_GSBASE);
+        exports.export("yield_flag", ExportKind::Global, GLOBAL_YIELD_FLAG);
+        exports.export("quantum", ExportKind::Global, GLOBAL_QUANTUM);
+        exports.export("x87_cw", ExportKind::Global, GLOBAL_X87_CW);
+        exports.export("x87_top", ExportKind::Global, GLOBAL_X87_TOP);
+        exports.export("x87_sw", ExportKind::Global, GLOBAL_X87_SW);
+        for i in 0..8u32 {
+            exports.export(
+                &format!("x87_st{}", i),
+                ExportKind::Global,
+                GLOBAL_X87_ST_BASE + i,
+            );
+            exports.export(
+                &format!("x87_se{}", i),
+                ExportKind::Global,
+                GLOBAL_X87_SE_BASE + i,
+            );
+        }
+        exports.append_to(&mut out);
     }
-    exports.export("rip", ExportKind::Global, GLOBAL_RIP);
-    exports.export("exit_flag", ExportKind::Global, GLOBAL_EXIT_FLAG);
-    exports.export("exit_code", ExportKind::Global, GLOBAL_EXIT_CODE);
-    exports.export("fsbase", ExportKind::Global, GLOBAL_FSBASE);
-    exports.export("gsbase", ExportKind::Global, GLOBAL_GSBASE);
-    exports.export("yield_flag", ExportKind::Global, GLOBAL_YIELD_FLAG);
-    exports.export("quantum", ExportKind::Global, GLOBAL_QUANTUM);
-    exports.export("x87_cw", ExportKind::Global, GLOBAL_X87_CW);
-    exports.export("x87_top", ExportKind::Global, GLOBAL_X87_TOP);
-    exports.export("x87_sw", ExportKind::Global, GLOBAL_X87_SW);
-    for i in 0..8u32 {
-        exports.export(
-            &format!("x87_st{}", i),
-            ExportKind::Global,
-            GLOBAL_X87_ST_BASE + i,
-        );
-        exports.export(
-            &format!("x87_se{}", i),
-            ExportKind::Global,
-            GLOBAL_X87_SE_BASE + i,
-        );
-    }
-    module.section(&exports);
 
-    // Element Section
     if num_chunks > 0 {
         let mut elements = ElementSection::new();
         let func_indices: Vec<u32> = (0..num_chunks).collect();
@@ -830,41 +1083,106 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
             &ConstExpr::i32_const(0),
             Elements::Functions(Cow::Owned(func_indices)),
         );
-        module.section(&elements);
+        elements.append_to(&mut out);
     }
 
-    // Code Section
-    let x87_helper_base = num_chunks + 3;
-    let mut codes = CodeSection::new();
-    for (blocks, map) in &chunks {
-        let f = emit_chunk_function(blocks, map, x87_helper_base);
-        codes.function(&f);
-    }
-    codes.function(&emit_start_function(num_chunks, hash_mask));
-    codes.function(&emit_save_ctx_function());
-    codes.function(&emit_load_ctx_function());
-    emit_x87_functions(&mut codes, x87_helper_base);
-    module.section(&codes);
+    // 4. Stream CodeSection directly into `out` (zero intermediate CodeSection buffer)
+    {
+        let x87_helper_base = num_chunks + 3;
+        out.push(SectionId::Code as u8);
+        let code_size_pos = out.len();
+        out.extend_from_slice(&[0u8; 5]);
+        let code_payload_start = out.len();
 
-    // Data Section
-    let mut data = DataSection::new();
-    for seg in &image.data_segments {
-        if !seg.data.is_empty() {
-            data.active(
-                0,
-                &ConstExpr::i32_const(seg.vaddr as i32),
-                seg.data.iter().copied(),
+        let total_funcs = num_chunks + 3 + X87_HELPER_COUNT;
+        write_leb_u32(&mut out, total_funcs);
+
+        let mut chunk_block_map: FastHashMap<u32, u32> =
+            FastHashMap::with_capacity_and_hasher(CHUNK_MAX_BLOCKS, Default::default());
+        let mut instr_buf: Vec<Instruction> = Vec::with_capacity(64);
+        let mut skip_flags_buf: Vec<bool> = Vec::with_capacity(64);
+
+        for &(start, end) in &chunk_ranges {
+            let chunk = &blocks_flat[start..end];
+            chunk_block_map.clear();
+            for (local_idx, block) in chunk.iter().enumerate() {
+                chunk_block_map.insert(block.start_va, local_idx as u32);
+            }
+            let f = emit_chunk_function(
+                &image.exec_segments,
+                chunk,
+                &chunk_block_map,
+                &blocks_flat,
+                &chunk_ranges,
+                x87_helper_base,
+                &mut instr_buf,
+                &mut skip_flags_buf,
             );
+            f.encode(&mut out);
         }
-    }
-    data.active(
-        0,
-        &ConstExpr::i32_const(DISPATCH_HASH_ADDR as i32),
-        hash_bytes.iter().copied(),
-    );
-    module.section(&data);
+        emit_start_function(num_chunks, hash_mask, dispatch_hash_addr).encode(&mut out);
+        emit_save_ctx_function().encode(&mut out);
+        emit_load_ctx_function().encode(&mut out);
+        emit_x87_functions_into(&mut out, x87_helper_base);
 
-    // Custom Section: elf2wasm_meta
+        let code_payload_len = u32::try_from(out.len() - code_payload_start)
+            .map_err(|_| anyhow::anyhow!("CodeSection exceeds 32-bit WASM section size"))?;
+        write_leb_u32_5byte(&mut out[code_size_pos..code_size_pos + 5], code_payload_len);
+    }
+
+    // 5. Stream DataSection directly into `out` with >=4 KiB zero-run compaction & late hash_bytes
+    {
+        let mut non_zero_slices: Vec<(u32, &[u8])> = Vec::new();
+        for seg in &image.data_segments {
+            if !seg.data.is_empty() {
+                push_nonzero_slices(seg.vaddr, &seg.data, &mut non_zero_slices);
+            }
+        }
+
+        out.push(SectionId::Data as u8);
+        let data_size_pos = out.len();
+        out.extend_from_slice(&[0u8; 5]);
+        let data_payload_start = out.len();
+
+        let num_data_segs = (non_zero_slices.len() + 1) as u32;
+        write_leb_u32(&mut out, num_data_segs);
+
+        for (vaddr, slice) in non_zero_slices {
+            write_active_data_segment(&mut out, vaddr, slice);
+        }
+
+        // Allocate dispatch hash table only now, stream it, and drop immediately
+        let mut hash_bytes = vec![0u8; table_bytes_len];
+        for (chunk_idx, &(start, end)) in chunk_ranges.iter().enumerate() {
+            for (local_idx, block) in blocks_flat[start..end].iter().enumerate() {
+                let va = block.start_va;
+                if va == 0 {
+                    continue;
+                }
+                let packed = ((chunk_idx as u32) << 10) | (local_idx as u32);
+                let mut slot = va.wrapping_mul(0x9E37_79B1) & hash_mask;
+                loop {
+                    let off = (slot as usize) * 8;
+                    let existing =
+                        u32::from_le_bytes(hash_bytes[off..off + 4].try_into().unwrap());
+                    if existing == 0 {
+                        hash_bytes[off..off + 4].copy_from_slice(&va.to_le_bytes());
+                        hash_bytes[off + 4..off + 8].copy_from_slice(&packed.to_le_bytes());
+                        break;
+                    }
+                    slot = (slot + 1) & hash_mask;
+                }
+            }
+        }
+        write_active_data_segment(&mut out, dispatch_hash_addr, &hash_bytes);
+        drop(hash_bytes);
+
+        let data_payload_len = u32::try_from(out.len() - data_payload_start)
+            .map_err(|_| anyhow::anyhow!("DataSection exceeds 32-bit WASM section size"))?;
+        write_leb_u32_5byte(&mut out[data_size_pos..data_size_pos + 5], data_payload_len);
+    }
+
+    // 6. Custom Section: elf2wasm_meta
     let meta = WasmMeta {
         entry_rip: image.entry_rip,
         at_phdr: image.at_phdr,
@@ -884,14 +1202,20 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
             .collect(),
         symbols: vec![],
         elf_path: image.elf_path.clone(),
+        brk_start: image.brk_start,
+        mmap_start: image.mmap_start,
+        mmap_end: image.mmap_end,
+        stack_top: image.stack_top,
+        dispatch_hash_addr: image.dispatch_hash_addr,
     };
     let meta_bytes = meta.encode();
-    module.section(&CustomSection {
+    CustomSection {
         name: Cow::Borrowed("elf2wasm_meta"),
         data: Cow::Owned(meta_bytes),
-    });
+    }
+    .append_to(&mut out);
 
-    Ok(module.finish())
+    Ok(out)
 }
 
 #[cfg(all(test, not(target_arch = "wasm32"), feature = "std-fs"))]
@@ -921,6 +1245,11 @@ mod tests {
             so_files: vec![],
             symbols: HashMap::new(),
             elf_path: String::new(),
+            brk_start: crate::meta::DEFAULT_BRK_START,
+            mmap_start: crate::meta::DEFAULT_MMAP_START,
+            mmap_end: crate::meta::DEFAULT_MMAP_END,
+            stack_top: crate::meta::DEFAULT_STACK_TOP,
+            dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
         }
     }
 
@@ -1458,6 +1787,11 @@ mod tests {
             so_files: vec![],
             symbols: std::collections::HashMap::new(),
             elf_path: "test".to_string(),
+            brk_start: crate::meta::DEFAULT_BRK_START,
+            mmap_start: crate::meta::DEFAULT_MMAP_START,
+            mmap_end: crate::meta::DEFAULT_MMAP_END,
+            stack_top: crate::meta::DEFAULT_STACK_TOP,
+            dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
         };
         let prog = crate::decoder::discover_code(&image).unwrap();
         let wasm_bytes = emit_wasm(&image, &prog).unwrap();
@@ -1509,6 +1843,11 @@ mod tests {
             so_files: vec![],
             symbols: std::collections::HashMap::new(),
             elf_path: "test".to_string(),
+            brk_start: crate::meta::DEFAULT_BRK_START,
+            mmap_start: crate::meta::DEFAULT_MMAP_START,
+            mmap_end: crate::meta::DEFAULT_MMAP_END,
+            stack_top: crate::meta::DEFAULT_STACK_TOP,
+            dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
         };
         let mut prog = crate::decoder::discover_code(&image).unwrap();
         crate::decoder::split_indirect_targets(&image, &mut prog);
@@ -1623,15 +1962,16 @@ mod tests {
 
     #[test]
     fn test_quantum_preemption_and_resume() {
-        // Loop 200 times (exceeds DEFAULT_QUANTUM = 128), then exit(rcx)
-        // 0x100000: mov rcx, 200   (48 c7 c1 c8 00 00 00)
-        // 0x100007: dec rcx        (48 ff c9)
-        // 0x10000a: jnz 0x100007   (75 fb)
-        // 0x10000c: mov rdi, 99    (48 c7 c7 63 00 00 00)
-        // 0x100013: mov rax, 60    (48 c7 c0 3c 00 00 00)
-        // 0x10001a: syscall        (0f 05)
+        // Loop (DEFAULT_QUANTUM + 2000) times, then exit(99)
+        // 0x100000: mov rcx, loop_count  (48 c7 c1 <imm32>)
+        // 0x100007: dec rcx              (48 ff c9)
+        // 0x10000a: jnz 0x100007         (75 fb)
+        // 0x10000c: mov rdi, 99          (48 c7 c7 63 00 00 00)
+        // 0x100013: mov rax, 60          (48 c7 c0 3c 00 00 00)
+        // 0x10001a: syscall              (0f 05)
+        let loop_count = ((DEFAULT_QUANTUM as u32) + 2000).to_le_bytes();
         let code = vec![
-            0x48, 0xc7, 0xc1, 0xc8, 0x00, 0x00, 0x00, // mov rcx, 200
+            0x48, 0xc7, 0xc1, loop_count[0], loop_count[1], loop_count[2], loop_count[3], // mov rcx, DEFAULT_QUANTUM + 2000
             0x48, 0xff, 0xc9, // dec rcx
             0x75, 0xfb, // jnz -5 -> 0x100007
             0x48, 0xc7, 0xc7, 0x63, 0x00, 0x00, 0x00, // mov rdi, 99
@@ -1654,6 +1994,11 @@ mod tests {
             so_files: vec![],
             symbols: std::collections::HashMap::new(),
             elf_path: "test".to_string(),
+            brk_start: crate::meta::DEFAULT_BRK_START,
+            mmap_start: crate::meta::DEFAULT_MMAP_START,
+            mmap_end: crate::meta::DEFAULT_MMAP_END,
+            stack_top: crate::meta::DEFAULT_STACK_TOP,
+            dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
         };
         let prog = crate::decoder::discover_code(&image).unwrap();
         let wasm_bytes = emit_wasm(&image, &prog).unwrap();
@@ -1764,6 +2109,11 @@ mod tests {
             so_files: vec![],
             symbols: std::collections::HashMap::new(),
             elf_path: "test".to_string(),
+            brk_start: crate::meta::DEFAULT_BRK_START,
+            mmap_start: crate::meta::DEFAULT_MMAP_START,
+            mmap_end: crate::meta::DEFAULT_MMAP_END,
+            stack_top: crate::meta::DEFAULT_STACK_TOP,
+            dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
         };
         let prog = crate::decoder::discover_code(&image).unwrap();
         let wasm_bytes = emit_wasm(&image, &prog).unwrap();
@@ -1918,6 +2268,11 @@ mod tests {
             so_files: vec![],
             symbols: std::collections::HashMap::new(),
             elf_path: "x87_test".to_string(),
+            brk_start: crate::meta::DEFAULT_BRK_START,
+            mmap_start: crate::meta::DEFAULT_MMAP_START,
+            mmap_end: crate::meta::DEFAULT_MMAP_END,
+            stack_top: crate::meta::DEFAULT_STACK_TOP,
+            dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
         };
 
         let prog = crate::decoder::discover_code(&image).unwrap();
@@ -2109,6 +2464,11 @@ mod tests {
             so_files: vec![],
             symbols: std::collections::HashMap::new(),
             elf_path: "x87_80bit_test".to_string(),
+            brk_start: crate::meta::DEFAULT_BRK_START,
+            mmap_start: crate::meta::DEFAULT_MMAP_START,
+            mmap_end: crate::meta::DEFAULT_MMAP_END,
+            stack_top: crate::meta::DEFAULT_STACK_TOP,
+            dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
         };
 
         let prog = crate::decoder::discover_code(&image).unwrap();
@@ -2173,5 +2533,292 @@ mod tests {
             Some(0),
             "x87_top must return to 0"
         );
+    }
+
+    #[test]
+    fn test_sse2_saturating_add_sub() {
+        // Inputs at RDI (0x0020_0000), 16 bytes each:
+        //   [rdi+0x00]: a_u8,  [rdi+0x10]: b_u8
+        //   [rdi+0x20]: a_i8,  [rdi+0x30]: b_i8
+        //   [rdi+0x40]: a_u16, [rdi+0x50]: b_u16
+        //   [rdi+0x60]: a_i16, [rdi+0x70]: b_i16
+        //
+        // Outputs at RSI (0x0020_0100), 16 bytes each:
+        //   [rsi+0x00]: psubusb (reg-reg)
+        //   [rsi+0x10]: psubusb (reg-mem)
+        //   [rsi+0x20]: paddusb
+        //   [rsi+0x30]: paddsb
+        //   [rsi+0x40]: psubsb
+        //   [rsi+0x50]: paddusw
+        //   [rsi+0x60]: psubusw
+        //   [rsi+0x70]: paddsw
+        //   [rsi+0x80]: psubsw
+        let code: Vec<u8> = vec![
+            // psubusb xmm0, xmm1
+            0xf3, 0x0f, 0x6f, 0x07,       // movdqu xmm0, [rdi+0x00]
+            0xf3, 0x0f, 0x6f, 0x4f, 0x10, // movdqu xmm1, [rdi+0x10]
+            0x66, 0x0f, 0xd8, 0xc1,       // psubusb xmm0, xmm1
+            0xf3, 0x0f, 0x7f, 0x06,       // movdqu [rsi+0x00], xmm0
+
+            // psubusb xmm0, [rdi+0x10] (memory operand form)
+            0xf3, 0x0f, 0x6f, 0x07,       // movdqu xmm0, [rdi+0x00]
+            0x66, 0x0f, 0xd8, 0x47, 0x10, // psubusb xmm0, [rdi+0x10]
+            0xf3, 0x0f, 0x7f, 0x46, 0x10, // movdqu [rsi+0x10], xmm0
+
+            // paddusb xmm0, xmm1
+            0xf3, 0x0f, 0x6f, 0x07,       // movdqu xmm0, [rdi+0x00]
+            0x66, 0x0f, 0xdc, 0xc1,       // paddusb xmm0, xmm1
+            0xf3, 0x0f, 0x7f, 0x46, 0x20, // movdqu [rsi+0x20], xmm0
+
+            // paddsb xmm0, xmm1
+            0xf3, 0x0f, 0x6f, 0x47, 0x20, // movdqu xmm0, [rdi+0x20]
+            0xf3, 0x0f, 0x6f, 0x4f, 0x30, // movdqu xmm1, [rdi+0x30]
+            0x66, 0x0f, 0xec, 0xc1,       // paddsb xmm0, xmm1
+            0xf3, 0x0f, 0x7f, 0x46, 0x30, // movdqu [rsi+0x30], xmm0
+
+            // psubsb xmm0, xmm1
+            0xf3, 0x0f, 0x6f, 0x47, 0x20, // movdqu xmm0, [rdi+0x20]
+            0x66, 0x0f, 0xe8, 0xc1,       // psubsb xmm0, xmm1
+            0xf3, 0x0f, 0x7f, 0x46, 0x40, // movdqu [rsi+0x40], xmm0
+
+            // paddusw xmm0, xmm1
+            0xf3, 0x0f, 0x6f, 0x47, 0x40, // movdqu xmm0, [rdi+0x40]
+            0xf3, 0x0f, 0x6f, 0x4f, 0x50, // movdqu xmm1, [rdi+0x50]
+            0x66, 0x0f, 0xdd, 0xc1,       // paddusw xmm0, xmm1
+            0xf3, 0x0f, 0x7f, 0x46, 0x50, // movdqu [rsi+0x50], xmm0
+
+            // psubusw xmm0, xmm1
+            0xf3, 0x0f, 0x6f, 0x47, 0x40, // movdqu xmm0, [rdi+0x40]
+            0x66, 0x0f, 0xd9, 0xc1,       // psubusw xmm0, xmm1
+            0xf3, 0x0f, 0x7f, 0x46, 0x60, // movdqu [rsi+0x60], xmm0
+
+            // paddsw xmm0, xmm1
+            0xf3, 0x0f, 0x6f, 0x47, 0x60, // movdqu xmm0, [rdi+0x60]
+            0xf3, 0x0f, 0x6f, 0x4f, 0x70, // movdqu xmm1, [rdi+0x70]
+            0x66, 0x0f, 0xed, 0xc1,       // paddsw xmm0, xmm1
+            0xf3, 0x0f, 0x7f, 0x46, 0x70, // movdqu [rsi+0x70], xmm0
+
+            // psubsw xmm0, xmm1
+            0xf3, 0x0f, 0x6f, 0x47, 0x60, // movdqu xmm0, [rdi+0x60]
+            0x66, 0x0f, 0xe9, 0xc1,       // psubsw xmm0, xmm1
+            0xf3, 0x0f, 0x7f, 0x86, 0x80, 0x00, 0x00, 0x00, // movdqu [rsi+0x80], xmm0
+
+            // exit(0)
+            0x48, 0xc7, 0xc7, 0x00, 0x00, 0x00, 0x00,
+            0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00,
+            0x0f, 0x05,
+        ];
+
+        let image = LoadedImage {
+            entry_rip: 0x0010_0000,
+            at_phdr: 0,
+            at_phent: 56,
+            at_phnum: 0,
+            at_entry: 0x0010_0000,
+            at_base: 0,
+            exec_segments: vec![ExecSegment {
+                name: "sse2_sat_test".to_string(),
+                vaddr: 0x0010_0000,
+                data: code,
+            }],
+            data_segments: vec![],
+            so_files: vec![],
+            symbols: std::collections::HashMap::new(),
+            elf_path: "sse2_sat_test".to_string(),
+            brk_start: crate::meta::DEFAULT_BRK_START,
+            mmap_start: crate::meta::DEFAULT_MMAP_START,
+            mmap_end: crate::meta::DEFAULT_MMAP_END,
+            stack_top: crate::meta::DEFAULT_STACK_TOP,
+            dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
+        };
+
+        let prog = crate::decoder::discover_code(&image).unwrap();
+        let wasm_bytes = emit_wasm(&image, &prog).unwrap();
+
+        let engine = Engine::default();
+        WasmModule::validate(&engine, &wasm_bytes)
+            .expect("SSE2 saturating add/sub WASM must pass validation");
+        let module = WasmModule::new(&engine, &wasm_bytes).unwrap();
+        let mut store = Store::new(&engine, ());
+        let inst = Instance::new(&mut store, &module, &[]).unwrap();
+        let mem = inst.get_memory(&mut store, "memory").unwrap();
+
+        let in_base = 0x0020_0000usize;
+        let out_base = 0x0020_0100usize;
+
+        let a_u8: [u8; 16] = [0, 1, 10, 100, 200, 250, 255, 255, 0, 5, 9, 10, 15, 0x80, 0xFE, 0xFF];
+        let b_u8: [u8; 16] = [0, 2, 10, 200, 100, 10, 0, 1, 255, 10, 9, 9, 9, 0x80, 0x02, 0xFF];
+
+        let a_i8: [i8; 16] = [0, 100, 127, 127, -100, -128, -128, -50, 50, -128, 127, 10, -10, 120, -120, 0];
+        let b_i8: [i8; 16] = [0, 50, 1, 127, -50, -1, -128, 100, -100, 1, -1, -20, 20, 10, -10, -128];
+
+        let a_u16: [u16; 8] = [0, 1, 1000, 40000, 65535, 65535, 0, 0x8000];
+        let b_u16: [u16; 8] = [0, 2, 1000, 30000, 0, 1, 65535, 0x8000];
+
+        let a_i16: [i16; 8] = [0, 30000, 32767, -30000, -32768, -20000, 20000, 0];
+        let b_i16: [i16; 8] = [0, 10000, 1, -10000, -1, 20000, -20000, -32768];
+
+        let to_bytes_i8 = |v: &[i8; 16]| -> [u8; 16] { v.map(|x| x as u8) };
+        let to_bytes_u16 = |v: &[u16; 8]| -> [u8; 16] {
+            let mut out = [0u8; 16];
+            for (i, &w) in v.iter().enumerate() {
+                out[2 * i..2 * i + 2].copy_from_slice(&w.to_le_bytes());
+            }
+            out
+        };
+        let to_bytes_i16 = |v: &[i16; 8]| -> [u8; 16] {
+            let mut out = [0u8; 16];
+            for (i, &w) in v.iter().enumerate() {
+                out[2 * i..2 * i + 2].copy_from_slice(&w.to_le_bytes());
+            }
+            out
+        };
+
+        mem.write(&mut store, in_base + 0x00, &a_u8).unwrap();
+        mem.write(&mut store, in_base + 0x10, &b_u8).unwrap();
+        mem.write(&mut store, in_base + 0x20, &to_bytes_i8(&a_i8)).unwrap();
+        mem.write(&mut store, in_base + 0x30, &to_bytes_i8(&b_i8)).unwrap();
+        mem.write(&mut store, in_base + 0x40, &to_bytes_u16(&a_u16)).unwrap();
+        mem.write(&mut store, in_base + 0x50, &to_bytes_u16(&b_u16)).unwrap();
+        mem.write(&mut store, in_base + 0x60, &to_bytes_i16(&a_i16)).unwrap();
+        mem.write(&mut store, in_base + 0x70, &to_bytes_i16(&b_i16)).unwrap();
+
+        inst.get_global(&mut store, "rsp").unwrap().set(&mut store, wasmtime::Val::I64(STACK_TOP as i64)).unwrap();
+        inst.get_global(&mut store, "rdi").unwrap().set(&mut store, wasmtime::Val::I64(in_base as i64)).unwrap();
+        inst.get_global(&mut store, "rsi").unwrap().set(&mut store, wasmtime::Val::I64(out_base as i64)).unwrap();
+
+        let start = inst.get_typed_func::<(), i32>(&mut store, "_start").unwrap();
+        let _ = start.call(&mut store, ()).unwrap();
+
+        let read_16 = |off: usize| -> [u8; 16] {
+            let mut b = [0u8; 16];
+            mem.read(&store, out_base + off, &mut b).unwrap();
+            b
+        };
+
+        let exp_psubusb: [u8; 16] = std::array::from_fn(|i| a_u8[i].saturating_sub(b_u8[i]));
+        let exp_paddusb: [u8; 16] = std::array::from_fn(|i| a_u8[i].saturating_add(b_u8[i]));
+        let exp_paddsb: [i8; 16] = std::array::from_fn(|i| a_i8[i].saturating_add(b_i8[i]));
+        let exp_psubsb: [i8; 16] = std::array::from_fn(|i| a_i8[i].saturating_sub(b_i8[i]));
+        let exp_paddusw: [u16; 8] = std::array::from_fn(|i| a_u16[i].saturating_add(b_u16[i]));
+        let exp_psubusw: [u16; 8] = std::array::from_fn(|i| a_u16[i].saturating_sub(b_u16[i]));
+        let exp_paddsw: [i16; 8] = std::array::from_fn(|i| a_i16[i].saturating_add(b_i16[i]));
+        let exp_psubsw: [i16; 8] = std::array::from_fn(|i| a_i16[i].saturating_sub(b_i16[i]));
+
+        assert_eq!(read_16(0x00), exp_psubusb, "psubusb (reg-reg) mismatch");
+        assert_eq!(read_16(0x10), exp_psubusb, "psubusb (reg-mem) mismatch");
+        assert_eq!(read_16(0x20), exp_paddusb, "paddusb mismatch");
+        assert_eq!(read_16(0x30), to_bytes_i8(&exp_paddsb), "paddsb mismatch");
+        assert_eq!(read_16(0x40), to_bytes_i8(&exp_psubsb), "psubsb mismatch");
+        assert_eq!(read_16(0x50), to_bytes_u16(&exp_paddusw), "paddusw mismatch");
+        assert_eq!(read_16(0x60), to_bytes_u16(&exp_psubusw), "psubusw mismatch");
+        assert_eq!(read_16(0x70), to_bytes_i16(&exp_paddsw), "paddsw mismatch");
+        assert_eq!(read_16(0x80), to_bytes_i16(&exp_psubsw), "psubsw mismatch");
+    }
+
+    #[test]
+    fn test_dead_flag_elimination_preserves_semantics() {
+        // Test both dead-flag ALU chains and live-flag sequences (adc, cmov, jcc).
+        //
+        // Block 1 (at 0x10_0000):
+        //   31 c0                 xor eax, eax          ; dead flags (overwritten by add)
+        //   83 c0 05              add eax, 5            ; dead flags (overwritten by sub)
+        //   83 e8 02              sub eax, 2            ; dead flags (overwritten by or), eax=3
+        //   83 c8 10              or  eax, 0x10         ; dead flags (overwritten by and), eax=0x13
+        //   83 e0 1f              and eax, 0x1f         ; dead flags (overwritten by neg), eax=0x13
+        //   f7 d8                 neg eax               ; dead flags (overwritten by add), eax=-19 (0xFFFFFFED)
+        //   48 89 c3              mov rbx, rax          ; transparent
+        //   83 c0 13              add eax, 0x13         ; LIVE flags (sets CF=1, ZF=1), eax=0
+        //   48 83 d3 00           adc rbx, 0            ; reads CF=1! rbx = 0xFFFFFFED + 1 = 0xFFFFFFEE
+        //   48 83 e8 01           sub rax, 1            ; LIVE flags (sets CF=1, SF=1), rax=-1
+        //   48 89 c1              mov rcx, rax          ; transparent
+        //   48 0f 42 c3           cmovb rax, rbx        ; reads CF=1 -> rax = 0xFFFFFFEE
+        //   48 3d ee ff ff 00     cmp rax, 0x00ff_ffee  ; LIVE flags (not equal: 0xFFFFFFEE != 0x00FFFFEE)
+        //   75 05                 jne +5                ; taken -> skip mov rax, 0xdead
+        //   b8 ad de 00 00        mov eax, 0xdead
+        //   c3                    ret
+        let code: Vec<u8> = vec![
+            0x31, 0xC0, // xor eax, eax
+            0x83, 0xC0, 0x05, // add eax, 5
+            0x83, 0xE8, 0x02, // sub eax, 2
+            0x83, 0xC8, 0x10, // or eax, 0x10
+            0x83, 0xE0, 0x1F, // and eax, 0x1f
+            0xF7, 0xD8, // neg eax
+            0x48, 0x89, 0xC3, // mov rbx, rax
+            0x83, 0xC0, 0x13, // add eax, 0x13 (CF=1, ZF=1)
+            0x48, 0x83, 0xD3, 0x00, // adc rbx, 0 (reads CF=1)
+            0x48, 0x83, 0xE8, 0x01, // sub rax, 1 (CF=1)
+            0x48, 0x89, 0xC1, // mov rcx, rax
+            0x48, 0x0F, 0x42, 0xC3, // cmovb rax, rbx (reads CF=1)
+            0x48, 0x3D, 0xEE, 0xFF, 0xFF, 0x00, // cmp rax, 0x00ff_ffee
+            0x75, 0x05, // jne +5
+            0xB8, 0xAD, 0xDE, 0x00, 0x00, // mov eax, 0xdead
+            0xC3, // ret
+        ];
+
+        // 1. Verify compute_skip_flags marks exact dead vs live instructions on block 1 body
+        let image = make_synthetic_image(code);
+        let prog = discover_code(&image).unwrap();
+        let entry_block = prog.blocks.get(&0x0010_0000).unwrap();
+        let mut instr_buf = Vec::new();
+        decode_block_instructions_into(&image.exec_segments, entry_block, &mut instr_buf);
+        let body_len = instr_buf.len() - 1; // exclude jne
+        let mut skip = Vec::new();
+        compute_skip_flags(&instr_buf[..body_len], &mut skip);
+        assert_eq!(
+            skip,
+            vec![
+                true,  // xor eax, eax (dead)
+                true,  // add eax, 5 (dead)
+                true,  // sub eax, 2 (dead)
+                true,  // or eax, 0x10 (dead)
+                true,  // and eax, 0x1f (dead)
+                true,  // neg eax (dead)
+                false, // mov rbx, rax (transparent)
+                false, // add eax, 0x13 (LIVE: read by adc)
+                false, // adc rbx, 0 (not skipped)
+                false, // sub rax, 1 (LIVE: read by cmovb)
+                false, // mov rcx, rax (transparent)
+                false, // cmovb rax, rbx (reads CF)
+                false, // cmp rax, 0x00ff_ffee (LIVE: read by jne)
+            ],
+            "unexpected dead-flag mask"
+        );
+
+        // 2. Execute compiled WASM in Wasmtime and verify exact register results
+        let wasm = emit_wasm(&image, &prog).unwrap();
+        let engine = Engine::default();
+        let module = WasmModule::new(&engine, &wasm).unwrap();
+        let mut store = Store::new(&engine, ());
+        let inst = Instance::new(&mut store, &module, &[]).unwrap();
+
+        inst.get_global(&mut store, "rsp")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I64(STACK_TOP as i64))
+            .unwrap();
+        let start = inst
+            .get_typed_func::<(), i32>(&mut store, "_start")
+            .unwrap();
+        let _ = start.call(&mut store, ()).unwrap();
+
+        let rax = inst
+            .get_global(&mut store, "rax")
+            .unwrap()
+            .get(&mut store)
+            .unwrap_i64() as u64;
+        let rbx = inst
+            .get_global(&mut store, "rbx")
+            .unwrap()
+            .get(&mut store)
+            .unwrap_i64() as u64;
+        let rcx = inst
+            .get_global(&mut store, "rcx")
+            .unwrap()
+            .get(&mut store)
+            .unwrap_i64() as u64;
+
+        assert_eq!(rbx, 0xFFFF_FFEE, "adc should have observed CF=1 from add");
+        assert_eq!(rcx, u64::MAX, "sub rax, 1 should produce -1");
+        assert_eq!(rax, 0xFFFF_FFEE, "cmovb and jne should have observed live flags");
     }
 }

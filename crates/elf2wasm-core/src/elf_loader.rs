@@ -9,11 +9,18 @@ use std::path::{Path, PathBuf};
 pub const MAIN_PIE_BASE: u32 = 0x0010_0000; // 1 MB
 pub const LD_BASE: u32 = 0x0100_0000; // 16 MB
 pub const SO_BASE_START: u32 = 0x0200_0000; // 32 MB
+pub const SO_ALIGN: u32 = 0x0001_0000; // 64 KB
 pub const BRK_START: u32 = 0x0500_0000; // 80 MB
 pub const MMAP_START: u32 = 0x0800_0000; // 128 MB
+pub const MMAP_END: u32 = 0x0B00_0000; // 176 MB
 pub const STACK_TOP: u32 = 0x0BFF_0000; // ~192 MB
 pub const INITIAL_MEM_PAGES: u32 = 4096; // 256 MB (4096 * 64KB)
 pub const DISPATCH_TABLE_ADDR: u32 = 0x0001_0000; // 64 KB
+
+const EXPANDED_BRK_SIZE: u32 = 0x0300_0000; // 48 MB
+const EXPANDED_MMAP_SIZE: u32 = 0x1000_0000; // 256 MB
+const EXPANDED_STACK_SIZE: u32 = 0x0100_0000; // 16 MB
+const STACK_GUARD_GAP: u32 = 0x0001_0000; // 64 KB below dispatch_hash_addr
 
 #[derive(Debug, Clone)]
 pub struct ExecSegment {
@@ -49,16 +56,48 @@ pub struct LoadedImage {
     pub so_files: Vec<SoFile>,
     pub symbols: HashMap<u32, String>,
     pub elf_path: String,
+    pub brk_start: u32,
+    pub mmap_start: u32,
+    pub mmap_end: u32,
+    pub stack_top: u32,
+    pub dispatch_hash_addr: u32,
 }
 
 pub const GUEST_MEM_SIZE: usize = (INITIAL_MEM_PAGES as usize) * 65536; // 256 MB
-pub const GUEST_CODE_DATA_LIMIT: usize = 0x0B00_0000; // below stack & dispatch hash table
+pub const GUEST_CODE_DATA_LIMIT: usize = 0x0B00_0000; // 176 MB max VA end for code/data/.so
 
 fn align_up(val: u32, align: u32) -> Option<u32> {
     val.checked_add(align - 1).map(|v| v & !(align - 1))
 }
 
-fn elf_span(elf: &Elf) -> Result<u32> {
+/// Compute per-module dynamic guest VA layout `(brk_start, mmap_start, mmap_end, stack_top, dispatch_hash_addr)`.
+/// Preserves the exact legacy 256 MiB layout whenever `code_so_end <= BRK_START`.
+pub fn compute_guest_layout(code_so_end: u32) -> Result<(u32, u32, u32, u32, u32)> {
+    if code_so_end <= BRK_START {
+        return Ok((
+            crate::meta::DEFAULT_BRK_START,
+            crate::meta::DEFAULT_MMAP_START,
+            crate::meta::DEFAULT_MMAP_END,
+            crate::meta::DEFAULT_STACK_TOP,
+            crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
+        ));
+    }
+    let brk_start = align_up(code_so_end, 0x0100_0000)
+        .context("brk_start 16MB alignment overflow")?;
+    let mmap_start = brk_start
+        .checked_add(EXPANDED_BRK_SIZE)
+        .context("mmap_start overflow")?;
+    let mmap_end = mmap_start
+        .checked_add(EXPANDED_MMAP_SIZE)
+        .context("mmap_end overflow")?;
+    let dispatch_hash_addr = mmap_end
+        .checked_add(EXPANDED_STACK_SIZE)
+        .context("dispatch_hash_addr overflow")?;
+    let stack_top = dispatch_hash_addr - STACK_GUARD_GAP;
+    Ok((brk_start, mmap_start, mmap_end, stack_top, dispatch_hash_addr))
+}
+
+fn elf_span(elf: &Elf, align: u32) -> Result<u32> {
     let mut max_end = 0u32;
     for ph in &elf.program_headers {
         if ph.p_type == program_header::PT_LOAD {
@@ -73,7 +112,7 @@ fn elf_span(elf: &Elf) -> Result<u32> {
             }
         }
     }
-    align_up(max_end, 0x0010_0000).context("ELF span 1MB alignment overflow")
+    align_up(max_end, align).context("ELF span alignment overflow")
 }
 
 fn collect_symbols(elf: &Elf, base: u32, out: &mut HashMap<u32, String>) {
@@ -170,25 +209,21 @@ fn extract_segments(
             );
         }
 
-        let mut seg_data = vec![0u8; memsz];
-        if filesz > 0 {
-            seg_data[..filesz].copy_from_slice(&bytes[offset..offset + filesz]);
-        }
-
+        let code_len = filesz.min(memsz);
         if ph.p_flags & program_header::PF_X != 0 {
             // Only lift the file-backed executable bytes
-            let code_len = filesz.min(memsz);
             exec_segments.push(ExecSegment {
                 name: format!("{name}@0x{vaddr:x}"),
                 vaddr,
-                data: seg_data[..code_len].to_vec(),
+                data: bytes[offset..offset + code_len].to_vec(),
             });
         }
 
-        if load_data && !seg_data.is_empty() {
+        // Only store file-backed bytes; WASM linear memory is already zero-initialized for .bss.
+        if load_data && filesz > 0 {
             data_segments.push(DataSegment {
                 vaddr,
-                data: seg_data,
+                data: bytes[offset..offset + filesz].to_vec(),
             });
         }
     }
@@ -227,7 +262,7 @@ pub fn load_elf_and_sos_bytes(
     } else {
         0
     };
-    let main_span = elf_span(&main_elf)?;
+    let main_span = elf_span(&main_elf, 0x0010_0000)?;
     let main_end = if main_base == 0 {
         main_span
     } else {
@@ -327,11 +362,13 @@ pub fn load_elf_and_sos_bytes(
 
     let ld_base = LD_BASE.max(main_end);
     let mut next_so_base = if let Some(idx) = interp_idx {
-        let ld_span = elf_span(&parsed_sos[idx].elf)?.max(0x0010_0000);
+        let ld_span = elf_span(&parsed_sos[idx].elf, SO_ALIGN)?.max(SO_ALIGN);
         let ld_end = ld_base
             .checked_add(ld_span)
-            .filter(|&n| n <= BRK_START)
-            .ok_or_else(|| anyhow::anyhow!("ld.so exceeds reserved VA space (BRK_START)"))?;
+            .filter(|&n| n <= GUEST_CODE_DATA_LIMIT as u32)
+            .ok_or_else(|| {
+                anyhow::anyhow!("ld.so exceeds reserved VA space (GUEST_CODE_DATA_LIMIT)")
+            })?;
         SO_BASE_START.max(ld_end)
     } else {
         SO_BASE_START.max(main_end)
@@ -364,10 +401,10 @@ pub fn load_elf_and_sos_bytes(
             collect_symbols(&pso.elf, ld_base, &mut symbols);
         } else {
             let base = next_so_base;
-            let span = elf_span(&pso.elf)?.max(0x0010_0000);
+            let span = elf_span(&pso.elf, SO_ALIGN)?.max(SO_ALIGN);
             next_so_base = next_so_base
                 .checked_add(span)
-                .filter(|&n| n <= BRK_START)
+                .filter(|&n| n <= GUEST_CODE_DATA_LIMIT as u32)
                 .ok_or_else(|| anyhow::anyhow!("Shared objects exceed reserved SO VA space"))?;
 
             // Lift its code at `base`, but do NOT preload its data segments:
@@ -413,6 +450,9 @@ pub fn load_elf_and_sos_bytes(
         bail!("No executable PT_LOAD segments found in ELF");
     }
 
+    let (brk_start, mmap_start, mmap_end, stack_top, dispatch_hash_addr) =
+        compute_guest_layout(next_so_base)?;
+
     Ok(LoadedImage {
         entry_rip,
         at_phdr,
@@ -425,6 +465,11 @@ pub fn load_elf_and_sos_bytes(
         so_files,
         symbols,
         elf_path: main_path.to_string(),
+        brk_start,
+        mmap_start,
+        mmap_end,
+        stack_top,
+        dispatch_hash_addr,
     })
 }
 
@@ -697,6 +742,78 @@ mod tests {
         assert_eq!(image.so_files.len(), 1);
         assert_eq!(image.so_files[0].host_path, "/usr/lib/libfoo.so.1");
         assert_eq!(image.so_files[0].base_addr, SO_BASE_START);
+        assert_eq!(image.brk_start, BRK_START);
+        assert_eq!(image.mmap_start, MMAP_START);
+        assert_eq!(image.mmap_end, MMAP_END);
+        assert_eq!(image.stack_top, STACK_TOP);
+        assert_eq!(
+            image.dispatch_hash_addr,
+            crate::meta::DEFAULT_DISPATCH_HASH_ADDR
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_node_scale_et_exec_dynamic_va_layout() -> Result<()> {
+        // Simulate node:22-slim: 108 MiB ET_EXEC ending at 0x06C0_0000 + ld.so + .so
+        let main_bytes = make_minimal_elf64(
+            goblin::elf::header::ET_EXEC,
+            0x0040_0000,
+            0x0040_0000,
+            0x0680_0000,
+            Some(b"/lib64/ld-linux-x86-64.so.2\0"),
+        );
+        let ld_bytes = make_minimal_elf64(goblin::elf::header::ET_DYN, 0x1000, 0, 0x4_0000, None);
+        let libc_bytes =
+            make_minimal_elf64(goblin::elf::header::ET_DYN, 0x1000, 0, 0x50_0000, None);
+
+        let image = load_elf_and_sos_bytes(
+            "/usr/local/bin/node",
+            &main_bytes,
+            &[
+                ("/lib64/ld-linux-x86-64.so.2", &ld_bytes),
+                ("/lib/x86_64-linux-gnu/libc.so.6", &libc_bytes),
+            ],
+        )?;
+
+        assert_eq!(image.at_base, 0x06C0_0000);
+        assert_eq!(image.so_files.len(), 1);
+        assert_eq!(image.so_files[0].base_addr, 0x06C4_0000);
+        assert_eq!(image.brk_start, 0x0800_0000);
+        assert_eq!(image.mmap_start, 0x0B00_0000);
+        assert_eq!(image.mmap_end, 0x1B00_0000);
+        assert_eq!(image.stack_top, 0x1BFF_0000);
+        assert_eq!(image.dispatch_hash_addr, 0x1C00_0000);
+        Ok(())
+    }
+
+    #[test]
+    fn test_64k_so_va_alignment_40_small_sos() -> Result<()> {
+        let main_bytes = make_minimal_elf64(
+            goblin::elf::header::ET_DYN,
+            0x1000,
+            0,
+            0x10_0000,
+            Some(b"/lib64/ld-linux-x86-64.so.2\0"),
+        );
+        let ld_bytes = make_minimal_elf64(goblin::elf::header::ET_DYN, 0x1000, 0, 0x4_0000, None);
+        let small_so = make_minimal_elf64(goblin::elf::header::ET_DYN, 0x1000, 0, 0x4000, None);
+
+        let names: Vec<String> = (0..40)
+            .map(|i| format!("/usr/local/lib/python3.12/lib-dynload/ext{}.so", i))
+            .collect();
+        let mut sos: Vec<(&str, &[u8])> = vec![("/lib64/ld-linux-x86-64.so.2", &ld_bytes)];
+        for n in &names {
+            sos.push((n.as_str(), &small_so));
+        }
+
+        let image = load_elf_and_sos_bytes("/usr/local/bin/python3.12", &main_bytes, &sos)?;
+        assert_eq!(image.so_files.len(), 40);
+        for (i, so) in image.so_files.iter().enumerate() {
+            assert_eq!(so.base_addr, SO_BASE_START + (i as u32) * SO_ALIGN);
+        }
+        // 40 * 64 KiB = 2.5 MiB -> still well within legacy layout (<= BRK_START)
+        assert_eq!(image.brk_start, BRK_START);
         Ok(())
     }
 }

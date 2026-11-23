@@ -56,16 +56,88 @@ pub enum BlockTerminator {
     Trap,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct DecodedBlock {
     pub start_va: u32,
     /// Exclusive end VA (`last_instr.next_ip() as u32`).
     pub end_va: u32,
-    /// Full `iced_x86::Instruction`s so `lifter.rs` has lossless operand/prefix/disp access.
-    pub instructions: Vec<Instruction>,
-    /// Static successor VAs (direct jump targets and/or fallthrough).
-    pub succs: Vec<u32>,
+    /// Number of decoded instructions in `[start_va, end_va)`.
+    pub instr_count: u32,
     pub terminator: BlockTerminator,
+}
+
+impl DecodedBlock {
+    /// Derive static successor VAs directly from `self.terminator` (zero stored Vec).
+    pub fn succs(&self) -> Vec<u32> {
+        match self.terminator {
+            BlockTerminator::Fallthrough(next) => vec![next],
+            BlockTerminator::DirectJump(target) => vec![target],
+            BlockTerminator::ConditionalBranch { taken, fallthrough } => {
+                if fallthrough != taken {
+                    vec![taken, fallthrough]
+                } else {
+                    vec![taken]
+                }
+            }
+            BlockTerminator::DirectCall {
+                target,
+                fallthrough,
+            } => {
+                if fallthrough != target {
+                    vec![target, fallthrough]
+                } else {
+                    vec![target]
+                }
+            }
+            BlockTerminator::IndirectCall { fallthrough } => vec![fallthrough],
+            BlockTerminator::IndirectJump | BlockTerminator::Return | BlockTerminator::Trap => {
+                vec![]
+            }
+        }
+    }
+}
+
+/// Compact 1-bit-per-byte bitmap tracking decoded instruction start VAs across executable segments.
+#[derive(Debug, Clone, Default)]
+pub struct ExecInstrBitmap {
+    /// `(vaddr, byte_len, bitset)` per `ExecSegment`; bit `i` = `vaddr + i` is a decoded instruction start.
+    segments: Vec<(u32, u32, Vec<u64>)>,
+}
+
+impl ExecInstrBitmap {
+    pub fn new(exec_segments: &[ExecSegment]) -> Self {
+        let segments = exec_segments
+            .iter()
+            .map(|s| {
+                let len = s.data.len();
+                let words = (len + 63) / 64;
+                (s.vaddr, len as u32, vec![0u64; words])
+            })
+            .collect();
+        Self { segments }
+    }
+
+    #[inline]
+    pub fn set(&mut self, va: u32) {
+        for (vaddr, len, words) in &mut self.segments {
+            if va >= *vaddr && va - *vaddr < *len {
+                let off = (va - *vaddr) as usize;
+                words[off >> 6] |= 1u64 << (off & 63);
+                return;
+            }
+        }
+    }
+
+    #[inline]
+    pub fn contains(&self, va: u32) -> bool {
+        for (vaddr, len, words) in &self.segments {
+            if va >= *vaddr && va - *vaddr < *len {
+                let off = (va - *vaddr) as usize;
+                return (words[off >> 6] & (1u64 << (off & 63))) != 0;
+            }
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -76,7 +148,7 @@ pub struct DecodedFunction {
     pub block_vas: Vec<u32>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DecodedProgram {
     pub entry_rip: u32,
     /// Highest `end_va` across decoded blocks (used for `WasmMeta.max_code_addr`).
@@ -87,8 +159,8 @@ pub struct DecodedProgram {
     pub functions: BTreeMap<u32, DecodedFunction>,
     /// Sorted, deduplicated guest VAs eligible for indirect dispatch (`call reg`, `jmp reg`, `ret`).
     pub indirect_targets: Vec<u32>,
-    /// Fast lookup from any decoded instruction VA -> owning block `start_va`.
-    pub instr_to_block: FastHashMap<u32, u32>,
+    /// Compact bitmap of all decoded instruction start VAs.
+    pub instr_bitmap: ExecInstrBitmap,
 }
 
 fn find_segment(segments: &[ExecSegment], addr: u32) -> Option<&ExecSegment> {
@@ -98,6 +170,43 @@ fn find_segment(segments: &[ExecSegment], addr: u32) -> Option<&ExecSegment> {
     })
 }
 
+/// Losslessly re-decode all instructions in `block` (`[start_va, end_va)`) into `out`.
+pub fn decode_block_instructions_into(
+    segments: &[ExecSegment],
+    block: &DecodedBlock,
+    out: &mut Vec<Instruction>,
+) {
+    out.clear();
+    if block.end_va <= block.start_va {
+        return;
+    }
+    let Some(seg) = find_segment(segments, block.start_va) else {
+        return;
+    };
+    let start_off = (block.start_va - seg.vaddr) as usize;
+    let end_off = (block.end_va.saturating_sub(seg.vaddr) as usize).min(seg.data.len());
+    if start_off >= end_off {
+        return;
+    }
+    let mut decoder = Decoder::with_ip(
+        64,
+        &seg.data[start_off..end_off],
+        block.start_va as u64,
+        DecoderOptions::NONE,
+    );
+    while decoder.can_decode() {
+        let cur_ip = decoder.ip() as u32;
+        if cur_ip >= block.end_va {
+            break;
+        }
+        let instr = decoder.decode();
+        if instr.is_invalid() {
+            break;
+        }
+        out.push(instr);
+    }
+}
+
 fn is_near_branch(instr: &Instruction) -> bool {
     matches!(
         instr.op0_kind(),
@@ -105,47 +214,76 @@ fn is_near_branch(instr: &Instruction) -> bool {
     )
 }
 
+fn find_owner_block(blocks: &BTreeMap<u32, DecodedBlock>, va: u32) -> Option<u32> {
+    for (&bva, block) in blocks.range(..=va).rev().take(4) {
+        if va < block.end_va {
+            return Some(bva);
+        }
+    }
+    None
+}
+
 /// Split an existing block at `split_va` (which must be a valid instruction boundary
 /// strictly inside `(owner_va, owner_block.end_va)`).
 fn split_block(
-    blocks: &mut FastHashMap<u32, DecodedBlock>,
-    instr_to_block: &mut FastHashMap<u32, u32>,
+    segments: &[ExecSegment],
+    blocks: &mut BTreeMap<u32, DecodedBlock>,
     owner_va: u32,
     split_va: u32,
 ) {
-    let Some(owner_block) = blocks.get_mut(&owner_va) else {
+    let Some(&owner) = blocks.get(&owner_va) else {
         return;
     };
-    let Some(idx) = owner_block
-        .instructions
-        .iter()
-        .position(|i| i.ip() as u32 == split_va)
-    else {
+    if split_va <= owner_va || split_va >= owner.end_va {
+        return;
+    }
+    let Some(seg) = find_segment(segments, owner_va) else {
         return;
     };
-    if idx == 0 {
+    let start_off = (owner_va - seg.vaddr) as usize;
+    let end_off = (owner.end_va.saturating_sub(seg.vaddr) as usize).min(seg.data.len());
+    if start_off >= end_off {
+        return;
+    }
+    let mut decoder = Decoder::with_ip(
+        64,
+        &seg.data[start_off..end_off],
+        owner_va as u64,
+        DecoderOptions::NONE,
+    );
+    let mut head_count = 0u32;
+    let mut found = false;
+    while decoder.can_decode() {
+        let cur_ip = decoder.ip() as u32;
+        if cur_ip == split_va {
+            found = true;
+            break;
+        }
+        if cur_ip > split_va || cur_ip >= owner.end_va {
+            break;
+        }
+        let instr = decoder.decode();
+        if instr.is_invalid() {
+            break;
+        }
+        head_count += 1;
+    }
+    if !found || head_count == 0 {
         return;
     }
 
-    let tail_instrs = owner_block.instructions.split_off(idx);
-    let old_end_va = owner_block.end_va;
-    let old_succs = std::mem::replace(&mut owner_block.succs, vec![split_va]);
-    let old_term = std::mem::replace(
-        &mut owner_block.terminator,
-        BlockTerminator::Fallthrough(split_va),
-    );
-    owner_block.end_va = split_va;
-
-    for instr in &tail_instrs {
-        instr_to_block.insert(instr.ip() as u32, split_va);
+    let tail_count = owner.instr_count.saturating_sub(head_count).max(1);
+    if let Some(ob) = blocks.get_mut(&owner_va) {
+        ob.end_va = split_va;
+        ob.instr_count = head_count;
+        ob.terminator = BlockTerminator::Fallthrough(split_va);
     }
 
     let new_block = DecodedBlock {
         start_va: split_va,
-        end_va: old_end_va,
-        instructions: tail_instrs,
-        succs: old_succs,
-        terminator: old_term,
+        end_va: owner.end_va,
+        instr_count: tail_count,
+        terminator: owner.terminator,
     };
     blocks.insert(split_va, new_block);
 }
@@ -177,79 +315,11 @@ fn is_non_stack_mem_write(instr: &Instruction) -> bool {
     instr.op_count() > 0 && instr.op0_kind() == OpKind::Memory
 }
 
-fn split_mem_read_write_blocks(
-    blocks: FastHashMap<u32, DecodedBlock>,
-    instr_to_block: &mut FastHashMap<u32, u32>,
-) -> BTreeMap<u32, DecodedBlock> {
-    let mut sorted: Vec<(u32, DecodedBlock)> = blocks.into_iter().collect();
-    sorted.sort_unstable_by_key(|(va, _)| *va);
-
-    let mut out: Vec<(u32, DecodedBlock)> = Vec::with_capacity(sorted.len() + sorted.len() / 16);
-    for (start_va, mut block) in sorted {
-        let mut split_indices: Vec<usize> = Vec::new();
-        let mut seen_read = false;
-        for (idx, instr) in block.instructions.iter().enumerate() {
-            let write = is_non_stack_mem_write(instr);
-            if write && seen_read && idx > 0 {
-                split_indices.push(idx);
-                seen_read = false;
-            }
-            if is_non_stack_mem_read(instr) {
-                seen_read = true;
-            }
-        }
-        if split_indices.is_empty() {
-            out.push((start_va, block));
-            continue;
-        }
-
-        let orig_end_va = block.end_va;
-        let orig_succs = std::mem::take(&mut block.succs);
-        let orig_term = block.terminator;
-
-        let mut tail_blocks: Vec<(u32, DecodedBlock)> = Vec::with_capacity(split_indices.len());
-        let mut cur_end_va = orig_end_va;
-        let mut cur_succs = orig_succs;
-        let mut cur_term = orig_term;
-
-        for &idx in split_indices.iter().rev() {
-            let tail_instrs = block.instructions.split_off(idx);
-            let split_va = tail_instrs[0].ip() as u32;
-            for instr in &tail_instrs {
-                instr_to_block.insert(instr.ip() as u32, split_va);
-            }
-            tail_blocks.push((
-                split_va,
-                DecodedBlock {
-                    start_va: split_va,
-                    end_va: cur_end_va,
-                    instructions: tail_instrs,
-                    succs: cur_succs,
-                    terminator: cur_term,
-                },
-            ));
-            cur_end_va = split_va;
-            cur_succs = vec![split_va];
-            cur_term = BlockTerminator::Fallthrough(split_va);
-        }
-
-        block.end_va = cur_end_va;
-        block.succs = cur_succs;
-        block.terminator = cur_term;
-        out.push((start_va, block));
-        for tb in tail_blocks.into_iter().rev() {
-            out.push(tb);
-        }
-    }
-
-    out.into_iter().collect()
-}
-
 fn decode_single_block_recursive(
     seg: &ExecSegment,
     start_va: u32,
-    _blocks: &mut FastHashMap<u32, DecodedBlock>,
-    instr_to_block: &mut FastHashMap<u32, u32>,
+    blocks: &mut BTreeMap<u32, DecodedBlock>,
+    instr_bitmap: &mut ExecInstrBitmap,
     worklist: &mut VecDeque<u32>,
     queued: &mut FastHashSet<u32>,
     function_entries: &mut FastHashSet<u32>,
@@ -258,9 +328,9 @@ fn decode_single_block_recursive(
     let offset = (start_va - seg.vaddr) as usize;
     let mut decoder = Decoder::with_ip(64, &seg.data[offset..], start_va as u64, DecoderOptions::NONE);
 
-    let mut instructions = Vec::new();
+    let mut instr_count = 0u32;
+    let mut seen_mem_read = false;
     let mut terminator = BlockTerminator::Trap;
-    let mut succs = Vec::new();
     let mut end_va = start_va;
 
     let mut enqueue = |va: u32, is_func: bool| {
@@ -284,16 +354,13 @@ fn decode_single_block_recursive(
             break;
         }
 
-        if cur_ip != start_va {
-            if let Some(&owner_va) = instr_to_block.get(&cur_ip) {
-                terminator = BlockTerminator::Fallthrough(cur_ip);
-                succs.push(cur_ip);
-                end_va = cur_ip;
-                if owner_va != cur_ip {
-                    enqueue(cur_ip, false);
-                }
-                break;
+        if cur_ip != start_va && instr_bitmap.contains(cur_ip) {
+            terminator = BlockTerminator::Fallthrough(cur_ip);
+            end_va = cur_ip;
+            if !blocks.contains_key(&cur_ip) {
+                enqueue(cur_ip, false);
             }
+            break;
         }
 
         let instr = decoder.decode();
@@ -302,8 +369,19 @@ fn decode_single_block_recursive(
             break;
         }
 
+        if instr_count > 0 && seen_mem_read && is_non_stack_mem_write(&instr) {
+            terminator = BlockTerminator::Fallthrough(cur_ip);
+            end_va = cur_ip;
+            enqueue(cur_ip, false);
+            break;
+        }
+        if is_non_stack_mem_read(&instr) {
+            seen_mem_read = true;
+        }
+
         let next_ip = instr.next_ip() as u32;
-        instructions.push(instr);
+        instr_bitmap.set(cur_ip);
+        instr_count += 1;
         end_va = next_ip;
 
         // Syscall has FlowControl::Call in iced-x86 with op_count == 0; treat as sequential.
@@ -322,10 +400,6 @@ fn decode_single_block_recursive(
                             target,
                             fallthrough: next_ip,
                         };
-                        succs.push(target);
-                        if next_ip != target {
-                            succs.push(next_ip);
-                        }
                         enqueue(target, true);
                         enqueue(next_ip, false);
                     } else {
@@ -340,7 +414,6 @@ fn decode_single_block_recursive(
                 if is_near_branch(&instr) {
                     if let Ok(target) = u32::try_from(instr.near_branch_target()) {
                         terminator = BlockTerminator::DirectJump(target);
-                        succs.push(target);
                         enqueue(target, false);
                     } else {
                         terminator = BlockTerminator::Trap;
@@ -357,10 +430,6 @@ fn decode_single_block_recursive(
                             taken,
                             fallthrough: next_ip,
                         };
-                        succs.push(taken);
-                        if next_ip != taken {
-                            succs.push(next_ip);
-                        }
                         enqueue(taken, false);
                         enqueue(next_ip, false);
                     } else {
@@ -379,7 +448,6 @@ fn decode_single_block_recursive(
                 terminator = BlockTerminator::IndirectCall {
                     fallthrough: next_ip,
                 };
-                succs.push(next_ip);
                 enqueue(next_ip, false);
                 break;
             }
@@ -394,21 +462,16 @@ fn decode_single_block_recursive(
         }
     }
 
-    if instructions.is_empty() {
+    if instr_count == 0 {
         return;
     }
 
-    for instr in &instructions {
-        instr_to_block.insert(instr.ip() as u32, start_va);
-    }
-
-    _blocks.insert(
+    blocks.insert(
         start_va,
         DecodedBlock {
             start_va,
             end_va,
-            instructions,
-            succs,
+            instr_count,
             terminator,
         },
     );
@@ -418,18 +481,20 @@ fn linear_sweep_gap(
     seg: &ExecSegment,
     gap_start: u32,
     gap_end: u32,
-    blocks: &mut FastHashMap<u32, DecodedBlock>,
-    instr_to_block: &mut FastHashMap<u32, u32>,
+    blocks: &mut BTreeMap<u32, DecodedBlock>,
+    instr_bitmap: &mut ExecInstrBitmap,
 ) {
     let mut pos_va = gap_start;
+    let mut skip_zero_pad = true;
 
     while pos_va < gap_end {
         // Skip zero-padding bytes at block start so 0x00 doesn't eat into aligned stubs.
         let byte_idx = (pos_va - seg.vaddr) as usize;
-        if seg.data[byte_idx] == 0x00 {
+        if skip_zero_pad && seg.data[byte_idx] == 0x00 {
             pos_va += 1;
             continue;
         }
+        skip_zero_pad = true;
 
         let start_va = pos_va;
         let end_idx = (gap_end - seg.vaddr) as usize;
@@ -440,10 +505,11 @@ fn linear_sweep_gap(
             DecoderOptions::NONE,
         );
 
-        let mut instructions = Vec::new();
+        let mut instr_count = 0u32;
+        let mut seen_mem_read = false;
         let mut terminator = BlockTerminator::Trap;
-        let mut succs = Vec::new();
         let mut end_va = start_va;
+        let mut split_on_mem_write = false;
 
         while decoder.can_decode() {
             let cur_ip = decoder.ip() as u32;
@@ -453,7 +519,7 @@ fn linear_sweep_gap(
 
             // Avoid decoding a run of 0x00 padding mid-block if it appears.
             let cur_idx = (cur_ip - seg.vaddr) as usize;
-            if !instructions.is_empty()
+            if instr_count > 0
                 && cur_idx + 1 < end_idx
                 && seg.data[cur_idx] == 0x00
                 && seg.data[cur_idx + 1] == 0x00
@@ -465,7 +531,7 @@ fn linear_sweep_gap(
 
             let instr = decoder.decode();
             if instr.is_invalid() {
-                if instructions.is_empty() {
+                if instr_count == 0 {
                     pos_va = start_va + 1;
                 } else {
                     terminator = BlockTerminator::Trap;
@@ -476,7 +542,7 @@ fn linear_sweep_gap(
             let next_ip = instr.next_ip() as u32;
             if next_ip > gap_end {
                 // Would overlap a recursive-descent block; stop cleanly.
-                if instructions.is_empty() {
+                if instr_count == 0 {
                     pos_va = gap_end;
                 } else {
                     terminator = BlockTerminator::Trap;
@@ -484,14 +550,24 @@ fn linear_sweep_gap(
                 break;
             }
 
-            instructions.push(instr);
+            if instr_count > 0 && seen_mem_read && is_non_stack_mem_write(&instr) {
+                terminator = BlockTerminator::Fallthrough(cur_ip);
+                end_va = cur_ip;
+                split_on_mem_write = true;
+                break;
+            }
+            if is_non_stack_mem_read(&instr) {
+                seen_mem_read = true;
+            }
+
+            instr_bitmap.set(cur_ip);
+            instr_count += 1;
             end_va = next_ip;
 
             if instr.mnemonic() == Mnemonic::Syscall {
                 if next_ip == gap_end {
                     if blocks.contains_key(&gap_end) {
                         terminator = BlockTerminator::Fallthrough(gap_end);
-                        succs.push(gap_end);
                     } else {
                         terminator = BlockTerminator::Trap;
                     }
@@ -506,7 +582,6 @@ fn linear_sweep_gap(
                         // Reached the start of an existing recursive-descent block.
                         if blocks.contains_key(&gap_end) {
                             terminator = BlockTerminator::Fallthrough(gap_end);
-                            succs.push(gap_end);
                         } else {
                             terminator = BlockTerminator::Trap;
                         }
@@ -520,10 +595,6 @@ fn linear_sweep_gap(
                                 target,
                                 fallthrough: next_ip,
                             };
-                            succs.push(target);
-                            if next_ip != target {
-                                succs.push(next_ip);
-                            }
                         } else {
                             terminator = BlockTerminator::Trap;
                         }
@@ -536,7 +607,6 @@ fn linear_sweep_gap(
                     if is_near_branch(&instr) {
                         if let Ok(target) = u32::try_from(instr.near_branch_target()) {
                             terminator = BlockTerminator::DirectJump(target);
-                            succs.push(target);
                         } else {
                             terminator = BlockTerminator::Trap;
                         }
@@ -552,10 +622,6 @@ fn linear_sweep_gap(
                                 taken,
                                 fallthrough: next_ip,
                             };
-                            succs.push(taken);
-                            if next_ip != taken {
-                                succs.push(next_ip);
-                            }
                         } else {
                             terminator = BlockTerminator::Trap;
                         }
@@ -572,7 +638,6 @@ fn linear_sweep_gap(
                     terminator = BlockTerminator::IndirectCall {
                         fallthrough: next_ip,
                     };
-                    succs.push(next_ip);
                     break;
                 }
                 FlowControl::Return => {
@@ -586,31 +651,28 @@ fn linear_sweep_gap(
             }
         }
 
-        if !instructions.is_empty() {
-            for instr in &instructions {
-                instr_to_block.insert(instr.ip() as u32, start_va);
-            }
+        if instr_count > 0 {
             blocks.insert(
                 start_va,
                 DecodedBlock {
                     start_va,
                     end_va,
-                    instructions,
-                    succs,
+                    instr_count,
                     terminator,
                 },
             );
             pos_va = end_va;
+            if split_on_mem_write {
+                skip_zero_pad = false;
+            }
         }
     }
 }
 
 pub fn discover_code(image: &LoadedImage) -> Result<DecodedProgram> {
     let total_exec_bytes: usize = image.exec_segments.iter().map(|s| s.data.len()).sum();
-    let mut blocks: FastHashMap<u32, DecodedBlock> =
-        FastHashMap::with_capacity_and_hasher(total_exec_bytes / 12, Default::default());
-    let mut instr_to_block: FastHashMap<u32, u32> =
-        FastHashMap::with_capacity_and_hasher(total_exec_bytes / 3, Default::default());
+    let mut blocks: BTreeMap<u32, DecodedBlock> = BTreeMap::new();
+    let mut instr_bitmap = ExecInstrBitmap::new(&image.exec_segments);
     let mut worklist: VecDeque<u32> = VecDeque::with_capacity(total_exec_bytes / 16);
     let mut queued: FastHashSet<u32> =
         FastHashSet::with_capacity_and_hasher(total_exec_bytes / 12, Default::default());
@@ -694,9 +756,11 @@ pub fn discover_code(image: &LoadedImage) -> Result<DecodedProgram> {
         if blocks.contains_key(&va) {
             continue;
         }
-        if let Some(&owner_va) = instr_to_block.get(&va) {
-            if owner_va < va {
-                split_block(&mut blocks, &mut instr_to_block, owner_va, va);
+        if instr_bitmap.contains(va) {
+            if let Some(owner_va) = find_owner_block(&blocks, va) {
+                if owner_va < va {
+                    split_block(&image.exec_segments, &mut blocks, owner_va, va);
+                }
             }
             continue;
         }
@@ -705,36 +769,36 @@ pub fn discover_code(image: &LoadedImage) -> Result<DecodedProgram> {
             seg,
             va,
             &mut blocks,
-            &mut instr_to_block,
+            &mut instr_bitmap,
             &mut worklist,
             &mut queued,
             &mut function_entries,
         );
     }
+    drop(worklist);
+    drop(queued);
 
     // 2. Gap-only linear sweep fallback over uncovered ranges in exec_segments.
     for seg in &image.exec_segments {
         let seg_start = seg.vaddr;
         let seg_end = seg.vaddr.saturating_add(seg.data.len() as u32);
 
-        let mut covered_ranges: Vec<(u32, u32)> = blocks
-            .values()
-            .filter(|b| b.start_va >= seg_start && b.start_va < seg_end)
-            .map(|b| (b.start_va, b.end_va.min(seg_end)))
+        let covered_ranges: Vec<(u32, u32)> = blocks
+            .range(seg_start..seg_end)
+            .map(|(_, b)| (b.start_va, b.end_va.min(seg_end)))
             .collect();
-        covered_ranges.sort_unstable_by_key(|&(s, _)| s);
 
         let mut cursor = seg_start;
         for (cov_start, cov_end) in covered_ranges {
             if cursor < cov_start {
-                linear_sweep_gap(seg, cursor, cov_start, &mut blocks, &mut instr_to_block);
+                linear_sweep_gap(seg, cursor, cov_start, &mut blocks, &mut instr_bitmap);
             }
             if cov_end > cursor {
                 cursor = cov_end;
             }
         }
         if cursor < seg_end {
-            linear_sweep_gap(seg, cursor, seg_end, &mut blocks, &mut instr_to_block);
+            linear_sweep_gap(seg, cursor, seg_end, &mut blocks, &mut instr_bitmap);
         }
     }
 
@@ -755,16 +819,14 @@ pub fn discover_code(image: &LoadedImage) -> Result<DecodedProgram> {
         }
     }
     for target in split_targets {
-        if !blocks.contains_key(&target) {
-            if let Some(&owner_va) = instr_to_block.get(&target) {
+        if !blocks.contains_key(&target) && instr_bitmap.contains(target) {
+            if let Some(owner_va) = find_owner_block(&blocks, target) {
                 if owner_va < target {
-                    split_block(&mut blocks, &mut instr_to_block, owner_va, target);
+                    split_block(&image.exec_segments, &mut blocks, owner_va, target);
                 }
             }
         }
     }
-
-    let blocks = split_mem_read_write_blocks(blocks, &mut instr_to_block);
 
     // 3. Build functions map (only used by decoder unit tests).
     #[allow(unused_mut)]
@@ -835,13 +897,12 @@ pub fn discover_code(image: &LoadedImage) -> Result<DecodedProgram> {
         blocks,
         functions,
         indirect_targets,
-        instr_to_block,
+        instr_bitmap,
     })
 }
 
 pub fn split_indirect_targets(image: &LoadedImage, prog: &mut DecodedProgram) {
     use iced_x86::{Mnemonic, OpKind, Register};
-    use std::collections::BTreeSet;
 
     let in_exec = |va: u32| -> bool {
         image.exec_segments.iter().any(|seg| {
@@ -941,11 +1002,13 @@ pub fn split_indirect_targets(image: &LoadedImage, prog: &mut DecodedProgram) {
         None
     };
 
-    let mut targets = BTreeSet::new();
-    let mut ro_table_candidates = BTreeSet::new();
-    let mut abs_table_candidates = BTreeSet::new();
+    let mut targets = FastHashSet::default();
+    let mut ro_table_candidates = FastHashSet::default();
+    let mut abs_table_candidates = FastHashSet::default();
+    let mut scratch_instrs = Vec::with_capacity(64);
     for block in prog.blocks.values() {
-        for (i, instr) in block.instructions.iter().enumerate() {
+        decode_block_instructions_into(&image.exec_segments, block, &mut scratch_instrs);
+        for (i, instr) in scratch_instrs.iter().enumerate() {
             if instr.is_ip_rel_memory_operand() {
                 if let Ok(va) = u32::try_from(instr.ip_rel_memory_address()) {
                     if in_exec(va) {
@@ -991,7 +1054,7 @@ pub fn split_indirect_targets(image: &LoadedImage, prog: &mut DecodedProgram) {
                 let va = instr.ip() as u32;
                 if instr.mnemonic() == Mnemonic::Endbr64 {
                     targets.insert(va);
-                } else if block.instructions[i - 1].mnemonic() == Mnemonic::Nop
+                } else if scratch_instrs[i - 1].mnemonic() == Mnemonic::Nop
                     && instr.mnemonic() != Mnemonic::Nop
                 {
                     targets.insert(va);
@@ -1025,7 +1088,7 @@ pub fn split_indirect_targets(image: &LoadedImage, prog: &mut DecodedProgram) {
             let Ok(target) = u32::try_from(entry) else {
                 break;
             };
-            if in_exec(target) && prog.instr_to_block.contains_key(&target) {
+            if in_exec(target) && prog.instr_bitmap.contains(target) {
                 targets.insert(target);
             } else {
                 break;
@@ -1033,46 +1096,17 @@ pub fn split_indirect_targets(image: &LoadedImage, prog: &mut DecodedProgram) {
         }
     }
 
-    for split_va in targets {
-        if prog.blocks.contains_key(&split_va) {
+    let mut sorted_targets: Vec<u32> = targets.into_iter().collect();
+    sorted_targets.sort_unstable();
+    for split_va in sorted_targets {
+        if prog.blocks.contains_key(&split_va) || !prog.instr_bitmap.contains(split_va) {
             continue;
         }
-        let Some((&block_va, _)) = prog.blocks.range(..split_va).next_back() else {
-            continue;
-        };
-        let Some(block) = prog.blocks.get(&block_va) else {
-            continue;
-        };
-        if split_va >= block.end_va {
-            continue;
+        if let Some(owner_va) = find_owner_block(&prog.blocks, split_va) {
+            if owner_va < split_va {
+                split_block(&image.exec_segments, &mut prog.blocks, owner_va, split_va);
+            }
         }
-        let Some(idx) = block
-            .instructions
-            .iter()
-            .position(|ins| ins.ip() as u32 == split_va)
-        else {
-            continue;
-        };
-        if idx == 0 {
-            continue;
-        }
-        let mut orig = prog.blocks.remove(&block_va).unwrap();
-        let tail_instrs = orig.instructions.split_off(idx);
-        let tail_block = DecodedBlock {
-            start_va: split_va,
-            end_va: orig.end_va,
-            instructions: tail_instrs,
-            succs: orig.succs,
-            terminator: orig.terminator,
-        };
-        for ins in &tail_block.instructions {
-            prog.instr_to_block.insert(ins.ip() as u32, split_va);
-        }
-        orig.end_va = split_va;
-        orig.succs = vec![split_va];
-        orig.terminator = BlockTerminator::Fallthrough(split_va);
-        prog.blocks.insert(block_va, orig);
-        prog.blocks.insert(split_va, tail_block);
     }
     prog.indirect_targets = prog.blocks.keys().copied().collect();
 }
@@ -1114,18 +1148,20 @@ mod tests {
             );
         }
 
-        // Verify instr_to_block and no DirectCall { target: 0 } from syscall
-        let mut total_instrs = 0usize;
+        // Verify instr_bitmap and no DirectCall { target: 0 } from syscall
+        let mut instrs = Vec::new();
         for (&start_va, block) in &prog.blocks {
             assert_eq!(block.start_va, start_va);
-            assert!(!block.instructions.is_empty());
+            decode_block_instructions_into(&image.exec_segments, block, &mut instrs);
+            assert!(!instrs.is_empty());
+            assert_eq!(instrs.len() as u32, block.instr_count);
             assert!(block.end_va > block.start_va);
 
             if let BlockTerminator::DirectCall { target, .. } = block.terminator {
                 assert_ne!(target, 0, "DirectCall target must not be 0 (syscall bug)");
             }
 
-            for &succ in &block.succs {
+            for succ in block.succs() {
                 if find_segment(&image.exec_segments, succ).is_some() {
                     assert!(
                         prog.blocks.contains_key(&succ),
@@ -1143,18 +1179,15 @@ mod tests {
                 }
             }
 
-            for instr in &block.instructions {
-                total_instrs += 1;
+            for instr in &instrs {
                 let ip = instr.ip() as u32;
-                assert_eq!(
-                    prog.instr_to_block.get(&ip).copied(),
-                    Some(start_va),
-                    "instr_to_block mismatch at 0x{:x}",
+                assert!(
+                    prog.instr_bitmap.contains(ip),
+                    "instr_bitmap missing instruction at 0x{:x}",
                     ip
                 );
             }
         }
-        assert_eq!(prog.instr_to_block.len(), total_instrs);
 
         let expected_indirect: Vec<u32> = prog.blocks.keys().copied().collect();
         assert_eq!(
@@ -1248,18 +1281,26 @@ mod tests {
             so_files: vec![],
             symbols: HashMap::new(),
             elf_path: String::new(),
+            brk_start: crate::meta::DEFAULT_BRK_START,
+            mmap_start: crate::meta::DEFAULT_MMAP_START,
+            mmap_end: crate::meta::DEFAULT_MMAP_END,
+            stack_top: crate::meta::DEFAULT_STACK_TOP,
+            dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
         };
         let prog = discover_code(&image)?;
         verify_program_invariants(&prog, &image);
 
+        let mut instrs = Vec::new();
         // 0x1000..0x1004 should be split with Fallthrough(0x1004)
         let b0 = &prog.blocks[&0x1000];
-        assert_eq!(b0.instructions[0].mnemonic(), Mnemonic::Endbr64);
+        decode_block_instructions_into(&image.exec_segments, b0, &mut instrs);
+        assert_eq!(instrs[0].mnemonic(), Mnemonic::Endbr64);
         assert_eq!(b0.terminator, BlockTerminator::Fallthrough(0x1004));
 
         // 0x1004..0x100b should contain syscall and call $+5
         let b1 = &prog.blocks[&0x1004];
-        assert_eq!(b1.instructions[0].mnemonic(), Mnemonic::Syscall);
+        decode_block_instructions_into(&image.exec_segments, b1, &mut instrs);
+        assert_eq!(instrs[0].mnemonic(), Mnemonic::Syscall);
         assert_eq!(
             b1.terminator,
             BlockTerminator::DirectCall {
@@ -1291,6 +1332,11 @@ mod tests {
             so_files: vec![],
             symbols: HashMap::new(),
             elf_path: String::new(),
+            brk_start: crate::meta::DEFAULT_BRK_START,
+            mmap_start: crate::meta::DEFAULT_MMAP_START,
+            mmap_end: crate::meta::DEFAULT_MMAP_END,
+            stack_top: crate::meta::DEFAULT_STACK_TOP,
+            dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
         }
     }
 
@@ -1319,8 +1365,10 @@ mod tests {
         assert_eq!(b1.end_va, 0x1003);
         assert_eq!(b1.terminator, BlockTerminator::Return);
 
-        assert_eq!(prog.instr_to_block.get(&0x1001).copied(), Some(0x1001));
-        assert_eq!(prog.instr_to_block.get(&0x1002).copied(), Some(0x1001));
+        assert!(prog.instr_bitmap.contains(0x1001));
+        assert!(prog.instr_bitmap.contains(0x1002));
+        assert_eq!(find_owner_block(&prog.blocks, 0x1001), Some(0x1001));
+        assert_eq!(find_owner_block(&prog.blocks, 0x1002), Some(0x1001));
         assert!(prog.indirect_targets.binary_search(&0x1001).is_ok());
 
         // DirectCall target 0x1001 must be registered as a function entry
@@ -1351,13 +1399,13 @@ mod tests {
 
         assert!(!prog.blocks.contains_key(&0x1001));
         assert!(!prog.blocks.contains_key(&0x1005));
-        assert!(!prog.instr_to_block.contains_key(&0x1001));
-        assert!(!prog.instr_to_block.contains_key(&0x1005));
+        assert!(!prog.instr_bitmap.contains(0x1001));
+        assert!(!prog.instr_bitmap.contains(0x1005));
 
         let gap_block = &prog.blocks[&0x1003];
         assert_eq!(gap_block.end_va, 0x1005);
         assert_eq!(gap_block.terminator, BlockTerminator::Trap);
-        assert!(gap_block.succs.is_empty());
+        assert!(gap_block.succs().is_empty());
 
         Ok(())
     }
