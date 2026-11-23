@@ -4,6 +4,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRegistryProxy } from "./registry_proxy.mjs";
+import { createGitProxy } from "./git_proxy.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -235,6 +236,18 @@ export function createServer(options = {}) {
   const proxyHandler =
     options.proxyHandler ?? ((req, res, rawPath) => proxy.handleRequest(req, res, rawPath));
 
+  const gitProxy =
+    options.gitProxy ??
+    createGitProxy({
+      allowLocalRegistries,
+      lookupFn: options.lookupFn,
+      maxRedirects: options.maxRedirects,
+      requestTimeoutMs: options.requestTimeoutMs,
+    });
+
+  const gitProxyHandler =
+    options.gitProxyHandler ?? ((req, res) => gitProxy.handleRequest(req, res));
+
   const server = http.createServer(async (req, res) => {
     setSecurityHeaders(res);
 
@@ -256,6 +269,12 @@ export function createServer(options = {}) {
       // OCI v2 thin streaming registry proxy
       if (rawPath.startsWith("/api/v2/")) {
         await proxyHandler(req, res, rawPath);
+        return;
+      }
+
+      // Git repository snapshot archive streaming proxy
+      if (rawPath === "/api/git/archive") {
+        await gitProxyHandler(req, res);
         return;
       }
 
@@ -310,6 +329,11 @@ export function createServer(options = {}) {
     }
   });
 
+  const keepAliveTimeout = options.keepAliveTimeout ?? 65_000;
+  server.keepAliveTimeout = keepAliveTimeout;
+  server.headersTimeout =
+    options.headersTimeout ?? Math.max(keepAliveTimeout + 1_000, 66_000);
+
   let boundPort = null;
   let boundHost = listenHost;
 
@@ -342,6 +366,7 @@ export function createServer(options = {}) {
   const handle = {
     server,
     proxy,
+    gitProxy,
     start,
     stop,
     get port() {

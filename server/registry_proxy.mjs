@@ -24,7 +24,7 @@ export {
   isBlockedIp,
 };
 
-function sendJsonError(res, statusCode, message, extraHeaders = null) {
+function sendJsonError(res, statusCode, message, method = "GET", extraHeaders = null) {
   if (res.headersSent) {
     if (!res.writableEnded) {
       res.destroy();
@@ -41,7 +41,11 @@ function sendJsonError(res, statusCode, message, extraHeaders = null) {
     }
   }
   res.writeHead(statusCode);
-  res.end(body);
+  if (method === "HEAD") {
+    res.end();
+  } else {
+    res.end(body);
+  }
 }
 
 /**
@@ -52,7 +56,10 @@ export async function validateAndResolveUrl(
   urlObj,
   { allowLocalRegistries = false, lookupFn = dns.lookup } = {}
 ) {
-  const { host, ipFamily } = validateUrlPolicy(urlObj, { allowLocalRegistries });
+  const { host, ipFamily } = validateUrlPolicy(urlObj, {
+    allowLocalRegistries,
+    requireLoopbackHostForHttp: true,
+  });
 
   let resolvedAddrs;
   if (ipFamily !== 0) {
@@ -102,10 +109,31 @@ export async function validateAndResolveUrl(
   return { url: urlObj, resolvedAddrs, lookup };
 }
 
-function openUpstreamRequest(validated, { method, headers, timeoutMs }) {
+function discardUpstream(upstreamReq, upstreamRes) {
+  if (upstreamRes) {
+    upstreamRes.on("error", () => {});
+    upstreamRes.resume();
+  }
+  if (upstreamReq && !upstreamReq.destroyed) {
+    upstreamReq.destroy();
+  }
+}
+
+function openUpstreamRequest(validated, { method, headers, timeoutMs, signal }) {
   return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) {
+      reject(new ProxyError(499, "Client disconnected"));
+      return;
+    }
+
     const client = validated.url.protocol === "https:" ? https : http;
     let settled = false;
+
+    const cleanupSignal = () => {
+      if (signal) {
+        signal.removeEventListener("abort", onAbort);
+      }
+    };
 
     const upstreamReq = client.request(
       validated.url,
@@ -113,14 +141,25 @@ function openUpstreamRequest(validated, { method, headers, timeoutMs }) {
         method,
         headers,
         lookup: validated.lookup,
+        agent: false,
       },
       (upstreamRes) => {
-        if (!settled) {
-          settled = true;
-          resolve({ upstreamReq, upstreamRes });
+        if (settled) {
+          discardUpstream(upstreamReq, upstreamRes);
+          return;
         }
+        settled = true;
+        cleanupSignal();
+        resolve({ upstreamReq, upstreamRes });
       }
     );
+
+    const onAbort = () => {
+      upstreamReq.destroy(new ProxyError(499, "Client disconnected"));
+    };
+    if (signal) {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
 
     upstreamReq.setTimeout(timeoutMs, () => {
       upstreamReq.destroy(new ProxyError(502, "Upstream request timed out"));
@@ -129,6 +168,7 @@ function openUpstreamRequest(validated, { method, headers, timeoutMs }) {
     upstreamReq.on("error", (err) => {
       if (!settled) {
         settled = true;
+        cleanupSignal();
         if (err instanceof ProxyError) {
           reject(err);
         } else {
@@ -185,7 +225,7 @@ export function createRegistryProxy(options = {}) {
     tokenCache.set(cacheKey, token, expiresInSeconds);
   }
 
-  async function fetchBearerToken(wwwAuthHeader) {
+  async function fetchBearerToken(wwwAuthHeader, signal) {
     const challenge = parseWwwAuthenticate(wwwAuthHeader);
     if (!challenge) {
       throw new ProxyError(502, "Unsupported or malformed WWW-Authenticate challenge from registry");
@@ -205,17 +245,18 @@ export function createRegistryProxy(options = {}) {
       tokenUrl.searchParams.set("scope", challenge.scope);
     }
 
-    const { upstreamRes } = await requestWithRedirects(tokenUrl, {
+    const { upstreamReq, upstreamRes } = await requestWithRedirects(tokenUrl, {
       method: "GET",
       baseHeaders: {
         Accept: "application/json",
         "User-Agent": "elf2wasm-registry-proxy/1.0",
       },
       authToken: null,
+      signal,
     });
 
     if (upstreamRes.statusCode !== 200) {
-      upstreamRes.resume();
+      discardUpstream(upstreamReq, upstreamRes);
       throw new ProxyError(502, `Registry auth server returned HTTP ${upstreamRes.statusCode}`);
     }
 
@@ -239,7 +280,7 @@ export function createRegistryProxy(options = {}) {
     };
   }
 
-  async function requestWithRedirects(initialUrl, { method, baseHeaders, authToken }) {
+  async function requestWithRedirects(initialUrl, { method, baseHeaders, authToken, signal }) {
     let currentUrl = initialUrl;
     let currentHeaders = { ...baseHeaders };
     if (authToken) {
@@ -247,18 +288,23 @@ export function createRegistryProxy(options = {}) {
     }
 
     for (let hop = 0; hop <= maxRedirects; hop++) {
+      if (signal && signal.aborted) {
+        throw new ProxyError(499, "Client disconnected");
+      }
+
       const validated = await validateAndResolveUrl(currentUrl, { allowLocalRegistries, lookupFn });
       const { upstreamReq, upstreamRes } = await openUpstreamRequest(validated, {
         method,
         headers: currentHeaders,
         timeoutMs: requestTimeoutMs,
+        signal,
       });
 
       const status = upstreamRes.statusCode || 502;
       const location = upstreamRes.headers.location;
 
       if (REDIRECT_STATUSES.has(status) && location) {
-        upstreamRes.resume();
+        discardUpstream(upstreamReq, upstreamRes);
         if (hop === maxRedirects) {
           throw new ProxyError(502, "Too many redirects from upstream registry");
         }
@@ -283,10 +329,19 @@ export function createRegistryProxy(options = {}) {
   }
 
   async function handleRequest(req, res, rawPathnameOverride = null) {
+    const clientAbort = new AbortController();
+    const onPreStreamClose = () => {
+      if (!res.writableFinished) {
+        clientAbort.abort();
+      }
+    };
+    res.on("close", onPreStreamClose);
+
+    const method = (req.method || "GET").toUpperCase();
+
     try {
-      const method = (req.method || "GET").toUpperCase();
       if (method !== "GET" && method !== "HEAD") {
-        sendJsonError(res, 405, "Method Not Allowed", { Allow: "GET, HEAD" });
+        sendJsonError(res, 405, "Method Not Allowed", method, { Allow: "GET, HEAD" });
         return;
       }
 
@@ -316,43 +371,50 @@ export function createRegistryProxy(options = {}) {
         method,
         baseHeaders,
         authToken: token,
+        signal: clientAbort.signal,
       });
 
       // Handle OCI v2 401 Bearer challenge with at most one retry.
       if (upstreamRes.statusCode === 401) {
         const wwwAuth = upstreamRes.headers["www-authenticate"];
-        upstreamRes.resume();
+        discardUpstream(upstreamReq, upstreamRes);
         tokenCache.delete(cacheKey);
 
         if (!wwwAuth) {
           throw new ProxyError(502, "Upstream registry returned 401 without WWW-Authenticate header");
         }
 
-        const fetched = await fetchBearerToken(wwwAuth);
+        const fetched = await fetchBearerToken(wwwAuth, clientAbort.signal);
         setCachedToken(cacheKey, fetched.token, fetched.expiresIn);
 
         ({ upstreamReq, upstreamRes } = await requestWithRedirects(upstreamUrl, {
           method,
           baseHeaders,
           authToken: fetched.token,
+          signal: clientAbort.signal,
         }));
 
         if (upstreamRes.statusCode === 401) {
-          upstreamRes.resume();
+          discardUpstream(upstreamReq, upstreamRes);
           tokenCache.delete(cacheKey);
           throw new ProxyError(502, "Upstream registry rejected Bearer token");
         }
       }
 
-      const status = upstreamRes.statusCode || 502;
-      if (status === 404) {
-        upstreamRes.resume();
-        sendJsonError(res, 404, "Upstream OCI resource not found");
+      if (res.destroyed || res.writableEnded || clientAbort.signal.aborted) {
+        discardUpstream(upstreamReq, upstreamRes);
         return;
       }
-      if (status < 200 || status >= 300) {
-        upstreamRes.resume();
-        sendJsonError(res, 502, `Upstream registry returned HTTP ${status}`);
+
+      const status = upstreamRes.statusCode || 502;
+      if (status === 404) {
+        discardUpstream(upstreamReq, upstreamRes);
+        sendJsonError(res, 404, "Upstream OCI resource not found", method);
+        return;
+      }
+      if (status !== 200) {
+        discardUpstream(upstreamReq, upstreamRes);
+        sendJsonError(res, 502, `Upstream registry returned HTTP ${status}`, method);
         return;
       }
 
@@ -367,37 +429,64 @@ export function createRegistryProxy(options = {}) {
       res.writeHead(status);
 
       if (method === "HEAD") {
-        upstreamRes.resume();
+        discardUpstream(upstreamReq, upstreamRes);
         res.end();
         return;
       }
 
+      const cleanupStreamListeners = () => {
+        res.off("close", onClientClose);
+        res.off("error", onClientError);
+      };
+
       const onClientClose = () => {
-        if (!res.writableEnded) {
+        if (!res.writableFinished) {
           upstreamReq.destroy();
           upstreamRes.destroy();
         }
       };
-      res.on("close", onClientClose);
 
-      upstreamRes.on("error", () => {
-        res.off("close", onClientClose);
+      const onClientError = () => {
+        cleanupStreamListeners();
+        upstreamReq.destroy();
+        upstreamRes.destroy();
+      };
+
+      const onUpstreamAbort = () => {
+        cleanupStreamListeners();
         if (!res.writableEnded) {
           res.destroy();
         }
-      });
+      };
 
+      res.off("close", onPreStreamClose);
+      res.on("close", onClientClose);
+      res.on("error", onClientError);
+
+      upstreamRes.on("error", onUpstreamAbort);
+      upstreamRes.on("aborted", onUpstreamAbort);
+      upstreamRes.on("close", () => {
+        cleanupStreamListeners();
+        if (!upstreamRes.complete && !res.writableEnded) {
+          res.destroy();
+        }
+      });
       upstreamRes.on("end", () => {
-        res.off("close", onClientClose);
+        cleanupStreamListeners();
       });
 
       upstreamRes.pipe(res);
     } catch (err) {
-      if (err instanceof ProxyError) {
-        sendJsonError(res, err.statusCode, err.message);
-      } else {
-        sendJsonError(res, 502, `Registry proxy error: ${err?.message || "unknown error"}`);
+      if (res.destroyed || res.writableEnded || clientAbort.signal.aborted) {
+        return;
       }
+      if (err instanceof ProxyError) {
+        sendJsonError(res, err.statusCode, err.message, method);
+      } else {
+        sendJsonError(res, 502, `Registry proxy error: ${err?.message || "unknown error"}`, method);
+      }
+    } finally {
+      res.off("close", onPreStreamClose);
     }
   }
 
