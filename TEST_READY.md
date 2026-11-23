@@ -1,23 +1,28 @@
-# Phase 2 E2E Test Suite Ready (`TEST_READY.md`)
+# E2E Test Suite Ready — Docker-on-WASM Web Platform
 
-## Test Runner Command
+The requirement-driven, opaque-box, 4-tier E2E test suite (`e2e_docker_web/`) for the `elf2wasm` Client-Side Docker-on-WASM Web Platform is complete and has passed the full 5-agent Verification Gate (2 Reviewers + 2 Challengers + 1 Forensic Auditor — all green).
+
+## Summary of Deliverables
+- **Specification**: `TEST_INFRA.md`
+- **Unified Runner**: `e2e_docker_web/run_all.mjs` (`--tier 1|2|3|4|all`, `--self-test`, `--skip-live`, `--verbose`, `--json <file>`, `--help`)
+- **4-Tier Opaque-Box Suite (47 E2E tests + 5 live harness self-tests)**:
+  - **Tier 1 (`e2e_docker_web/tier1_features.mjs`, 24 tests)**: Server static/WASM/health routes, COOP/COEP headers, OCI v2 Bearer auth & cross-origin 302 auth-stripping, JS SDK (`parseImageRef`, `Elf2WasmDocker`, `pullImage`, `loadOciTarball`, `createContainer`, `runDockerImage`), client-side execution proof (fetch spy + negative server probes), interactive shell commands, live streaming, UID `0`, `/dev/*`, `/proc/*`, `#!` + `X_OK`, and `runtime-wasm` §1 C-ABI export check.
+  - **Tier 2 (`e2e_docker_web/tier2_boundaries.mjs`, 13 tests)**: Malformed image refs, 404 & upstream 500 -> 502, 10-host SSRF 403 matrix (hardened server), path traversal, invalid digests (400), empty directories, OCI `.wh.<name>` & `.wh..wh..opq` whiteouts, `-ENOEXEC`, exact 131,072-byte stdout streaming, 25 sequential forks (memory hygiene), `SIGINT` Ctrl-C, `closeStdin()` EOF, and `resize()` / `stty size`.
+  - **Tier 3 (`e2e_docker_web/tier3_combinations.mjs`, 5 tests)**: Multi-layer OCI whiteouts + symlinks + `PATH`/`Env`/`WorkingDir`, pipelines + redirections + subshells + `#!` + `/dev/null` in TTY, host VFS `writeFile`/`readFile`, multi-image switching isolation (`alpine:latest` ↔ `custom/app:v2` ↔ `busybox:musl`), and offline `loadOciTarball` interactive TTY controls.
+  - **Tier 4 (`e2e_docker_web/tier4_scenarios.mjs`, 5 headless Google Chrome CDP scenarios)**: Default Alpine interactive shell UI (`#image-input`, `#start-btn`, `#terminal`, `#clear-btn`, `#stop-btn`), programmatic `window.Elf2WasmDocker`/`window.runDockerImage`, second image launched from UI, strictly client-side + zero-CDN Page & Dedicated Web Worker CDP network audit, and live Docker Hub `alpine:latest` pull on a hardened server.
+- **Helpers (`e2e_docker_web/helpers/`)**: `test_runner.mjs`, `tar_builder.mjs`, `mock_oci_registry.mjs`, `server_harness.mjs`, `cdp_browser.mjs` (uses `/usr/bin/google-chrome` via Node 22 native `WebSocket` CDP with `Target.setAutoAttach({ waitForDebuggerOnStart: true })` for race-free Worker network capture).
+
+## M5 Sequential Execution Commands
+Once M1–M4 are complete, run each tier sequentially:
 ```bash
-./e2e_v2/run_phase2.sh
+node e2e_docker_web/run_all.mjs --self-test --verbose
+node e2e_docker_web/run_all.mjs --tier 1 --verbose
+node e2e_docker_web/run_all.mjs --tier 2 --verbose
+node e2e_docker_web/run_all.mjs --tier 3 --verbose
+node e2e_docker_web/run_all.mjs --tier 4 --verbose
 ```
 
-Individual requirement tests can also be run directly with Node.js (`v24+`):
+Or run the entire suite in one command:
 ```bash
-node e2e_v2/test_r1_cps_preemption.mjs
-node e2e_v2/test_r2_readme_abi.mjs
-node e2e_v2/test_r3_web_ui_python.mjs
-node e2e_v2/test_r4_cleanliness.mjs
+node e2e_docker_web/run_all.mjs --tier all --verbose
 ```
-
-## Coverage Summary
-
-| Requirement | Test File | What It Verifies (Opaque-Box) |
-|---|---|---|
-| **R1: CPS Syscall ABI & Kernel Preemption** | `e2e_v2/test_r1_cps_preemption.mjs` | Compiles C programs with `gcc` and translates via `elf2wasm translate`; inspects `.wasm` via `WebAssembly.Module` for 0 imports (`env.syscall` removed), all required ABI exports (`memory`, `_start`, `save_ctx`, `load_ctx`, `yield_flag`, `quantum`, `rip`, `exit_flag`, `exit_code`, `fsbase`, `gsbase`, `rax`..`r15`), and `elf2wasm_meta` custom section; instantiates directly in Node to verify `_start()` CPS return (`yield_flag` 2/3, `rip != 0`); runs a two-subprocess `fork()` + `nanosleep()` + `waitpid()` program (Child A 50ms, Child B 10ms) via both `elf2wasm run` and `node js/cli.mjs run`, asserting exit code 0, deterministic `CHILD_B_DONE` before `CHILD_A_DONE` before `PARENT_DONE`, and identical stdout across repeated runs. |
-| **R2: `README.md` & Exhaustive WASM ABI Docs** | `e2e_v2/test_r2_readme_abi.mjs` | Verifies `README.md` exists and documents the core goal (deterministic, Linux-compatible OS running unmodified x86/x86-64 programs), build/install instructions (`wasm32-unknown-unknown`, `cargo build`, `.wasm` modules), and run instructions; dynamically extracts all `WebAssembly.Module.imports` and `WebAssembly.Module.exports` from `elf2wasm_compiler_wasm.wasm`, `elf2wasm_runtime_wasm.wasm`, and a freshly translated guest `.wasm`, asserting every import and export symbol is documented in `README.md`. |
-| **R3: VFS Symlinks, `.tar.gz` Overlay & HTML Web UI + Python** | `e2e_v2/test_r3_web_ui_python.mjs` | Packages a real `.tar.gz` overlay from host `/usr/bin/python3.11`, its `.so` dependencies (`libc.so.6`, `libm.so.6`, `libexpat.so.1`, `libz.so.1`, `ld-linux-x86-64.so.2`), symlinks (`/usr/bin/python3 -> python3.11`, `/lib64/ld-linux-x86-64.so.2 -> /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2`), and minimal `/usr/lib/python3.11` stdlib; verifies `js/elf2wasm_shim.mjs` (`extractTarGzToVfs`, `runFromVfs`, symlink resolution); serves the repo via HTTP, launches headless `/usr/bin/chromium` over CDP, loads `/web/index.html` with zero uncaught page errors, uploads the `.tar.gz` overlay via `DOM.setFileInputFiles`, runs `/usr/bin/python3 -S -c "print(6 * 7)"`, and asserts stdout contains `42`. |
-| **R4: Codebase Simplification & Cleanup** | `e2e_v2/test_r4_cleanliness.mjs` | Verifies obsolete/redundant files (`src/syscalls.rs`, `src/vfs.rs`, `tests/m2_runtime.rs`, `tests/m3_true_echo.rs`, `tests/m4_python3.rs`, `TEST_READY_V2.md`) are deleted, root `Cargo.toml` `[dependencies]` no longer contains unused `goblin`, `iced-x86`, or `wasm-encoder`, and `cargo test --workspace` exits `0`. |
