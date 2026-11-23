@@ -13,23 +13,144 @@ import {
   Suite,
 } from "./helpers/test_runner.mjs";
 import { startMockOciRegistry } from "./helpers/mock_oci_registry.mjs";
+import { startMockGitServer } from "./helpers/mock_git_server.mjs";
 import { REQUIRED_ARTIFACTS, startServer } from "./helpers/server_harness.mjs";
+
+const T3_PINNED_SHA = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
 
 export async function runTier3(opts = {}) {
   const sdk = await import(pathToFileURL(REQUIRED_ARTIFACTS.dockerSdk).href);
   const { Elf2WasmDocker } = sdk;
 
   let registry = null;
+  let gitServer = null;
   let server = null;
 
   try {
     registry = await startMockOciRegistry({ requireAuth: true, redirectBlobs: true });
+    gitServer = await startMockGitServer({ redirectArchives: true });
     server = await startServer({ allowLocalRegistries: true });
+
+    gitServer.addRepo("acme/shell-proj", {
+      main: [
+        { path: "shell-proj-main/", type: "dir", mode: 0o755 },
+        { path: "shell-proj-main/version.txt", type: "file", content: "branch-main-v2\n" },
+        { path: "shell-proj-main/bin/", type: "dir", mode: 0o755 },
+        {
+          path: "shell-proj-main/bin/check.sh",
+          type: "file",
+          mode: 0o755,
+          content: '#!/bin/sh\necho "PWD=$PWD"\necho "SHELL_TEST_PASS:main:$((20+22))"\ncat version.txt\n',
+        },
+      ],
+      [T3_PINNED_SHA]: [
+        { path: "shell-proj-a1b2c3d4/", type: "dir", mode: 0o755 },
+        { path: "shell-proj-a1b2c3d4/version.txt", type: "file", content: "pinned-sha-v1\n" },
+        { path: "shell-proj-a1b2c3d4/bin/", type: "dir", mode: 0o755 },
+        {
+          path: "shell-proj-a1b2c3d4/bin/check.sh",
+          type: "file",
+          mode: 0o755,
+          content: '#!/bin/sh\necho "PWD=$PWD"\necho "SHELL_TEST_PASS:sha:$((90+9))"\ncat version.txt\n',
+        },
+      ],
+    });
+
+    gitServer.addRepo("acme/py-mathlib", {
+      "v1.0.0": [
+        { path: "py-mathlib-v1.0.0/", type: "dir", mode: 0o755 },
+        { path: "py-mathlib-v1.0.0/mathlib/", type: "dir", mode: 0o755 },
+        { path: "py-mathlib-v1.0.0/mathlib/__init__.py", type: "file", content: "" },
+        {
+          path: "py-mathlib-v1.0.0/mathlib/calc.py",
+          type: "file",
+          content: [
+            "import hashlib",
+            "import json",
+            "import math",
+            "",
+            "def add(a, b):",
+            "    return a + b",
+            "",
+            "def fact_and_hash(n, label):",
+            "    val = math.factorial(n)",
+            "    h = hashlib.sha256(f'{label}:{val}'.encode('utf-8')).hexdigest()[:12]",
+            "    return json.loads(json.dumps({'val': val, 'hash': h}))",
+            "",
+          ].join("\n"),
+        },
+        { path: "py-mathlib-v1.0.0/tests/", type: "dir", mode: 0o755 },
+        { path: "py-mathlib-v1.0.0/tests/__init__.py", type: "file", content: "" },
+        {
+          path: "py-mathlib-v1.0.0/tests/test_calc.py",
+          type: "file",
+          content: [
+            "import os",
+            "import unittest",
+            "from mathlib.calc import add, fact_and_hash",
+            "",
+            "class TestMathlib(unittest.TestCase):",
+            "    def test_arithmetic(self):",
+            "        self.assertEqual(add(20, 22), 42)",
+            "",
+            "    def test_factorial_and_sha256(self):",
+            "        res = fact_and_hash(6, 'elf2wasm')",
+            "        self.assertEqual(res['val'], 720)",
+            "        self.assertEqual(len(res['hash']), 12)",
+            "",
+            "    def test_cwd_workspace(self):",
+            "        self.assertEqual(os.getcwd(), '/workspace')",
+            "",
+            "if __name__ == '__main__':",
+            "    unittest.main()",
+            "",
+          ].join("\n"),
+        },
+      ],
+    });
+
+    gitServer.addRepo("acme/js-toolkit", {
+      main: [
+        { path: "js-toolkit-main/", type: "dir", mode: 0o755 },
+        {
+          path: "js-toolkit-main/package.json",
+          type: "file",
+          content: JSON.stringify({ name: "js-toolkit", type: "module" }, null, 2) + "\n",
+        },
+        { path: "js-toolkit-main/src/", type: "dir", mode: 0o755 },
+        {
+          path: "js-toolkit-main/src/index.mjs",
+          type: "file",
+          content: [
+            'import crypto from "node:crypto";',
+            "export function add(a, b) { return a + b; }",
+            'export function sha12(s) { return crypto.createHash("sha256").update(s).digest("hex").slice(0, 12); }',
+            "",
+          ].join("\n"),
+        },
+        { path: "js-toolkit-main/test/", type: "dir", mode: 0o755 },
+        {
+          path: "js-toolkit-main/test/index.test.mjs",
+          type: "file",
+          content: [
+            'import test from "node:test";',
+            'import assert from "node:assert/strict";',
+            'import { add, sha12 } from "../src/index.mjs";',
+            "",
+            'test("add(20, 22) === 42", () => { assert.equal(add(20, 22), 42); });',
+            'test("sha12 produces 12 hex chars", () => { assert.match(sha12("elf2wasm"), /^[0-9a-f]{12}$/); });',
+            'test("cwd is /workspace", () => { assert.equal(process.cwd(), "/workspace"); });',
+            "",
+          ].join("\n"),
+        },
+      ],
+    });
 
     const sdkOpts = {
       compilerWasmUrl: `${server.url}/wasm/elf2wasm_compiler_wasm.wasm`,
       runtimeWasmUrl: `${server.url}/wasm/elf2wasm_runtime_wasm.wasm`,
       registryProxyBase: `${server.url}/api/v2`,
+      gitProxyBase: `${server.url}/api/git/archive`,
       useWorker: false,
     };
 
@@ -492,9 +613,157 @@ export async function runTier3(opts = {}) {
     }
   });
 
+  // -------------------------------------------------------------------------
+  // Git Repo Overlay Combinations (Features F25-F28, Contracts §7-§9)
+  // -------------------------------------------------------------------------
+
+  suite.add("T3.10", "Alpine + git repo overlay (branch main vs pinned 40-char commit SHA) running shell test script in /workspace", async () => {
+    const alpineImg = await docker.pullImage(registry.imageRef("library/alpine", "latest"));
+
+    // Part A: branch main
+    const cMain = await alpineImg.createContainer({
+      gitRepo: { repo: gitServer.repoUrl("acme/shell-proj"), ref: "main" },
+      cmd: ["/bin/sh", "-c", "pwd && test ! -d /workspace/shell-proj-main && ./bin/check.sh"],
+      tty: false,
+    });
+    await cMain.start();
+    try {
+      const resMain = await waitWithTimeout(cMain.wait(), 90000, "T3.10 branch main");
+      assert.equal(resMain.exitCode, 0, `Branch main failed (stderr: ${resMain.stderr})`);
+      const outMain = stripAnsi(resMain.stdout);
+      assertIncludes(outMain, "/workspace");
+      assertIncludes(outMain, "SHELL_TEST_PASS:main:42");
+      assertIncludes(outMain, "branch-main-v2");
+      assertNotIncludes(outMain, "pinned-sha-v1");
+    } finally {
+      await cMain.stop().catch(() => {});
+    }
+
+    // Part B: pinned 40-char commit SHA
+    const cSha = await alpineImg.createContainer({
+      gitRepo: { repo: gitServer.repoUrl("acme/shell-proj"), ref: T3_PINNED_SHA },
+      cmd: ["/bin/sh", "-c", "pwd && test ! -d /workspace/shell-proj-a1b2c3d4 && ./bin/check.sh"],
+      tty: false,
+    });
+    await cSha.start();
+    try {
+      const resSha = await waitWithTimeout(cSha.wait(), 90000, "T3.10 pinned SHA");
+      assert.equal(resSha.exitCode, 0, `Pinned SHA failed (stderr: ${resSha.stderr})`);
+      const outSha = stripAnsi(resSha.stdout);
+      assertIncludes(outSha, "/workspace");
+      assertIncludes(outSha, "SHELL_TEST_PASS:sha:99");
+      assertIncludes(outSha, "pinned-sha-v1");
+      assertNotIncludes(outSha, "branch-main-v2");
+    } finally {
+      await cSha.stop().catch(() => {});
+    }
+  });
+
+  suite.add("T3.11", "python:3.12-slim + synthetic Python project git repo overlay running unittest discover in /workspace", async () => {
+    const pyImg = await getPython();
+    const container = await pyImg.createContainer({
+      gitRepo: { repo: gitServer.repoUrl("acme/py-mathlib"), ref: "v1.0.0" },
+      cmd: ["python3", "-m", "unittest", "discover", "-s", "tests", "-v"],
+      tty: false,
+    });
+    await container.start();
+    try {
+      const res = await waitWithTimeout(container.wait(), 120000, "T3.11 python unittest discover");
+      assert.equal(res.exitCode, 0, `Python unittest failed (stdout: ${res.stdout}\nstderr: ${res.stderr})`);
+      const combined = stripAnsi(`${res.stdout}\n${res.stderr}`);
+      assertMatch(combined, /Ran 3 tests in/);
+      assertMatch(combined, /(?:^|\n)OK(?:\n|$)/);
+      assertIncludes(combined, "test_cwd_workspace");
+    } finally {
+      await container.stop().catch(() => {});
+    }
+  });
+
+  suite.add("T3.12", "node:22-slim + synthetic JavaScript project git repo overlay running node --test in /workspace", async () => {
+    const nodeImg = await getNode();
+    const container = await nodeImg.createContainer({
+      gitRepo: { repo: gitServer.repoUrl("acme/js-toolkit"), ref: "main" },
+      cmd: ["node", "--test", "--experimental-test-isolation=none", "test/index.test.mjs"],
+      tty: false,
+    });
+    await container.start();
+    try {
+      const res = await waitWithTimeout(container.wait(), 180000, "T3.12 node --test");
+      assert.equal(res.exitCode, 0, `Node test failed (stdout: ${res.stdout}\nstderr: ${res.stderr})`);
+      const combined = stripAnsi(`${res.stdout}\n${res.stderr}`);
+      assertMatch(combined, /tests 3/);
+      assertMatch(combined, /pass 3/);
+      assertMatch(combined, /fail 0/);
+    } finally {
+      await container.stop().catch(() => {});
+    }
+  });
+
+  suite.add("T3.13", "Git repo overlay + custom mountPath + env/cmd overrides + host readFile/writeFile + zero /workspace bleed", async () => {
+    const alpineImg = await docker.pullImage(registry.imageRef("library/alpine", "latest"));
+
+    // Part A: Overlaid container with custom mountPath, env, and host writeFile/readFile
+    const c1 = await alpineImg.createContainer({
+      gitRepo: {
+        repo: gitServer.repoUrl("acme/shell-proj"),
+        ref: "main",
+        mountPath: "/opt/myrepo",
+      },
+      env: ["CUSTOM_TAG=OVERLAY_77"],
+      cmd: [
+        "/bin/sh",
+        "-c",
+        'printf "PWD=%s\\nENV=%s\\nVER=%s\\nHOST=%s\\n" "$PWD" "$CUSTOM_TAG" "$(cat version.txt)" "$(cat /opt/myrepo/host_in.txt)" > /opt/myrepo/result.out && cat /opt/myrepo/result.out',
+      ],
+      tty: false,
+    });
+    await c1.writeFile("/opt/myrepo/host_in.txt", "FROM_HOST_99");
+    await c1.start();
+    try {
+      const r1 = await waitWithTimeout(c1.wait(), 90000, "T3.13 Part A overlaid container");
+      assert.equal(r1.exitCode, 0, `Part A failed (stderr: ${r1.stderr})`);
+      const out1 = stripAnsi(r1.stdout);
+      assertIncludes(out1, "PWD=/opt/myrepo");
+      assertIncludes(out1, "ENV=OVERLAY_77");
+      assertIncludes(out1, "VER=branch-main-v2");
+      assertIncludes(out1, "HOST=FROM_HOST_99");
+
+      const verBytes = await c1.readFile("/opt/myrepo/version.txt");
+      assert.ok(verBytes instanceof Uint8Array);
+      assert.equal(new TextDecoder().decode(verBytes), "branch-main-v2\n");
+
+      const resBytes = await c1.readFile("/opt/myrepo/result.out");
+      assert.ok(resBytes instanceof Uint8Array);
+      assertIncludes(new TextDecoder().decode(resBytes), "HOST=FROM_HOST_99");
+    } finally {
+      await c1.stop().catch(() => {});
+    }
+
+    // Part B: Plain container on same alpineImg with NO gitRepo must have zero VFS/env bleed
+    const c2 = await alpineImg.createContainer({
+      cmd: [
+        "/bin/sh",
+        "-c",
+        'test ! -e /workspace && test ! -e /opt/myrepo && test -z "$CUSTOM_TAG" && echo ISOLATION_CLEAN',
+      ],
+      tty: false,
+    });
+    await c2.start();
+    try {
+      const r2 = await waitWithTimeout(c2.wait(), 90000, "T3.13 Part B plain container isolation");
+      assert.equal(r2.exitCode, 0, `Part B isolation failed (stderr: ${r2.stderr})`);
+      assertIncludes(stripAnsi(r2.stdout), "ISOLATION_CLEAN");
+      assert.equal(await c2.readFile("/opt/myrepo/version.txt"), null);
+      assert.equal(await c2.readFile("/workspace/version.txt"), null);
+    } finally {
+      await c2.stop().catch(() => {});
+    }
+  });
+
     return await suite.run(opts);
   } finally {
     if (server) await server.close();
+    if (gitServer) await gitServer.close();
     if (registry) await registry.close();
   }
 }

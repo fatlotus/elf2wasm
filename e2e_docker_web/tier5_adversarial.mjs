@@ -915,6 +915,570 @@ export async function runTier5(opts = {}) {
     }
   );
 
+  // -------------------------------------------------------------------------
+  // T5.15 (M13-ChalA): Obfuscated SSRF matrix on /api/git/archive, #fragment stripping (BUG-A1),
+  //                    and Worker Vary: Origin cache-poisoning protection (BUG-A2)
+  // -------------------------------------------------------------------------
+  suite.add(
+    "T5.15",
+    "M13-ChalA: /api/git/archive blocks obfuscated IPv4/IPv6/metadata SSRF, strips #fragment (BUG-A1), and emits Vary: Origin (BUG-A2)",
+    async () => {
+      const ssrfTargets = [
+        "https://0x7f000001/a/b",
+        "https://2130706433/a/b",
+        "https://2852039166/a/b",
+        "https://0177.0.0.1/a/b",
+        "https://127.1/a/b",
+        "https://0/a/b",
+        "https://[64:ff9b::169.254.169.254]/a/b",
+        "https://[2002:7f00:1::]/a/b",
+        "https://metadata.google.internal./a/b",
+        "https://sub.localhost./a/b",
+        "http://user:pass@127.0.0.1:8080/a/b",
+      ];
+      for (const target of ssrfTargets) {
+        const res = await fetch(
+          `${hardenedServer.url}/api/git/archive?repo=${encodeURIComponent(target)}&ref=main`
+        );
+        assert.equal(res.status, 403, `Expected 403 for SSRF ${target}, got ${res.status}`);
+        assert.equal(res.headers.get("cross-origin-opener-policy"), "same-origin");
+        assert.equal(res.headers.get("cross-origin-embedder-policy"), "require-corp");
+        assert.equal(res.headers.get("cross-origin-resource-policy"), "same-origin");
+        assert.equal(res.headers.get("x-content-type-options"), "nosniff");
+      }
+
+      // BUG-A1 & BUG-A2 in Cloudflare Worker handler
+      const { createWorkerHandler } = await import(
+        pathToFileURL(path.join(REPO_ROOT, "worker", "src", "index.mjs")).href
+      );
+      const seenUrls = [];
+      const fakeGz = new Uint8Array([0x1f, 0x8b, 0x08, 0x00, 0x01, 0x02]);
+      const worker = createWorkerHandler({
+        allowedOrigins: "https://app.example.com",
+        fetchImpl: async (url) => {
+          seenUrls.push(String(url));
+          return new Response(fakeGz, { status: 200 });
+        },
+      });
+
+      const rFrag1 = await worker.fetch(
+        new Request("https://elf2wasm.workers.dev/api/git/archive?repo=octocat/Hello-World#frag")
+      );
+      assert.equal(rFrag1.status, 200);
+      assert.equal(seenUrls[0], "https://github.com/octocat/Hello-World/archive/HEAD.tar.gz");
+      assert.equal(
+        rFrag1.headers.get("vary"),
+        "Origin",
+        "BUG-A2: Vary: Origin must be emitted even without Origin header when ALLOWED_ORIGINS is set"
+      );
+
+      const rFrag2 = await worker.fetch(
+        new Request(
+          "https://elf2wasm.workers.dev/api/git/archive?repo=octocat/Hello-World&ref=main#frag"
+        )
+      );
+      assert.equal(rFrag2.status, 200);
+      assert.equal(seenUrls[1], "https://github.com/octocat/Hello-World/archive/main.tar.gz");
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // T5.16 (M13-ChalA): Adversarial redirects (BUG-A4), 204/206 -> 502 (BUG-A3),
+  //                    Retry-After sanitization, invalid strip-components & HEAD parity
+  // -------------------------------------------------------------------------
+  suite.add(
+    "T5.16",
+    "M13-ChalA: /api/git/archive blocks adversarial redirects (BUG-A4), rejects 204/206 as 502 (BUG-A3), sanitizes headers & enforces HEAD parity",
+    async () => {
+      const { createGitArchiveTarGz } = await import(
+        pathToFileURL(path.join(REPO_ROOT, "server", "mock_git_server.mjs")).href
+      );
+      const { gzipBytes } = createGitArchiveTarGz([{ path: "ok.txt", content: "hi\n" }], {
+        rootDir: "repo-main",
+      });
+
+      const advUpstream = http.createServer((req, res) => {
+        const u = req.url || "";
+        if (u.includes("/archive/http-evil.tar.gz")) {
+          res.writeHead(302, { Location: "http://evil.example/archive.tar.gz" });
+          res.end();
+        } else if (u.includes("/archive/proto-rel.tar.gz")) {
+          res.writeHead(302, { Location: "//169.254.169.254/latest/meta-data" });
+          res.end();
+        } else if (u.includes("/archive/file-redir.tar.gz")) {
+          res.writeHead(302, { Location: "file:///etc/passwd" });
+          res.end();
+        } else if (u.includes("/archive/ftp-redir.tar.gz")) {
+          res.writeHead(302, { Location: "ftp://evil.example/a.tar.gz" });
+          res.end();
+        } else if (u.includes("/archive/creds-redir.tar.gz")) {
+          res.writeHead(302, { Location: "https://user:pass@codeload.github.com/a/b" });
+          res.end();
+        } else if (u.includes("/archive/v4mapped-redir.tar.gz")) {
+          res.writeHead(302, { Location: "http://[::ffff:127.0.0.1]/secret" });
+          res.end();
+        } else if (u.includes("/archive/no-loc.tar.gz")) {
+          res.writeHead(302);
+          res.end();
+        } else if (u.includes("/archive/status-204.tar.gz")) {
+          res.writeHead(204);
+          res.end();
+        } else if (u.includes("/archive/status-206.tar.gz")) {
+          res.writeHead(206, { "Content-Type": "application/gzip" });
+          res.end(gzipBytes.subarray(0, 4));
+        } else if (u.includes("/archive/rate-unsafe.tar.gz")) {
+          res.writeHead(429, { "Retry-After": "9".repeat(80) });
+          res.end("rate limited");
+        } else if (u.includes("/archive/bad-strip.tar.gz")) {
+          res.writeHead(200, {
+            "Content-Type": "application/gzip",
+            "Content-Length": String(gzipBytes.length),
+            "X-Git-Strip-Components": "99",
+          });
+          res.end(gzipBytes);
+        } else {
+          res.writeHead(404);
+          res.end("not found");
+        }
+      });
+
+      await new Promise((resolve) => advUpstream.listen(0, "127.0.0.1", resolve));
+      const advPort = advUpstream.address().port;
+      const repoUrl = `http://127.0.0.1:${advPort}/org/adv`;
+
+      try {
+        // BUG-A4 & redirect targets -> immediate 403
+        for (const ref of [
+          "http-evil",
+          "proto-rel",
+          "file-redir",
+          "ftp-redir",
+          "creds-redir",
+          "v4mapped-redir",
+        ]) {
+          const r = await fetch(
+            `${localServer.url}/api/git/archive?repo=${encodeURIComponent(repoUrl)}&ref=${ref}`
+          );
+          assert.equal(r.status, 403, `Expected 403 for ${ref}, got ${r.status}`);
+        }
+
+        // Missing Location -> 502; 204/206 -> 502 (BUG-A3)
+        for (const ref of ["no-loc", "status-204", "status-206"]) {
+          const r = await fetch(
+            `${localServer.url}/api/git/archive?repo=${encodeURIComponent(repoUrl)}&ref=${ref}`
+          );
+          assert.equal(r.status, 502, `Expected 502 for ${ref}, got ${r.status}`);
+        }
+
+        // Unsafe Retry-After omitted
+        const r429 = await fetch(
+          `${localServer.url}/api/git/archive?repo=${encodeURIComponent(repoUrl)}&ref=rate-unsafe`
+        );
+        assert.equal(r429.status, 429);
+        assert.equal(r429.headers.get("retry-after"), null);
+
+        // Invalid X-Git-Strip-Components -> fallback 1
+        const rStrip = await fetch(
+          `${localServer.url}/api/git/archive?repo=${encodeURIComponent(repoUrl)}&ref=bad-strip`
+        );
+        assert.equal(rStrip.status, 200);
+        assert.equal(rStrip.headers.get("x-git-strip-components"), "1");
+
+        // HEAD parity on 400, 403, 404, 429, 502
+        for (const [q, expected] of [
+          ["", 400],
+          [`?repo=${encodeURIComponent("https://169.254.169.254/a/b")}`, 403],
+          [`?repo=${encodeURIComponent(repoUrl)}&ref=missing`, 404],
+          [`?repo=${encodeURIComponent(repoUrl)}&ref=rate-unsafe`, 429],
+          [`?repo=${encodeURIComponent(repoUrl)}&ref=status-204`, 502],
+        ]) {
+          const r = await fetch(`${localServer.url}/api/git/archive${q}`, { method: "HEAD" });
+          assert.equal(r.status, expected, `HEAD /api/git/archive${q}`);
+          assert.ok(Number(r.headers.get("content-length")) > 0);
+          assert.equal(await r.text(), "");
+        }
+      } finally {
+        await new Promise((resolve) => advUpstream.close(resolve));
+      }
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // T5.17 (M13-ChalB): Negative tar entry size DoS guard (BUG-B1), PAX/GNU traversal,
+  //                    and negative/NaN/huge stripComponents
+  // -------------------------------------------------------------------------
+  suite.add(
+    "T5.17",
+    "M13-ChalB: extractTarToVfs rejects negative tar sizes (BUG-B1), blocks PAX/GNU path traversal, and clamps invalid stripComponents",
+    async () => {
+      const { extractTarToVfs } = await import(
+        pathToFileURL(path.join(REPO_ROOT, "js", "elf2wasm_shim.mjs")).href
+      );
+      const enc = new TextEncoder();
+
+      function makeNegSizeTar(mutateSize) {
+        const buf = new Uint8Array(1536);
+        buf.set(enc.encode("repo-main/dos.txt"), 0);
+        buf.set(enc.encode("0000644\0"), 100);
+        mutateSize(buf);
+        buf[156] = "0".charCodeAt(0);
+        buf.set(enc.encode("ustar\0"), 257);
+        buf.set(enc.encode("00"), 263);
+        return buf;
+      }
+
+      const octalNeg = makeNegSizeTar((b) => b.set(enc.encode("-1000\0"), 124));
+      assert.equal(
+        extractTarToVfs(octalNeg, { mountPath: "/workspace", stripComponents: 1 }).files.size,
+        0
+      );
+
+      const base256Neg = makeNegSizeTar((b) => {
+        for (let i = 124; i < 134; i++) b[i] = 0xff;
+        b[134] = 0xfe;
+        b[135] = 0x00;
+      });
+      assert.equal(
+        extractTarToVfs(base256Neg, { mountPath: "/workspace", stripComponents: 1 }).files.size,
+        0
+      );
+
+      // PAX x and GNU L traversal attempt
+      function hdr(name, typeFlag, size) {
+        const b = new Uint8Array(512);
+        b.set(enc.encode(name).subarray(0, 100), 0);
+        b.set(enc.encode("0000644\0"), 100);
+        b.set(enc.encode(size.toString(8).padStart(11, "0") + "\0"), 124);
+        b[156] = typeFlag.charCodeAt(0);
+        b.set(enc.encode("ustar\0"), 257);
+        b.set(enc.encode("00"), 263);
+        return b;
+      }
+      function pad(bytes) {
+        const out = new Uint8Array(Math.ceil(bytes.length / 512) * 512);
+        out.set(bytes);
+        return out;
+      }
+      const paxBody = "path=repo-main/../../etc/escape_pax\n";
+      const paxRec = enc.encode(`${paxBody.length + 3} ${paxBody}`);
+      const gnuLong = enc.encode("repo-main/../../etc/escape_gnu\0");
+      const safe = enc.encode("ok");
+      const parts = [
+        hdr("pax", "x", paxRec.length),
+        pad(paxRec),
+        hdr("p1", "0", 2),
+        pad(safe),
+        hdr("././@LongLink", "L", gnuLong.length),
+        pad(gnuLong),
+        hdr("p2", "0", 2),
+        pad(safe),
+        hdr("repo-main/good.txt", "0", 2),
+        pad(safe),
+        new Uint8Array(1024),
+      ];
+      const tar = new Uint8Array(parts.reduce((s, p) => s + p.length, 0));
+      let off = 0;
+      for (const p of parts) {
+        tar.set(p, off);
+        off += p.length;
+      }
+
+      const res = extractTarToVfs(tar, { mountPath: "/workspace", stripComponents: 1 });
+      assert.equal(res.files.has("/etc/escape_pax"), false);
+      assert.equal(res.files.has("/etc/escape_gnu"), false);
+      assert.ok(res.files.has("/workspace/good.txt"));
+      assert.ok(
+        extractTarToVfs(tar, { mountPath: "/workspace", stripComponents: -3 }).files.has(
+          "/workspace/repo-main/good.txt"
+        )
+      );
+      assert.ok(
+        extractTarToVfs(tar, { mountPath: "/workspace", stripComponents: Number.NaN }).files.has(
+          "/workspace/repo-main/good.txt"
+        )
+      );
+      assert.equal(
+        extractTarToVfs(tar, { mountPath: "/workspace", stripComponents: 500 }).files.size,
+        0
+      );
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // T5.18 (M13-ChalB): fetchGitArchive abort during git-decompress (BUG-B2),
+  //                    direct err.code fast-fail (BUG-B6), bad strip header & query base
+  // -------------------------------------------------------------------------
+  suite.add(
+    "T5.18",
+    "M13-ChalB: fetchGitArchive aborts during git-decompress (BUG-B2), fails fast on direct err.code (BUG-B6) & normalizes headers",
+    async () => {
+      const { fetchGitArchive } = await import(
+        pathToFileURL(path.join(REPO_ROOT, "js", "git_client.mjs")).href
+      );
+      const { createGitArchiveTarGz } = await import(
+        pathToFileURL(path.join(REPO_ROOT, "server", "mock_git_server.mjs")).href
+      );
+      const { gzipBytes } = createGitArchiveTarGz([{ path: "a.txt", content: "hello\n" }], {
+        rootDir: "r-main",
+      });
+
+      // Abort during git-decompress
+      const ac = new AbortController();
+      let abortErr = null;
+      try {
+        await fetchGitArchive({
+          repo: "acme/demo",
+          ref: "main",
+          gitProxyBase: `${localServer.url}/api/git/archive`,
+          signal: ac.signal,
+          onProgress: (ev) => {
+            if (ev.stage === "git-decompress") ac.abort();
+          },
+          fetchImpl: async () => new Response(gzipBytes, { status: 200 }),
+        });
+      } catch (e) {
+        abortErr = e;
+      }
+      assert.ok(abortErr && abortErr.name === "AbortError", "Expected AbortError after git-decompress abort");
+
+      // Direct err.code = "ECONNREFUSED" fails fast (1 attempt)
+      let calls = 0;
+      let directErr = null;
+      try {
+        await fetchGitArchive({
+          repo: "acme/demo",
+          ref: "main",
+          gitProxyBase: `${localServer.url}/api/git/archive`,
+          fetchImpl: async () => {
+            calls++;
+            const e = new TypeError("fetch failed");
+            e.code = "ECONNREFUSED";
+            throw e;
+          },
+        });
+      } catch (e) {
+        directErr = e;
+      }
+      assert.equal(calls, 1, "Direct err.code=ECONNREFUSED must not retry");
+      assertIncludes(String(directErr?.message || ""), "ECONNREFUSED");
+
+      // Bad X-Git-Strip-Components falls back to 1
+      const resBad = await fetchGitArchive({
+        repo: "acme/demo",
+        ref: "main",
+        gitProxyBase: `${localServer.url}/api/git/archive/?existing=1`,
+        fetchImpl: async (url) => {
+          assertIncludes(String(url), "existing=1&repo=acme%2Fdemo&ref=main");
+          return new Response(gzipBytes, {
+            status: 200,
+            headers: { "X-Git-Strip-Components": "NaN" },
+          });
+        },
+      });
+      assert.equal(resBad.stripComponents, 1);
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // T5.19 (M13-ChalB): createContainer + dispose() race leaks zero containers (BUG-B2),
+  //                    WorkerBackend null parity (BUG-B5), and combined gitRepo + overlayTarBytes
+  // -------------------------------------------------------------------------
+  suite.add(
+    "T5.19",
+    "M13-ChalB: createContainer+dispose() race leaks zero containers (BUG-B2), WorkerBackend null parity (BUG-B5) & combined overlays",
+    async () => {
+      const { ContainerEngine } = sdk;
+      const { createMockGitServer, createGitArchiveTarGz } = await import(
+        pathToFileURL(path.join(REPO_ROOT, "server", "mock_git_server.mjs")).href
+      );
+      const { gzipBytes } = createGitArchiveTarGz([{ path: "a.txt", content: "v1\n" }], {
+        rootDir: "r-main",
+      });
+
+      // 1. createContainer + dispose() race
+      let arrived;
+      const arrivedP = new Promise((r) => (arrived = r));
+      let release;
+      const gate = new Promise((r) => (release = r));
+      const slowProxy = http.createServer(async (_req, res) => {
+        arrived();
+        await gate;
+        res.writeHead(200, { "Content-Type": "application/gzip" });
+        res.end(gzipBytes);
+      });
+      await new Promise((r) => slowProxy.listen(0, "127.0.0.1", r));
+
+      const eng = new ContainerEngine();
+      await eng.init({
+        compilerWasm: fs.readFileSync(REQUIRED_ARTIFACTS.compilerWasm),
+        runtimeWasm: fs.readFileSync(REQUIRED_ARTIFACTS.runtimeWasm),
+      });
+      try {
+        const imgMeta = await eng.loadOciTarball(new Uint8Array(1024), { name: "local/r:latest" });
+        const createP = eng.createContainer(imgMeta.imageId, {
+          gitRepo: {
+            repo: "acme/demo",
+            ref: "main",
+            gitProxyBase: `http://127.0.0.1:${slowProxy.address().port}/api/git/archive`,
+          },
+        });
+        await arrivedP;
+        await eng.dispose();
+        release();
+        let threwDisposed = false;
+        try {
+          await createP;
+        } catch (err) {
+          threwDisposed = /disposed/i.test(String(err.message));
+        }
+        assert.equal(threwDisposed, true, "createContainer must reject when engine is disposed mid-fetch");
+        assert.equal(eng.containers.size, 0, "Disposed engine must retain 0 containers");
+      } finally {
+        await eng.dispose();
+        await new Promise((r) => slowProxy.close(r));
+      }
+
+      // 2. Live container with combined gitRepo + overlayTarBytes precedence
+      const mockGit = createMockGitServer();
+      mockGit.addRepo("acme/live", "main", [
+        { path: "file.txt", content: "FROM_GIT\n" },
+        { path: "git_only.txt", content: "GIT_ONLY\n" },
+      ]);
+      await mockGit.start();
+      try {
+        const overlayGz = createGitArchiveTarGz(
+          [{ path: "file.txt", content: "FROM_OVERLAY\n" }],
+          { rootDir: null }
+        ).gzipBytes;
+        const img = await getAlpine();
+        const c = await img.createContainer({
+          gitRepo: {
+            repo: `${mockGit.url}/acme/live`,
+            ref: "main",
+            mountPath: "/workspace/",
+            gitProxyBase: `${localServer.url}/api/git/archive`,
+          },
+          overlayTarBytes: overlayGz,
+          overlayMountPath: "/workspace",
+          overlayStripComponents: 0,
+          cmd: ["/bin/sh", "-c", "pwd && cat file.txt && cat git_only.txt"],
+          tty: false,
+        });
+        await c.start();
+        const res = await c.wait();
+        assert.equal(res.exitCode, 0, `stderr=${res.stderr}`);
+        assertIncludes(res.stdout, "/workspace");
+        assertIncludes(res.stdout, "FROM_OVERLAY");
+        assertIncludes(res.stdout, "GIT_ONLY");
+        await c.stop();
+      } finally {
+        await mockGit.stop();
+      }
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // T5.20 (M13-ChalB): Headless Chrome UI adversarial tests — mid-boot preset TOCTOU race (BUG-B3),
+  //                    XSS safety in #terminal-title/#status-text, and splitShellArgs double-quote escapes (BUG-B4)
+  // -------------------------------------------------------------------------
+  suite.add(
+    "T5.20",
+    "M13-ChalB: Chrome UI resists mid-boot preset TOCTOU race (BUG-B3), XSS in repo/ref inputs, and preserves double-quote escapes (BUG-B4)",
+    async () => {
+      const browser = await launchCdpBrowser();
+      try {
+        await browser.navigate(`${localServer.url}/`);
+
+        // 1. BUG-B3: Mid-boot preset click TOCTOU race
+        // Intercept pullImage so while alpine:latest is pulling, we click the python-bottle project preset.
+        // The in-flight boot MUST NOT receive python-bottle's gitRepo or cmd!
+        await browser.evaluate(`(async () => {
+          const { Elf2WasmDocker } = await import("/js/docker_sdk.mjs");
+          window.__t5_toctou = { createOpts: null };
+          const origCreate = Elf2WasmDocker.create;
+          Elf2WasmDocker.create = async (opts) => {
+            return await origCreate.call(Elf2WasmDocker, { ...opts, useWorker: false });
+          };
+          const origPull = Elf2WasmDocker.prototype.pullImage;
+          Elf2WasmDocker.prototype.pullImage = async function (...args) {
+            const img = await origPull.apply(this, args);
+            // Simulate user clicking python-bottle project preset mid-pull (does not auto-start)
+            const presetBtn = document.querySelector('.project-preset-chip[data-preset="python-bottle"]');
+            if (presetBtn) presetBtn.click();
+            const origCC = img.createContainer.bind(img);
+            img.createContainer = async (ccOpts) => {
+              window.__t5_toctou.createOpts = {
+                cmd: ccOpts?.cmd || null,
+                cwd: ccOpts?.cwd || null,
+                gitRepo: ccOpts?.gitRepo || null,
+              };
+              return await origCC(ccOpts);
+            };
+            return img;
+          };
+        })()`);
+
+        await browser.setInputValue("#image-input", registry.imageRef("library/alpine", "latest"));
+        await browser.setInputValue("#repo-input", "");
+        await browser.setInputValue("#cmd-input", 'sh -c "printf \'LINE1\\nLINE2\\tTAB\\n\'"');
+        await browser.click("#start-btn");
+
+        await waitFor(
+          async () => {
+            const text = await browser.getText("#terminal");
+            return (
+              text.includes("LINE1") &&
+              text.includes("LINE2") &&
+              text.includes("TAB") &&
+              !text.includes("LINE1nLINE2")
+            );
+          },
+          { timeoutMs: 30000, description: "in-flight alpine boot with BUG-B4 double-quote escapes" }
+        );
+
+        const toctou = await browser.evaluate("window.__t5_toctou.createOpts");
+        assert.equal(
+          toctou.gitRepo,
+          null,
+          `BUG-B3: mid-pull preset click must NOT inject gitRepo into in-flight boot, got ${JSON.stringify(toctou)}`
+        );
+        assert.deepEqual(
+          toctou.cmd,
+          ["sh", "-c", "printf 'LINE1\\nLINE2\\tTAB\\n'"],
+          `BUG-B4: splitShellArgs must preserve \\n and \\t inside double quotes, got ${JSON.stringify(toctou.cmd)}`
+        );
+
+        // 2. XSS / DOM injection safety in #terminal-title and #status-text
+        await browser.evaluate("window.__xss = 0");
+        const xssPayload = '<img src=x onerror="window.__xss=1">';
+        await browser.setInputValue("#image-input", registry.imageRef("library/alpine", "latest"));
+        await browser.setInputValue("#repo-input", xssPayload);
+        await browser.setInputValue("#repo-ref-input", xssPayload);
+        await browser.setInputValue("#cmd-input", "/bin/true");
+        await browser.click("#start-btn");
+
+        await waitFor(
+          async () => {
+            const status = await browser.getText("#status-text");
+            return /error|failed|invalid|400|403/i.test(status);
+          },
+          { timeoutMs: 15000, description: "XSS repo input rejected cleanly" }
+        );
+
+        const xssCheck = await browser.evaluate(`({
+          xssFlag: window.__xss,
+          injectedImgs: document.querySelectorAll('#terminal-title img, #status-text img').length,
+          titleText: document.getElementById('terminal-title')?.textContent || '',
+        })`);
+        assert.equal(xssCheck.xssFlag, 0, "XSS payload must never execute");
+        assert.equal(xssCheck.injectedImgs, 0, "XSS payload must never inject DOM elements");
+        assertIncludes(xssCheck.titleText, "<img");
+      } finally {
+        await browser.close();
+      }
+    }
+  );
+
   try {
     return await suite.run(opts);
   } finally {

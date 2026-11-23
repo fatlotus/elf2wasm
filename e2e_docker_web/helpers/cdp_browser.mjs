@@ -398,6 +398,13 @@ export async function launchCdpBrowser(opts = {}) {
       );
     }
 
+    async function getInputValue(selector) {
+      return evaluate(
+        `document.querySelector(${JSON.stringify(selector)})?.value ?? ""`,
+        { awaitPromise: false }
+      );
+    }
+
     async function getText(selector) {
       return evaluate(
         `(() => {
@@ -489,6 +496,34 @@ export async function launchCdpBrowser(opts = {}) {
       );
     }
 
+    async function getProjectPresetChips() {
+      return evaluate(
+        `Array.from(document.querySelectorAll(".project-presets-row .project-preset-chip[data-preset], .project-preset-chip[data-preset]")).map((el) => ({
+          preset: el.dataset.preset || "",
+          language: el.dataset.language || "",
+          text: (el.textContent || "").trim(),
+        }))`,
+        { awaitPromise: false }
+      );
+    }
+
+    async function clickProjectPresetChip(presetId) {
+      const selector = `button.project-preset-chip[data-preset=${JSON.stringify(presetId)}]`;
+      await click(selector);
+      return evaluate(
+        `({
+          image: document.querySelector("#image-input")?.value ?? "",
+          repo: document.querySelector("#repo-input")?.value ?? "",
+          ref: document.querySelector("#repo-ref-input")?.value ?? "",
+          mountPath: document.querySelector("#repo-mount-input")?.value ?? "",
+          cmd: document.querySelector("#cmd-input")?.value ?? "",
+          cwd: document.querySelector("#cwd-input")?.value ?? "",
+          env: document.querySelector("#env-input")?.value ?? "",
+        })`,
+        { awaitPromise: false }
+      );
+    }
+
     async function waitForTerminalText(matcher, waitOpts = {}) {
       const {
         timeoutMs = 90000,
@@ -563,11 +598,14 @@ export async function launchCdpBrowser(opts = {}) {
       waitForSelector,
       click,
       setInputValue,
+      getInputValue,
       getText,
       focusSelector,
       typeIntoTerminal,
       getPresetChips,
       clickPresetChip,
+      getProjectPresetChips,
+      clickProjectPresetChip,
       waitForTerminalText,
       sendControlKey,
       clearLogs() {

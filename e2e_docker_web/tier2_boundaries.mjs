@@ -14,20 +14,48 @@ import {
   Suite,
 } from "./helpers/test_runner.mjs";
 import { startMockOciRegistry } from "./helpers/mock_oci_registry.mjs";
-import { REQUIRED_ARTIFACTS, startServer } from "./helpers/server_harness.mjs";
+import { startMockGitServer } from "./helpers/mock_git_server.mjs";
+import { createTar } from "./helpers/tar_builder.mjs";
+import { REQUIRED_ARTIFACTS, getFreePort, startServer } from "./helpers/server_harness.mjs";
 
 export async function runTier2(opts = {}) {
   const sdk = await import(pathToFileURL(REQUIRED_ARTIFACTS.dockerSdk).href);
   const { Elf2WasmDocker, parseImageRef } = sdk;
 
   const registry = await startMockOciRegistry({ requireAuth: true, redirectBlobs: true });
+  const gitServer = await startMockGitServer({ redirectArchives: true });
   const hardenedServer = await startServer({ allowLocalRegistries: false });
   const localServer = await startServer({ allowLocalRegistries: true });
+
+  const BINARY_BLOB = Uint8Array.from({ length: 4096 }, (_, i) => (i * 31 + 7) & 0xff);
+  const UTF8_TEXT = "café 日本語 🚀\n";
+
+  gitServer.addRepo("testorg/demo", {
+    main: [
+      { path: "demo-main/", type: "dir", mode: 0o755 },
+      { path: "demo-main/README.md", type: "file", content: "DEMO_OK\n" },
+    ],
+    HEAD: [
+      { path: "demo-main/", type: "dir", mode: 0o755 },
+      { path: "demo-main/README.md", type: "file", content: "DEMO_OK\n" },
+    ],
+  });
+
+  gitServer.addRepo("testorg/binutf8", {
+    main: [
+      { path: "binutf8-main/", type: "dir", mode: 0o755 },
+      { path: "binutf8-main/assets/", type: "dir", mode: 0o755 },
+      { path: "binutf8-main/assets/blob.bin", type: "file", content: BINARY_BLOB },
+      { path: "binutf8-main/docs/", type: "dir", mode: 0o755 },
+      { path: "binutf8-main/docs/unicode.txt", type: "file", content: UTF8_TEXT },
+    ],
+  });
 
   const sdkOpts = {
     compilerWasmUrl: `${localServer.url}/wasm/elf2wasm_compiler_wasm.wasm`,
     runtimeWasmUrl: `${localServer.url}/wasm/elf2wasm_runtime_wasm.wasm`,
     registryProxyBase: `${localServer.url}/api/v2`,
+    gitProxyBase: `${localServer.url}/api/git/archive`,
     useWorker: false,
   };
 
@@ -656,11 +684,241 @@ export async function runTier2(opts = {}) {
     }
   });
 
+  // -------------------------------------------------------------------------
+  // Git Repo Overlay Boundaries, Security & Error Handling (F25-F28, §7-§9)
+  // -------------------------------------------------------------------------
+
+  suite.add("T2.22", "Input validation 400 JSON matrix for /api/git/archive (missing/invalid repo & ref)", async () => {
+    gitServer.clearRequests();
+
+    const assert400Json = async (url, label) => {
+      const resp = await fetch(url);
+      assert.equal(resp.status, 400, `${label}: expected 400, got ${resp.status}`);
+      let body;
+      try {
+        body = await resp.json();
+      } catch (err) {
+        assert.fail(`${label}: expected JSON error body, parse failed: ${err.message}`);
+      }
+      assert.equal(typeof body?.error, "string", `${label}: JSON must include string error field`);
+      assert.ok(body.error.length > 0, `${label}: error message must be non-empty`);
+    };
+
+    // 1. Missing repo
+    for (const qs of ["", "?ref=main", "?repo="]) {
+      await assert400Json(`${localServer.url}/api/git/archive${qs}`, `missing repo (${qs || "empty"})`);
+    }
+
+    // 2. Invalid repo specs
+    const badRepos = [
+      "https://user:pass@github.com/owner/repo",
+      "owner/../evil",
+      "https://github.com/owner/../repo",
+      "owner/repo\x00",
+      "owner/repo\n",
+      "http://github.com/owner/repo",
+      "ftp://github.com/owner/repo",
+      "file:///etc/passwd",
+      "javascript:alert(1)",
+    ];
+    for (const repo of badRepos) {
+      const qs = new URLSearchParams({ repo, ref: "main" });
+      await assert400Json(`${localServer.url}/api/git/archive?${qs.toString()}`, `bad repo ${JSON.stringify(repo)}`);
+    }
+
+    // 3. Invalid refs paired with valid local mock repo (zero upstream hits expected)
+    const validRepo = gitServer.repoUrl("testorg/demo");
+    const badRefs = [
+      "main branch",
+      "main\ttab",
+      "main..evil",
+      "../secret",
+      "HEAD~1",
+      "HEAD^",
+      "a:b",
+      "v1?",
+      "v1*",
+      "v1[0]",
+      "a\\b",
+      "-main",
+      "--upload-pack=x",
+      "/main",
+      "main/",
+      "a".repeat(256),
+      "main\x00",
+      "main\n",
+    ];
+    for (const ref of badRefs) {
+      const qs = new URLSearchParams({ repo: validRepo, ref });
+      await assert400Json(`${localServer.url}/api/git/archive?${qs.toString()}`, `bad ref ${JSON.stringify(ref)}`);
+    }
+
+    assert.equal(gitServer.getRequests().length, 0, "Invalid repo/ref requests must be rejected before hitting upstream");
+  });
+
+  suite.add("T2.23", "SSRF 403 matrix on hardened /api/git/archive blocks loopback, private & link-local hosts", async () => {
+    gitServer.clearRequests();
+
+    const blockedRepos = [
+      "https://127.0.0.1/org/repo",
+      "https://[::1]/org/repo",
+      "https://localhost/org/repo",
+      "https://169.254.169.254/org/repo",
+      "https://10.0.0.1/org/repo",
+      "https://192.168.1.1/org/repo",
+      gitServer.repoUrl("testorg/demo"),
+    ];
+
+    for (const repo of blockedRepos) {
+      const qs = new URLSearchParams({ repo, ref: "main" });
+      const resp = await fetch(`${hardenedServer.url}/api/git/archive?${qs.toString()}`);
+      assert.equal(resp.status, 403, `Hardened server must block ${repo} with 403, got ${resp.status}`);
+      const body = await resp.json();
+      assert.equal(typeof body?.error, "string", `403 response for ${repo} must include JSON error string`);
+    }
+
+    assert.equal(gitServer.getRequests().length, 0, "No SSRF request may reach local mock git server");
+  });
+
+  suite.add("T2.24", "Upstream error propagation (404, 429, 502 JSON) on /api/git/archive and SDK rejection", async () => {
+    const assertErrorStatus = async (repoUrl, ref, expectedStatus, label) => {
+      const qs = new URLSearchParams({ repo: repoUrl, ref });
+      const resp = await fetch(`${localServer.url}/api/git/archive?${qs.toString()}`);
+      assert.equal(resp.status, expectedStatus, `${label}: expected ${expectedStatus}, got ${resp.status}`);
+      const body = await resp.json();
+      assert.equal(typeof body?.error, "string", `${label}: expected JSON { error }`);
+      assert.ok(body.error.length > 0, `${label}: error string must be non-empty`);
+    };
+
+    await assertErrorStatus(gitServer.repoUrl("testorg/doesnotexist"), "main", 404, "unknown repo");
+    await assertErrorStatus(gitServer.repoUrl("testorg/demo"), "nonexistent-ref-999", 404, "unknown ref");
+    await assertErrorStatus(gitServer.repoUrl("error/ratelimit"), "main", 429, "upstream 429");
+    await assertErrorStatus(gitServer.repoUrl("error/upstream500"), "main", 502, "upstream 500 -> 502");
+
+    const deadPort = await getFreePort();
+    await assertErrorStatus(`http://127.0.0.1:${deadPort}/testorg/demo`, "main", 502, "connection refused -> 502");
+
+    const alpineImg = await getAlpine();
+    await assert.rejects(
+      () =>
+        alpineImg.createContainer({
+          gitRepo: { repo: gitServer.repoUrl("testorg/doesnotexist"), ref: "main" },
+          cmd: ["/bin/sh", "-c", "echo unreachable"],
+          tty: false,
+        }),
+      Error,
+      "createContainer with 404 gitRepo must reject"
+    );
+  });
+
+  suite.add("T2.25", "Tar overlay security: .. path traversal cannot escape mountPath & stripComponents skips root-only entries", async () => {
+    const alpineImg = await getAlpine();
+    const evilTar = createTar([
+      { path: "repo-main/", type: "dir", mode: 0o755 },
+      { path: "root_only_file.txt", type: "file", content: "SHOULD_BE_SKIPPED\n" },
+      { path: "repo-main/../../etc/escaped_pwn.txt", type: "file", content: "PWN\n" },
+      { path: "repo-main/sub/../../../tmp/escaped_tmp.txt", type: "file", content: "PWN\n" },
+      { path: "repo-main/../../../escaped_root.txt", type: "file", content: "PWN\n" },
+      { path: "repo-main/safe/", type: "dir", mode: 0o755 },
+      { path: "repo-main/safe/ok.txt", type: "file", content: "SAFE_OK\n" },
+    ]);
+
+    const c = await alpineImg.createContainer({
+      overlayTarBytes: evilTar,
+      overlayMountPath: "/workspace",
+      overlayStripComponents: 1,
+      cmd: [
+        "/bin/sh",
+        "-c",
+        [
+          "set -eu",
+          "cat /workspace/safe/ok.txt",
+          "test ! -e /etc/escaped_pwn.txt",
+          "test ! -e /tmp/escaped_tmp.txt",
+          "test ! -e /escaped_root.txt",
+          "test ! -e /root_only_file.txt",
+          "test ! -e /workspace/root_only_file.txt",
+          "echo TRAVERSAL_BLOCKED_OK",
+        ].join(" && "),
+      ],
+      tty: false,
+    });
+    await c.start();
+    try {
+      const res = await waitWithTimeout(c.wait(), 45000, "T2.25 tar overlay traversal guard");
+      assert.equal(res.exitCode, 0, `Traversal check failed (stderr: ${res.stderr})`);
+      const out = stripAnsi(res.stdout);
+      assertIncludes(out, "SAFE_OK");
+      assertIncludes(out, "TRAVERSAL_BLOCKED_OK");
+    } finally {
+      await c.stop().catch(() => {});
+    }
+  });
+
+  suite.add("T2.26", "Tar overlay edge cases: explicit cwd overrides mountPath & binary/UTF-8 byte integrity", async () => {
+    const alpineImg = await getAlpine();
+
+    // 1. Explicit cwd overrides mountPath
+    const c1 = await alpineImg.createContainer({
+      gitRepo: {
+        repo: gitServer.repoUrl("testorg/demo"),
+        ref: "main",
+        mountPath: "/workspace",
+      },
+      cwd: "/tmp",
+      cmd: ["/bin/sh", "-c", 'echo "CWD=$(pwd)|ENV_PWD=$PWD"; cat /workspace/README.md'],
+      tty: false,
+    });
+    await c1.start();
+    try {
+      const r1 = await waitWithTimeout(c1.wait(), 45000, "T2.26 explicit cwd override");
+      assert.equal(r1.exitCode, 0, `Explicit cwd override failed (stderr: ${r1.stderr})`);
+      const out1 = stripAnsi(r1.stdout);
+      assertIncludes(out1, "CWD=/tmp");
+      assertIncludes(out1, "DEMO_OK");
+    } finally {
+      await c1.stop().catch(() => {});
+    }
+
+    // 2. Binary + UTF-8 byte-for-byte integrity across gzip + tar overlay
+    const expectedBlobSha = crypto.createHash("sha256").update(BINARY_BLOB).digest("hex");
+    const expectedUtf8Sha = crypto.createHash("sha256").update(Buffer.from(UTF8_TEXT, "utf8")).digest("hex");
+
+    const c2 = await alpineImg.createContainer({
+      gitRepo: {
+        repo: gitServer.repoUrl("testorg/binutf8"),
+        ref: "main",
+        mountPath: "/workspace",
+      },
+      cmd: ["/bin/sh", "-c", "sha256sum /workspace/assets/blob.bin /workspace/docs/unicode.txt"],
+      tty: false,
+    });
+    await c2.start();
+    try {
+      const r2 = await waitWithTimeout(c2.wait(), 45000, "T2.26 binary+UTF-8 sha256sum");
+      assert.equal(r2.exitCode, 0, `Binary+UTF-8 sha256sum failed (stderr: ${r2.stderr})`);
+      const out2 = stripAnsi(r2.stdout);
+      assertIncludes(out2, expectedBlobSha, "Guest sha256sum for blob.bin must match host SHA-256");
+      assertIncludes(out2, expectedUtf8Sha, "Guest sha256sum for unicode.txt must match host SHA-256");
+
+      const readBlob = await c2.readFile("/workspace/assets/blob.bin");
+      assert.ok(readBlob instanceof Uint8Array, "readFile(blob.bin) must return Uint8Array");
+      assert.equal(Buffer.compare(Buffer.from(readBlob), Buffer.from(BINARY_BLOB)), 0, "blob.bin bytes must match exactly");
+
+      const readUtf8 = await c2.readFile("/workspace/docs/unicode.txt");
+      assert.ok(readUtf8 instanceof Uint8Array, "readFile(unicode.txt) must return Uint8Array");
+      assert.equal(new TextDecoder().decode(readUtf8), UTF8_TEXT, "unicode.txt UTF-8 content must match exactly");
+    } finally {
+      await c2.stop().catch(() => {});
+    }
+  });
+
   try {
     return await suite.run(opts);
   } finally {
     await localServer.close();
     await hardenedServer.close();
+    await gitServer.close();
     await registry.close();
   }
 }

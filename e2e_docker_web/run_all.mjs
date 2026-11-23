@@ -16,7 +16,7 @@ function printHelp() {
 Options:
   --tier <1|2|3|4|all>   Run a specific tier or all tiers sequentially (default: all)
   --self-test            Verify harness infrastructure only (independent of M1-M4)
-  --skip-live            Skip all live Docker Hub Tier 4 scenarios (T4.5, T4.9) for offline runs
+  --skip-live            Skip all live Docker Hub & GitHub Tier 4 scenarios (T4.5, T4.9, T4.12, T4.13) for offline runs
   --verbose              Stream detailed test progress and diagnostics
   --json <file>          Write machine-readable JSON results summary to <file>
   --help                 Print usage and exit 0

@@ -17,6 +17,7 @@ import {
 } from "./helpers/test_runner.mjs";
 import { createTar, createTarGz, parseTarEntries } from "./helpers/tar_builder.mjs";
 import { buildOciImage, startMockOciRegistry } from "./helpers/mock_oci_registry.mjs";
+import { MOCK_SHAS, startMockGitServer } from "./helpers/mock_git_server.mjs";
 import { launchCdpBrowser } from "./helpers/cdp_browser.mjs";
 
 function sha256Digest(bytes) {
@@ -350,6 +351,142 @@ fetch("/worker-ping")
 
     // Verify clean teardown removed userDataDir
     assert.equal(fs.existsSync(userDataDir), false, `Expected Chrome userDataDir ${userDataDir} to be cleaned up`);
+  });
+
+  suite.add("ST-6", "mock_git_server: commit/branch/tag/HEAD, HEAD method, 302 cross-origin auth-stripping, X-Git-Strip-Components, error triggers & tar.gz fixtures", async () => {
+    const gitServer = await startMockGitServer({ redirectArchives: true });
+    try {
+      const fetchEntries = async (urlPath) => {
+        const resp = await fetch(`${gitServer.url}${urlPath}`);
+        assert.equal(resp.status, 200, `Expected 200 for ${urlPath}, got ${resp.status}`);
+        assertIncludes(resp.headers.get("content-type") || "", "application/gzip");
+        const bytes = new Uint8Array(await resp.arrayBuffer());
+        assert.equal(Number(resp.headers.get("content-length")), bytes.byteLength, `Content-Length mismatch for ${urlPath}`);
+        assert.equal(bytes[0], 0x1f, `gzip magic byte 0 for ${urlPath}`);
+        assert.equal(bytes[1], 0x8b, `gzip magic byte 1 for ${urlPath}`);
+        const parsed = parseTarEntries(zlib.gunzipSync(bytes));
+        return {
+          resp,
+          bytes,
+          parsed,
+          byName: new Map(parsed.map((e) => [e.name, e])),
+        };
+      };
+
+      // 1. Ref resolution: main, HEAD, refs/heads/main (slash & encoded), dev, v1.0.0, refs/tags/v1.0.0, 40-char SHA
+      const mainRes = await fetchEntries("/fixtures/alpine-shell/archive/main.tar.gz");
+      assert.equal(mainRes.resp.headers.get("x-git-strip-components"), "1");
+      assert.equal(
+        Buffer.from(mainRes.byName.get("alpine-shell-main/VERSION").data).toString("utf8"),
+        "1.0.0-main\n"
+      );
+
+      for (const p of [
+        "/fixtures/alpine-shell/archive/HEAD.tar.gz",
+        "/fixtures/alpine-shell/archive/refs/heads/main.tar.gz",
+        "/fixtures/alpine-shell/archive/refs%2Fheads%2Fmain.tar.gz",
+      ]) {
+        const r = await fetchEntries(p);
+        assert.equal(
+          Buffer.from(r.byName.get("alpine-shell-main/VERSION").data).toString("utf8"),
+          "1.0.0-main\n",
+          `Ref path ${p} must resolve to main`
+        );
+      }
+
+      const devRes = await fetchEntries("/fixtures/alpine-shell/archive/dev.tar.gz");
+      assert.equal(Buffer.from(devRes.byName.get("alpine-shell-dev/VERSION").data).toString("utf8"), "2.0.0-dev\n");
+      assert.ok(devRes.byName.has("alpine-shell-dev/dev_only.txt"));
+
+      for (const p of [
+        "/fixtures/alpine-shell/archive/v1.0.0.tar.gz",
+        "/fixtures/alpine-shell/archive/refs/tags/v1.0.0.tar.gz",
+        "/fixtures/alpine-shell/archive/refs%2Ftags%2Fv1.0.0.tar.gz",
+      ]) {
+        const r = await fetchEntries(p);
+        assert.equal(Buffer.from(r.byName.get("alpine-shell-1.0.0/VERSION").data).toString("utf8"), "1.0.0-tag\n");
+        assert.ok(r.byName.has("alpine-shell-1.0.0/TAG_MARKER"));
+      }
+
+      const shaRes = await fetchEntries(`/fixtures/alpine-shell/archive/${MOCK_SHAS.alpine}.tar.gz`);
+      assert.equal(Buffer.from(shaRes.byName.get("alpine-shell-1111111/VERSION").data).toString("utf8"), "0.9.0-commit\n");
+      assert.ok(shaRes.byName.has("alpine-shell-1111111/COMMIT_MARKER"));
+
+      // 2. HTTP HEAD method
+      const headResp = await fetch(`${gitServer.url}/fixtures/alpine-shell/archive/main.tar.gz`, {
+        method: "HEAD",
+      });
+      assert.equal(headResp.status, 200);
+      assertIncludes(headResp.headers.get("content-type") || "", "application/gzip");
+      assert.equal(Number(headResp.headers.get("content-length")), mainRes.bytes.byteLength);
+      assert.equal(headResp.headers.get("x-git-strip-components"), "1");
+      assert.equal((await headResp.arrayBuffer()).byteLength, 0);
+
+      // 3. 302 cross-origin redirect & Authorization stripping
+      const redirResp = await fetch(`${gitServer.url}/fixtures/alpine-shell/archive/main.tar.gz`, {
+        headers: { Authorization: "Bearer test-secret" },
+        redirect: "manual",
+      });
+      assert.equal(redirResp.status, 302);
+      const loc = redirResp.headers.get("location") || "";
+      assert.ok(loc.includes(gitServer.cdnHost), "302 Location must point to separate cdnHost");
+      assert.notEqual(gitServer.cdnHost, gitServer.host);
+
+      assert.equal(gitServer.leakedAuthCount(), 0);
+      const leakedResp = await fetch(loc, { headers: { Authorization: "Bearer test-secret" } });
+      assert.equal(leakedResp.status, 400);
+      assert.equal(gitServer.leakedAuthCount(), 1);
+
+      const cleanCdnResp = await fetch(loc);
+      assert.equal(cleanCdnResp.status, 200);
+      const cleanBytes = new Uint8Array(await cleanCdnResp.arrayBuffer());
+      assert.equal(cleanBytes[0], 0x1f);
+      assert.equal(cleanBytes[1], 0x8b);
+      assert.equal(gitServer.leakedAuthCount(), 1);
+
+      // 4. Custom X-Git-Strip-Components: 0
+      const noStripRes = await fetchEntries("/fixtures/no-strip/archive/main.tar.gz");
+      assert.equal(noStripRes.resp.headers.get("x-git-strip-components"), "0");
+      assert.equal(Buffer.from(noStripRes.byName.get("flat.txt").data).toString("utf8"), "FLAT_NO_STRIP\n");
+
+      // 5. Error triggers
+      assert.equal((await fetch(`${gitServer.url}/does/notexist/archive/main.tar.gz`)).status, 404);
+      assert.equal((await fetch(`${gitServer.url}/fixtures/alpine-shell/archive/no-such-ref.tar.gz`)).status, 404);
+      const rlResp = await fetch(`${gitServer.url}/error/ratelimit/archive/main.tar.gz`);
+      assert.equal(rlResp.status, 429);
+      assert.ok(rlResp.headers.get("retry-after"), "429 must include Retry-After header");
+      assert.equal((await fetch(`${gitServer.url}/error/upstream500/archive/main.tar.gz`)).status, 500);
+      const loopResp = await fetch(`${gitServer.url}/error/redirect-loop/archive/main.tar.gz`, { redirect: "manual" });
+      assert.equal(loopResp.status, 302);
+
+      gitServer.setErrorTrigger("fixtures/alpine-shell", { status: 503 });
+      assert.equal((await fetch(`${gitServer.url}/fixtures/alpine-shell/archive/main.tar.gz`)).status, 503);
+      gitServer.clearErrorTriggers();
+      assert.equal((await fetch(`${gitServer.url}/fixtures/alpine-shell/archive/main.tar.gz`)).status, 200);
+
+      // 6. Synthetic repo fixture integrity
+      const pyRes = await fetchEntries("/fixtures/py-unittest/archive/main.tar.gz");
+      assert.ok(pyRes.byName.has("py-unittest-main/pkg/calc.py"));
+      assert.ok(pyRes.byName.has("py-unittest-main/tests/test_calc.py"));
+      assert.ok(pyRes.byName.has("py-unittest-main/data/sample.json"));
+
+      const jsRes = await fetchEntries("/fixtures/js-nodetest/archive/main.tar.gz");
+      assert.ok(jsRes.byName.has("js-nodetest-main/package.json"));
+      assert.ok(jsRes.byName.has("js-nodetest-main/src/math.mjs"));
+      assert.ok(jsRes.byName.has("js-nodetest-main/test/math.test.mjs"));
+      assert.ok(jsRes.byName.has("js-nodetest-main/data/input.json"));
+
+      const linksRes = await fetchEntries("/fixtures/links-nested/archive/main.tar.gz");
+      assert.equal(linksRes.byName.get("links-nested-main/empty_dir/")?.typeFlag, "5");
+      assert.equal(linksRes.byName.get("links-nested-main/src/rel_symlink")?.typeFlag, "2");
+      assert.equal(linksRes.byName.get("links-nested-main/hardlink_copy.txt")?.typeFlag, "1");
+
+      const travRes = await fetchEntries("/fixtures/traversal-evil/archive/main.tar.gz");
+      assert.ok(travRes.byName.has("traversal-evil-main/../escape.txt"));
+      assert.ok(travRes.byName.has("../direct_escape.txt"));
+    } finally {
+      await gitServer.close();
+    }
   });
 
   return suite.run(opts);

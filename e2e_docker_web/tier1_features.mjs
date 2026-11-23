@@ -2,6 +2,8 @@
 // Covers PROJECT.md Interface Contracts §1-§3 and Features F1-F11.
 
 import fs from "node:fs";
+import path from "node:path";
+import zlib from "node:zlib";
 import crypto from "node:crypto";
 import { pathToFileURL } from "node:url";
 import {
@@ -15,7 +17,9 @@ import {
   Suite,
 } from "./helpers/test_runner.mjs";
 import { startMockOciRegistry } from "./helpers/mock_oci_registry.mjs";
-import { REQUIRED_ARTIFACTS, findChromeBinary, startServer } from "./helpers/server_harness.mjs";
+import { startMockGitServer } from "./helpers/mock_git_server.mjs";
+import { createTar, parseTarEntries } from "./helpers/tar_builder.mjs";
+import { REPO_ROOT, REQUIRED_ARTIFACTS, findChromeBinary, startServer } from "./helpers/server_harness.mjs";
 import { launchCdpBrowser } from "./helpers/cdp_browser.mjs";
 
 function assertCoopCoep(headers, label) {
@@ -31,17 +35,64 @@ function assertCoopCoep(headers, label) {
   );
 }
 
+function assertGitSecurityHeaders(headers, label) {
+  assertCoopCoep(headers, label);
+  assert.ok(
+    headers.get("cross-origin-resource-policy"),
+    `${label}: missing Cross-Origin-Resource-Policy header`
+  );
+  assert.equal(
+    headers.get("x-content-type-options"),
+    "nosniff",
+    `${label}: missing X-Content-Type-Options: nosniff`
+  );
+}
+
 export async function runTier1(opts = {}) {
   const sdk = await import(pathToFileURL(REQUIRED_ARTIFACTS.dockerSdk).href);
   const { Elf2WasmDocker, parseImageRef, runDockerImage } = sdk;
 
   const registry = await startMockOciRegistry({ requireAuth: true, redirectBlobs: true });
+  const gitServer = await startMockGitServer({ redirectArchives: true });
   const server = await startServer({ allowLocalRegistries: true });
+
+  const GIT_SHA_40 = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
+  const makeSampleRepoEntries = (refLabel) => [
+    { path: `sample-${refLabel}/`, type: "dir", mode: 0o755 },
+    { path: `sample-${refLabel}/README.md`, type: "file", content: `REF=${refLabel}\n` },
+    { path: `sample-${refLabel}/src/`, type: "dir", mode: 0o755 },
+    { path: `sample-${refLabel}/src/data.txt`, type: "file", content: "HARDLINK_TARGET_DATA\n" },
+    {
+      path: `sample-${refLabel}/src/data_hardlink.txt`,
+      type: "hardlink",
+      linkname: `sample-${refLabel}/src/data.txt`,
+    },
+    {
+      path: `sample-${refLabel}/src/link_to_readme.txt`,
+      type: "symlink",
+      linkname: "../README.md",
+    },
+    { path: `sample-${refLabel}/bin/`, type: "dir", mode: 0o755 },
+    {
+      path: `sample-${refLabel}/bin/check.sh`,
+      type: "file",
+      mode: 0o755,
+      content: "#!/bin/sh\necho SCRIPT_OK\n",
+    },
+  ];
+
+  gitServer.addRepo("testorg/sample", {
+    HEAD: makeSampleRepoEntries("HEAD"),
+    main: makeSampleRepoEntries("main"),
+    "v1.2.3": makeSampleRepoEntries("v1.2.3"),
+    [GIT_SHA_40]: makeSampleRepoEntries(GIT_SHA_40),
+  });
 
   const sdkOpts = {
     compilerWasmUrl: `${server.url}/wasm/elf2wasm_compiler_wasm.wasm`,
     runtimeWasmUrl: `${server.url}/wasm/elf2wasm_runtime_wasm.wasm`,
     registryProxyBase: `${server.url}/api/v2`,
+    gitProxyBase: `${server.url}/api/git/archive`,
     useWorker: false,
   };
 
@@ -51,6 +102,14 @@ export async function runTier1(opts = {}) {
   let sharedNodeImage = null;
   let alpineAmd64Digest = null;
   let alpineLayerDigest = null;
+
+  async function getAlpine() {
+    if (!sharedDocker) sharedDocker = await Elf2WasmDocker.create(sdkOpts);
+    if (!sharedAlpineImage) {
+      sharedAlpineImage = await sharedDocker.pullImage(registry.imageRef("library/alpine", "latest"));
+    }
+    return sharedAlpineImage;
+  }
 
   async function getPython() {
     if (!sharedDocker) sharedDocker = await Elf2WasmDocker.create(sdkOpts);
@@ -744,10 +803,319 @@ export async function runTier1(opts = {}) {
     }
   });
 
+  // -------------------------------------------------------------------------
+  // Git Repo Overlay & Project Test Presets (Features F25-F31, Contracts §7-§10)
+  // -------------------------------------------------------------------------
+
+  suite.add("T1.9.1", "GET /api/git/archive streams tar.gz for 40-char SHA, branch, tag, and default HEAD with headers & 302 auth-stripping", async () => {
+    gitServer.clearRequests();
+    gitServer.resetLeakedAuthCount();
+
+    const cases = [
+      { ref: GIT_SHA_40, expectedRef: GIT_SHA_40, expectImmutable: true, label: "40-char SHA" },
+      { ref: "main", expectedRef: "main", expectImmutable: false, label: "branch main" },
+      { ref: "v1.2.3", expectedRef: "v1.2.3", expectImmutable: false, label: "tag v1.2.3" },
+      { ref: null, expectedRef: "HEAD", expectImmutable: false, label: "omitted ref (HEAD)" },
+    ];
+
+    for (const c of cases) {
+      const qs = new URLSearchParams({ repo: gitServer.repoUrl("testorg/sample") });
+      if (c.ref !== null) qs.set("ref", c.ref);
+
+      const resp = await fetch(`${server.url}/api/git/archive?${qs.toString()}`, {
+        headers: { Authorization: "Bearer secret-must-not-leak" },
+      });
+      assert.equal(resp.status, 200, `${c.label}: expected 200, got ${resp.status}`);
+      assertIncludes(resp.headers.get("content-type") || "", "application/gzip", `${c.label}: content-type`);
+      assert.equal(resp.headers.get("x-git-archive-format"), "tar.gz", `${c.label}: X-Git-Archive-Format`);
+      assert.equal(resp.headers.get("x-git-strip-components"), "1", `${c.label}: X-Git-Strip-Components`);
+      assertGitSecurityHeaders(resp.headers, `T1.9.1 ${c.label}`);
+
+      const cc = (resp.headers.get("cache-control") || "").toLowerCase();
+      assertIncludes(cc, "public", `${c.label}: Cache-Control must include public`);
+      if (c.expectImmutable) {
+        assertIncludes(cc, "immutable", `${c.label}: 40-char SHA Cache-Control must include immutable`);
+      } else {
+        assert.equal(cc.includes("immutable"), false, `${c.label}: mutable ref Cache-Control must not include immutable (got ${cc})`);
+      }
+
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      assert.equal(bytes[0], 0x1f, `${c.label}: gzip magic byte 0`);
+      assert.equal(bytes[1], 0x8b, `${c.label}: gzip magic byte 1`);
+      const contentLen = resp.headers.get("content-length");
+      if (contentLen !== null) {
+        assert.equal(Number(contentLen), bytes.byteLength, `${c.label}: Content-Length mismatch`);
+      }
+
+      const entries = parseTarEntries(zlib.gunzipSync(bytes));
+      const readme = entries.find((e) => e.name.endsWith("/README.md"));
+      assert.ok(readme, `${c.label}: archive must contain README.md`);
+      assert.equal(Buffer.from(readme.data).toString("utf8"), `REF=${c.expectedRef}\n`);
+    }
+
+    assert.equal(gitServer.leakedAuthCount(), 0, "Proxy must strip Authorization on cross-origin 302 redirect");
+    assert.ok(
+      gitServer.getRequests((r) => r.server === "cdn" && r.status === 200).length >= 4,
+      "Expected at least 4 successful cross-origin CDN archive fetches"
+    );
+  });
+
+  suite.add("T1.9.2", "HEAD /api/git/archive returns 200 with empty body and matching archive headers", async () => {
+    const qs = new URLSearchParams({
+      repo: gitServer.repoUrl("testorg/sample"),
+      ref: GIT_SHA_40,
+    });
+    const resp = await fetch(`${server.url}/api/git/archive?${qs.toString()}`, {
+      method: "HEAD",
+    });
+    assert.equal(resp.status, 200);
+    assertIncludes(resp.headers.get("content-type") || "", "application/gzip");
+    assert.equal(resp.headers.get("x-git-archive-format"), "tar.gz");
+    assert.equal(resp.headers.get("x-git-strip-components"), "1");
+    assertIncludes((resp.headers.get("cache-control") || "").toLowerCase(), "immutable");
+    assertGitSecurityHeaders(resp.headers, "HEAD /api/git/archive");
+    assert.equal((await resp.arrayBuffer()).byteLength, 0, "HEAD response body must be empty");
+  });
+
+  suite.add("T1.9.3", "GET /js/git_client.mjs serves ESM and fetchGitArchive streams, decompresses & reports progress", async () => {
+    const resp = await fetch(`${server.url}/js/git_client.mjs`);
+    assert.equal(resp.status, 200, "GET /js/git_client.mjs must return 200");
+    assertIncludes(resp.headers.get("content-type") || "", "javascript");
+    assertCoopCoep(resp.headers, "GET /js/git_client.mjs");
+
+    // Dynamic import inside test body so tier1_features.mjs loads cleanly prior to M11
+    const gitClientPath = path.resolve(REPO_ROOT, "js/git_client.mjs");
+    const { fetchGitArchive } = await import(pathToFileURL(gitClientPath).href);
+    assert.equal(typeof fetchGitArchive, "function", "git_client.mjs must export fetchGitArchive");
+
+    const progressStages = [];
+    const res = await fetchGitArchive({
+      repo: gitServer.repoUrl("testorg/sample"),
+      ref: "v1.2.3",
+      gitProxyBase: `${server.url}/api/git/archive`,
+      onProgress: (ev) => {
+        if (ev && ev.stage) progressStages.push(ev.stage);
+      },
+    });
+
+    assert.ok(res.tarBytes instanceof Uint8Array, "fetchGitArchive must return tarBytes Uint8Array");
+    assert.ok(res.tarBytes.byteLength >= 1024, `Expected tarBytes >= 1024 bytes, got ${res.tarBytes.byteLength}`);
+    assert.equal(res.stripComponents, 1);
+    assert.equal(typeof res.repo, "string");
+    assert.equal(res.ref, "v1.2.3");
+
+    const entries = parseTarEntries(res.tarBytes);
+    const readme = entries.find((e) => e.name === "sample-v1.2.3/README.md");
+    assert.ok(readme, "Decompressed tarBytes must contain sample-v1.2.3/README.md");
+    assert.equal(Buffer.from(readme.data).toString("utf8"), "REF=v1.2.3\n");
+
+    assert.ok(
+      progressStages.includes("git-download"),
+      `Expected progressStages to include "git-download", got ${JSON.stringify(progressStages)}`
+    );
+    assert.ok(
+      progressStages.includes("git-decompress"),
+      `Expected progressStages to include "git-decompress", got ${JSON.stringify(progressStages)}`
+    );
+  });
+
+  suite.add("T1.9.4", "GET / exposes Git repo overlay controls & 3 project test presets while preserving all 5 image presets", async () => {
+    const resp = await fetch(`${server.url}/`);
+    assert.equal(resp.status, 200);
+    assertCoopCoep(resp.headers, "GET /");
+    const html = await resp.text();
+
+    for (const id of ["repo-input", "repo-ref-input", "repo-mount-input"]) {
+      assertIncludes(html, `id="${id}"`, `index.html missing #${id}`);
+    }
+    assertMatch(
+      html,
+      /id="repo-mount-input"[^>]*value="\/workspace"|value="\/workspace"[^>]*id="repo-mount-input"/,
+      "#repo-mount-input must default to value=\"/workspace\""
+    );
+    assertIncludes(html, "project-presets-row", "index.html missing .project-presets-row");
+
+    const projectPresetMatches = [...html.matchAll(/class="[^"]*\bproject-preset-chip\b[^"]*"[^>]*data-preset="([^"]+)"|data-preset="([^"]+)"[^>]*class="[^"]*\bproject-preset-chip\b[^"]*"/g)];
+    const presetIds = new Set(projectPresetMatches.map((m) => m[1] || m[2]).filter(Boolean));
+    assert.ok(presetIds.size >= 3, `Expected at least 3 distinct .project-preset-chip[data-preset] buttons, found ${presetIds.size}`);
+
+    for (const img of ["alpine:latest", "busybox:latest", "debian:bookworm-slim", "python:3.12-slim", "node:22-slim"]) {
+      assertIncludes(html, `data-image="${img}"`, `Existing image preset ${img} must be preserved`);
+    }
+  });
+
+  suite.add("T1.9.5", "Headless Chrome DOM contract: .project-preset-chip populates fields & plain .preset-chip resets repo/cmd/cwd/env", async () => {
+    if (!findChromeBinary()) {
+      skip("Google Chrome binary not found");
+    }
+    const browser = await launchCdpBrowser();
+    try {
+      await browser.navigate(`${server.url}/`);
+      await browser.waitForSelector("#repo-input", 15000);
+      await browser.waitForSelector("#repo-ref-input", 15000);
+      await browser.waitForSelector("#repo-mount-input", 15000);
+      await browser.waitForSelector(".project-presets-row", 15000);
+
+      assert.equal(await browser.getInputValue("#repo-mount-input"), "/workspace");
+      assert.equal(await browser.getInputValue("#repo-input"), "");
+      assert.equal(await browser.getInputValue("#repo-ref-input"), "");
+
+      const projectChips = await browser.getProjectPresetChips();
+      assert.equal(projectChips.length, 3, `Expected 3 .project-preset-chip buttons, got ${JSON.stringify(projectChips)}`);
+      const uniqueIds = new Set(projectChips.map((c) => c.preset).filter(Boolean));
+      assert.equal(uniqueIds.size, 3, "All 3 project presets must have distinct data-preset values");
+
+      const combinedDescriptions = [];
+      for (const chip of projectChips) {
+        const fields = await browser.clickProjectPresetChip(chip.preset);
+        assert.ok(fields.image.trim().length > 0, `Preset ${chip.preset} must populate #image-input`);
+        assert.ok(fields.repo.trim().length > 0, `Preset ${chip.preset} must populate #repo-input`);
+        assert.ok(fields.cmd.trim().length > 0, `Preset ${chip.preset} must populate #cmd-input`);
+        assert.ok(fields.mountPath.startsWith("/"), `Preset ${chip.preset} #repo-mount-input must start with "/" (got ${fields.mountPath})`);
+        combinedDescriptions.push(
+          `${chip.preset} ${chip.language} ${chip.text} ${fields.image} ${fields.cmd}`
+        );
+      }
+
+      assert.ok(combinedDescriptions.some((d) => /python/i.test(d)), "Project presets must include a Python project");
+      assert.ok(combinedDescriptions.some((d) => /javascript|node|\bjs\b/i.test(d)), "Project presets must include a JavaScript project");
+      assert.ok(combinedDescriptions.some((d) => /rust|cargo|nushell|\bnu\b/i.test(d)), "Project presets must include a Rust project");
+
+      // Clicking a plain image .preset-chip must clear repo/cmd/cwd/env and restore /workspace
+      await browser.clickPresetChip("alpine:latest");
+      assert.equal(await browser.getInputValue("#image-input"), "alpine:latest");
+      assert.equal(await browser.getInputValue("#repo-input"), "");
+      assert.equal(await browser.getInputValue("#repo-ref-input"), "");
+      assert.equal(await browser.getInputValue("#repo-mount-input"), "/workspace");
+      assert.equal(await browser.getInputValue("#cmd-input"), "");
+      assert.equal(await browser.getInputValue("#cwd-input"), "");
+      assert.equal(await browser.getInputValue("#env-input"), "");
+      const activeId = await browser.evaluate("document.activeElement?.id || ''", { awaitPromise: false });
+      assert.equal(activeId, "image-input", "Clicking plain .preset-chip must focus #image-input");
+
+      assert.deepEqual(browser.exceptions, [], `Uncaught exceptions: ${JSON.stringify(browser.exceptions)}`);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  suite.add("T1.9.6", "image.createContainer({ gitRepo }) overlays at /workspace & custom mountPath, sets cwd/PWD, rebases hardlinks & preserves relative symlinks", async () => {
+    const alpineImg = await getAlpine();
+
+    // Case A: default mountPath = /workspace
+    const c1 = await alpineImg.createContainer({
+      gitRepo: { repo: gitServer.repoUrl("testorg/sample"), ref: "main" },
+      cmd: [
+        "/bin/sh",
+        "-c",
+        'echo "PWD=$(pwd)|ENV_PWD=$PWD"; cat README.md; cat src/data_hardlink.txt; readlink src/link_to_readme.txt; cat src/link_to_readme.txt',
+      ],
+      tty: false,
+    });
+    await c1.start();
+    try {
+      const r1 = await waitWithTimeout(c1.wait(), 45000, "T1.9.6 Case A default /workspace");
+      assert.equal(r1.exitCode, 0, `Case A failed (stderr: ${r1.stderr})`);
+      const out1 = stripAnsi(r1.stdout);
+      assertIncludes(out1, "PWD=/workspace|ENV_PWD=/workspace");
+      assertIncludes(out1, "REF=main");
+      assertIncludes(out1, "HARDLINK_TARGET_DATA");
+      assertIncludes(out1, "../README.md");
+    } finally {
+      await c1.stop().catch(() => {});
+    }
+
+    // Case B: custom mountPath = /srv/custom_app with 40-char SHA
+    const c2 = await alpineImg.createContainer({
+      gitRepo: {
+        repo: gitServer.repoUrl("testorg/sample"),
+        ref: GIT_SHA_40,
+        mountPath: "/srv/custom_app",
+      },
+      cmd: [
+        "/bin/sh",
+        "-c",
+        'echo "PWD=$(pwd)|ENV_PWD=$PWD"; test -f /srv/custom_app/src/data_hardlink.txt && cat README.md && cat src/data_hardlink.txt',
+      ],
+      tty: false,
+    });
+    await c2.start();
+    try {
+      const r2 = await waitWithTimeout(c2.wait(), 45000, "T1.9.6 Case B custom mountPath");
+      assert.equal(r2.exitCode, 0, `Case B failed (stderr: ${r2.stderr})`);
+      const out2 = stripAnsi(r2.stdout);
+      assertIncludes(out2, "PWD=/srv/custom_app|ENV_PWD=/srv/custom_app");
+      assertIncludes(out2, `REF=${GIT_SHA_40}`);
+      assertIncludes(out2, "HARDLINK_TARGET_DATA");
+    } finally {
+      await c2.stop().catch(() => {});
+    }
+  });
+
+  suite.add("T1.9.7", "runDockerImage(ref, { gitRepo }) one-shot execution with git repo overlay", async () => {
+    const res = await waitWithTimeout(
+      runDockerImage(registry.imageRef("library/alpine", "latest"), {
+        ...sdkOpts,
+        gitRepo: {
+          repo: gitServer.repoUrl("testorg/sample"),
+          ref: "v1.2.3",
+          mountPath: "/workspace",
+        },
+        cmd: ["/bin/sh", "-c", 'echo "RUN_PWD=$(pwd)"; cat /workspace/README.md'],
+        tty: false,
+      }),
+      60000,
+      "T1.9.7 runDockerImage with gitRepo"
+    );
+    assert.equal(res.exitCode, 0, `runDockerImage failed (stderr: ${res.stderr})`);
+    const out = stripAnsi(res.stdout);
+    assertIncludes(out, "RUN_PWD=/workspace");
+    assertIncludes(out, "REF=v1.2.3");
+  });
+
+  suite.add("T1.9.8", "Offline overlayTarBytes + overlayMountPath + overlayStripComponents makes zero git network calls", async () => {
+    const alpineImg = await getAlpine();
+    const tarBytes = createTar([
+      { path: "offline-pkg/", type: "dir", mode: 0o755 },
+      { path: "offline-pkg/hello.txt", type: "file", content: "OFFLINE_HELLO\n" },
+      { path: "offline-pkg/sub/", type: "dir", mode: 0o755 },
+      { path: "offline-pkg/sub/orig.txt", type: "file", content: "OFFLINE_ORIG\n" },
+      { path: "offline-pkg/sub/hard.txt", type: "hardlink", linkname: "offline-pkg/sub/orig.txt" },
+      { path: "offline-pkg/sub/sym.txt", type: "symlink", linkname: "../hello.txt" },
+    ]);
+
+    gitServer.clearRequests();
+    const c = await alpineImg.createContainer({
+      overlayTarBytes: tarBytes,
+      overlayMountPath: "/opt/repo",
+      overlayStripComponents: 1,
+      cmd: [
+        "/bin/sh",
+        "-c",
+        'echo "PWD=$(pwd)|ENV=$PWD"; cat hello.txt; cat sub/hard.txt; readlink sub/sym.txt; cat sub/sym.txt',
+      ],
+      tty: false,
+    });
+    await c.start();
+    try {
+      const res = await waitWithTimeout(c.wait(), 45000, "T1.9.8 offline overlayTarBytes");
+      assert.equal(res.exitCode, 0, `Offline overlay failed (stderr: ${res.stderr})`);
+      const out = stripAnsi(res.stdout);
+      assertIncludes(out, "PWD=/opt/repo|ENV=/opt/repo");
+      assertIncludes(out, "OFFLINE_HELLO");
+      assertIncludes(out, "OFFLINE_ORIG");
+      assertIncludes(out, "../hello.txt");
+      assert.equal(gitServer.getRequests().length, 0, "Offline overlayTarBytes must make zero git network requests");
+    } finally {
+      await c.stop().catch(() => {});
+    }
+  });
+
   try {
     return await suite.run(opts);
   } finally {
     await server.close();
+    await gitServer.close();
     await registry.close();
   }
 }

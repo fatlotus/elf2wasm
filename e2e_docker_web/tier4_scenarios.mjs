@@ -5,14 +5,17 @@ import crypto from "node:crypto";
 import {
   assert,
   assertIncludes,
+  assertNotIncludes,
   assertMatch,
   stripAnsi,
   sleep,
   skip,
   waitFor,
+  waitWithTimeout,
   Suite,
 } from "./helpers/test_runner.mjs";
 import { startMockOciRegistry } from "./helpers/mock_oci_registry.mjs";
+import { startMockGitServer } from "./helpers/mock_git_server.mjs";
 import { startServer } from "./helpers/server_harness.mjs";
 import { launchCdpBrowser } from "./helpers/cdp_browser.mjs";
 
@@ -20,6 +23,7 @@ const COLD_BOOT_TIMEOUT_MS = 90000;
 const PYTHON_COLD_BOOT_TIMEOUT_MS = 120000;
 const NODE_COLD_BOOT_TIMEOUT_MS = 180000;
 const CMD_TIMEOUT_MS = 25000;
+const PROJECT_PRESET_RUN_TIMEOUT_MS = 240000;
 
 /**
  * Wait until the interactive shell in `#terminal` is ready by observing status or probing a computed command.
@@ -140,15 +144,79 @@ async function waitForReplPrompt(browser, promptRegex, timeoutMs, label = "REPL 
   );
 }
 
+/**
+ * Poll #status-text and #status-pill[data-state] until container exits ("Exited (code N)").
+ * Checks for "Exited (code N)" before failing fast on "Error: ..." so non-zero guest exits
+ * return cleanly with full terminal diagnostics.
+ */
+async function waitForContainerExit(browser, timeoutMs = COLD_BOOT_TIMEOUT_MS, label = "container exit") {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const info = await browser.evaluate(
+      `(() => ({
+        state: document.querySelector("#status-pill")?.dataset?.state || "",
+        statusText: (document.querySelector("#status-text")?.textContent || "").trim(),
+      }))()`,
+      { awaitPromise: false }
+    );
+    const exitMatch = info.statusText.match(/^Exited \(code (\d+)\)/i);
+    if (exitMatch) {
+      const term = stripAnsi(await browser.getText("#terminal"));
+      return {
+        exitCode: Number(exitMatch[1]),
+        statusText: info.statusText,
+        state: info.state,
+        term,
+      };
+    }
+    if (info.state === "error") {
+      const termTail = stripAnsi(await browser.getText("#terminal")).slice(-800);
+      throw new Error(
+        `Container entered error state while waiting for ${label}.\n` +
+        `#status-text: ${JSON.stringify(info.statusText)}\n` +
+        `#terminal tail:\n${termTail}`
+      );
+    }
+    await sleep(250);
+  }
+  const finalStatus = await browser.getText("#status-text");
+  const finalState = await browser.evaluate(
+    'document.querySelector("#status-pill")?.dataset?.state || ""',
+    { awaitPromise: false }
+  );
+  const finalTerm = stripAnsi(await browser.getText("#terminal"));
+  throw new Error(
+    `Timed out after ${timeoutMs}ms waiting for ${label}.\n` +
+    `#status-text: ${JSON.stringify(finalStatus)} (state=${JSON.stringify(finalState)})\n` +
+    `#terminal tail:\n${finalTerm.slice(-800)}`
+  );
+}
+
 export async function runTier4(opts = {}) {
   const skipLive = Boolean(opts.skipLive);
 
   let registry = null;
+  let gitServer = null;
   let localServer = null;
 
   try {
     registry = await startMockOciRegistry({ requireAuth: true, redirectBlobs: true });
+    gitServer = await startMockGitServer({ redirectArchives: true });
     localServer = await startServer({ allowLocalRegistries: true });
+
+    gitServer.addRepo("acme/shell-proj", {
+      main: [
+        { path: "shell-proj-main/", type: "dir", mode: 0o755 },
+        { path: "shell-proj-main/version.txt", type: "file", content: "branch-main-v2\n" },
+        { path: "shell-proj-main/bin/", type: "dir", mode: 0o755 },
+        {
+          path: "shell-proj-main/bin/check.sh",
+          type: "file",
+          mode: 0o755,
+          content: '#!/bin/sh\necho "PWD=$PWD"\necho "SHELL_TEST_PASS:main:$((20+22))"\ncat version.txt\n',
+        },
+      ],
+    });
 
     const suite = new Suite("Tier 4 (Browser E2E)");
 
@@ -654,9 +722,312 @@ export async function runTier4(opts = {}) {
     }
   });
 
+  // -------------------------------------------------------------------------
+  // Git Repo Overlay & Project Test Presets Browser Scenarios (F25-F31, §7-§10)
+  // -------------------------------------------------------------------------
+
+  suite.add("T4.10", "Web UI Git Repo Overlay workflow (#repo-input/#repo-ref-input/#repo-mount-input), #terminal-title & client-side CDP audit (offline)", async () => {
+    const browser = await launchCdpBrowser();
+    try {
+      browser.clearLogs();
+      await browser.navigate(`${localServer.url}/`);
+      await browser.waitForSelector("#image-input", 15000);
+      await browser.waitForSelector("#repo-input", 15000);
+      await browser.waitForSelector("#repo-ref-input", 15000);
+      await browser.waitForSelector("#repo-mount-input", 15000);
+      await browser.waitForSelector("#cmd-input", 15000);
+      await browser.waitForSelector("#start-btn", 15000);
+      await browser.waitForSelector("#terminal", 15000);
+      await browser.waitForSelector("#terminal-title", 15000);
+
+      assert.equal(await browser.getInputValue("#repo-mount-input"), "/workspace");
+
+      await browser.setInputValue("#image-input", registry.imageRef("library/alpine", "latest"));
+      await browser.setInputValue("#repo-input", gitServer.repoUrl("acme/shell-proj"));
+      await browser.setInputValue("#repo-ref-input", "main");
+      await browser.setInputValue("#repo-mount-input", "/opt/demo-repo");
+      await browser.setInputValue("#cmd-input", "/bin/sh -c 'pwd && ./bin/check.sh && ls -1'");
+
+      await browser.click("#start-btn");
+      const exitRes = await waitForContainerExit(browser, COLD_BOOT_TIMEOUT_MS, "T4.10 git overlay");
+      assert.equal(
+        exitRes.exitCode,
+        0,
+        `T4.10 expected exit code 0, got ${exitRes.exitCode} (#status-text=${exitRes.statusText})\n${exitRes.term.slice(-800)}`
+      );
+
+      const title = await browser.getText("#terminal-title");
+      assertIncludes(title, "shell-proj", `#terminal-title must reflect repo name (got ${JSON.stringify(title)})`);
+      assertIncludes(title, "main", `#terminal-title must reflect ref (got ${JSON.stringify(title)})`);
+
+      assertIncludes(exitRes.term, "/opt/demo-repo");
+      assertIncludes(exitRes.term, "SHELL_TEST_PASS:main:42");
+      assertIncludes(exitRes.term, "version.txt");
+
+      // CDP Network Audit (Page + Dedicated Worker)
+      const localOrigin = new URL(localServer.url).origin;
+      for (const req of browser.networkRequests) {
+        if (req.url.startsWith("http://") || req.url.startsWith("https://")) {
+          assert.equal(new URL(req.url).origin, localOrigin, `Unexpected external request: ${req.url}`);
+          assert.notEqual(req.method, "POST", `Unexpected POST request: ${req.url}`);
+          const pathname = new URL(req.url).pathname;
+          assertNotIncludes(pathname, "/compile", `Server must not expose /compile: ${req.url}`);
+          assertNotIncludes(pathname, "/exec", `Server must not expose /exec: ${req.url}`);
+        }
+      }
+
+      const sawGitArchive = browser.networkResponses.some(
+        (r) => r.url.includes("/api/git/archive") && r.url.includes("ref=main") && r.status === 200
+      );
+      assert.ok(sawGitArchive, "Expected /api/git/archive 200 response with ref=main in CDP networkResponses");
+
+      const sawCompilerWasm = browser.networkResponses.some(
+        (r) => r.url.includes("/wasm/elf2wasm_compiler_wasm.wasm") && r.status === 200
+      );
+      const sawRuntimeWasm = browser.networkResponses.some(
+        (r) => r.url.includes("/wasm/elf2wasm_runtime_wasm.wasm") && r.status === 200
+      );
+      assert.ok(sawCompilerWasm, "Expected elf2wasm_compiler_wasm.wasm 200");
+      assert.ok(sawRuntimeWasm, "Expected elf2wasm_runtime_wasm.wasm 200");
+
+      assert.deepEqual(browser.exceptions, [], `Uncaught exceptions: ${JSON.stringify(browser.exceptions)}`);
+      assert.deepEqual(browser.consoleErrors, [], `Console errors: ${JSON.stringify(browser.consoleErrors)}`);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  suite.add("T4.11", "Web UI Project Test Presets (.project-presets-row) & backward-compatible Image Presets (.presets-row) DOM contract (offline)", async () => {
+    const browser = await launchCdpBrowser();
+    try {
+      browser.clearLogs();
+      await browser.navigate(`${localServer.url}/`);
+      await browser.waitForSelector(".presets-row", 15000);
+      await browser.waitForSelector(".project-presets-row", 15000);
+      await browser.waitForSelector("#image-input", 15000);
+      await browser.waitForSelector("#repo-input", 15000);
+      await browser.waitForSelector("#repo-ref-input", 15000);
+      await browser.waitForSelector("#repo-mount-input", 15000);
+      await browser.waitForSelector("#cmd-input", 15000);
+      await browser.waitForSelector("#cwd-input", 15000);
+      await browser.waitForSelector("#env-input", 15000);
+
+      // 1. All 5 backward-compatible image presets preserved
+      const imageChips = await browser.getPresetChips();
+      const imageNames = imageChips.map((c) => c.image);
+      for (const expectedImg of [
+        "alpine:latest",
+        "busybox:latest",
+        "debian:bookworm-slim",
+        "python:3.12-slim",
+        "node:22-slim",
+      ]) {
+        assert.ok(imageNames.includes(expectedImg), `Missing preserved image preset ${expectedImg}`);
+      }
+
+      // 2. 3 Project Test Presets covering Python, JavaScript, and Rust
+      const projectChips = await browser.getProjectPresetChips();
+      assert.equal(projectChips.length, 3, `Expected 3 project preset chips, got ${JSON.stringify(projectChips)}`);
+
+      const ecosystemDescriptions = [];
+      for (const chip of projectChips) {
+        const populated = await browser.clickProjectPresetChip(chip.preset);
+        assert.ok(populated.image.trim().length > 0, `Preset ${chip.preset}: image must be non-empty`);
+        assert.ok(populated.repo.trim().length > 0, `Preset ${chip.preset}: repo must be non-empty`);
+        assert.ok(populated.ref.trim().length > 0, `Preset ${chip.preset}: ref must be non-empty`);
+        assert.ok(
+          populated.mountPath.startsWith("/"),
+          `Preset ${chip.preset}: mountPath must start with "/" (got ${JSON.stringify(populated.mountPath)})`
+        );
+        assert.ok(populated.cmd.trim().length > 0, `Preset ${chip.preset}: cmd must be non-empty`);
+        ecosystemDescriptions.push(
+          `${chip.preset} ${chip.language} ${chip.text} ${populated.image} ${populated.cmd}`
+        );
+      }
+
+      assert.ok(ecosystemDescriptions.some((d) => /python/i.test(d)), "Expected Python project preset");
+      assert.ok(ecosystemDescriptions.some((d) => /javascript|node|\bjs\b/i.test(d)), "Expected JavaScript project preset");
+      assert.ok(ecosystemDescriptions.some((d) => /rust|cargo|nushell|\bnu\b/i.test(d)), "Expected Rust project preset");
+
+      // 3. Dirty fields and click plain alpine:latest .preset-chip -> Contract §10 full reset
+      await browser.setInputValue("#cwd-input", "/dirty/cwd");
+      await browser.setInputValue("#env-input", "DIRTY=1");
+      await browser.setInputValue("#repo-mount-input", "/custom-mount");
+
+      await browser.clickPresetChip("alpine:latest");
+      assert.equal(await browser.getInputValue("#image-input"), "alpine:latest");
+      assert.equal(await browser.getInputValue("#repo-input"), "");
+      assert.equal(await browser.getInputValue("#repo-ref-input"), "");
+      assert.equal(await browser.getInputValue("#cmd-input"), "");
+      assert.equal(await browser.getInputValue("#cwd-input"), "");
+      assert.equal(await browser.getInputValue("#env-input"), "");
+      assert.equal(await browser.getInputValue("#repo-mount-input"), "/workspace");
+      const activeId = await browser.evaluate("document.activeElement?.id || ''", { awaitPromise: false });
+      assert.equal(activeId, "image-input", "Plain .preset-chip click must focus #image-input");
+
+      assert.deepEqual(browser.exceptions, [], `Uncaught exceptions: ${JSON.stringify(browser.exceptions)}`);
+      assert.deepEqual(browser.consoleErrors, [], `Console errors: ${JSON.stringify(browser.consoleErrors)}`);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  suite.add("T4.12", "Live GitHub repo snapshot streamed through hardened /api/git/archive & overlaid on live alpine:latest", async () => {
+    if (skipLive) {
+      skip("skipped via --skip-live");
+    }
+
+    const LIVE_REPO = "octocat/Hello-World";
+    const LIVE_SHA = "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d";
+
+    const hardenedServer = await startServer({ allowLocalRegistries: false });
+    let browser = null;
+    try {
+      // Part A: Direct HTTP contract verification against real GitHub
+      const qs = new URLSearchParams({ repo: LIVE_REPO, ref: LIVE_SHA });
+      const resp = await fetch(`${hardenedServer.url}/api/git/archive?${qs.toString()}`);
+      assert.equal(resp.status, 200, `Live GitHub archive returned ${resp.status}`);
+      assertIncludes(resp.headers.get("content-type") || "", "gzip");
+      assert.equal(resp.headers.get("x-git-archive-format"), "tar.gz");
+      assert.equal(resp.headers.get("x-git-strip-components"), "1");
+      assertIncludes((resp.headers.get("cache-control") || "").toLowerCase(), "immutable");
+      assert.equal(resp.headers.get("cross-origin-opener-policy"), "same-origin");
+      assert.equal(resp.headers.get("cross-origin-embedder-policy"), "require-corp");
+      assert.equal(resp.headers.get("x-content-type-options"), "nosniff");
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      assert.equal(bytes[0], 0x1f, "Live GitHub archive gzip magic byte 0");
+      assert.equal(bytes[1], 0x8b, "Live GitHub archive gzip magic byte 1");
+
+      // SSRF guard on hardened server
+      const ssrfResp = await fetch(
+        `${hardenedServer.url}/api/git/archive?repo=${encodeURIComponent("http://127.0.0.1:9999/a/b")}&ref=main`
+      );
+      assert.equal(ssrfResp.status, 403, `Hardened server must block loopback git repo with 403, got ${ssrfResp.status}`);
+
+      // Part B: Browser SDK overlay on live alpine:latest
+      browser = await launchCdpBrowser();
+      await browser.navigate(`${hardenedServer.url}/`);
+      await browser.waitForSelector("#image-input", 15000);
+
+      const sdkRes = await waitWithTimeout(
+        browser.evaluate(
+          `window.runDockerImage("alpine:latest", {
+            gitRepo: { repo: ${JSON.stringify(LIVE_REPO)}, ref: ${JSON.stringify(LIVE_SHA)} },
+            cmd: ["/bin/sh", "-c", "pwd && cat README"],
+            tty: false
+          })`,
+          { awaitPromise: true }
+        ),
+        120000,
+        "T4.12 live window.runDockerImage with GitHub overlay"
+      );
+      assert.equal(sdkRes.exitCode, 0, `Live overlay exited with ${sdkRes.exitCode}, stderr: ${sdkRes.stderr}`);
+      const out = stripAnsi(sdkRes.stdout);
+      assertIncludes(out, "/workspace");
+      assertIncludes(out, "Hello World!");
+      assert.deepEqual(browser.exceptions, [], `Uncaught exceptions: ${JSON.stringify(browser.exceptions)}`);
+    } finally {
+      if (browser) await browser.close();
+      if (hardenedServer) await hardenedServer.close();
+    }
+  });
+
+  suite.add("T4.13", "Live execution of all 3 dynamically discovered .project-preset-chip Project Test Presets (Python, JavaScript, Rust) on hardened server", async () => {
+    if (skipLive) {
+      skip("skipped via --skip-live");
+    }
+
+    const hardenedServer = await startServer({ allowLocalRegistries: false });
+    try {
+      const hardenedOrigin = new URL(hardenedServer.url).origin;
+
+      // Discovery Phase: inspect the 3 .project-preset-chip buttons dynamically from the DOM
+      let presets = [];
+      const discoveryBrowser = await launchCdpBrowser();
+      try {
+        await discoveryBrowser.navigate(`${hardenedServer.url}/`);
+        await discoveryBrowser.waitForSelector(".project-presets-row", 15000);
+        presets = await discoveryBrowser.getProjectPresetChips();
+      } finally {
+        await discoveryBrowser.close();
+      }
+
+      assert.equal(
+        presets.length,
+        3,
+        `Expected 3 dynamically discovered .project-preset-chip buttons, got ${JSON.stringify(presets)}`
+      );
+
+      // Sequential Isolated Execution Phase: fresh browser per preset so WASM heaps never coexist
+      for (const preset of presets) {
+        const browser = await launchCdpBrowser();
+        try {
+          browser.clearLogs();
+          await browser.navigate(`${hardenedServer.url}/`);
+          await browser.waitForSelector(".project-presets-row", 15000);
+
+          const fields = await browser.clickProjectPresetChip(preset.preset);
+          assert.ok(fields.image.trim().length > 0, `Live preset ${preset.preset}: empty #image-input`);
+          assert.ok(fields.repo.trim().length > 0, `Live preset ${preset.preset}: empty #repo-input`);
+          assert.ok(fields.ref.trim().length > 0, `Live preset ${preset.preset}: empty #repo-ref-input`);
+          assert.ok(fields.mountPath.startsWith("/"), `Live preset ${preset.preset}: invalid #repo-mount-input`);
+          assert.ok(fields.cmd.trim().length > 0, `Live preset ${preset.preset}: empty #cmd-input`);
+
+          await browser.click("#start-btn");
+          const exitRes = await waitForContainerExit(
+            browser,
+            PROJECT_PRESET_RUN_TIMEOUT_MS,
+            `Live preset ${preset.preset}`
+          );
+          assert.equal(
+            exitRes.exitCode,
+            0,
+            `Live preset ${preset.preset} (${fields.repo}@${fields.ref}) exited with code ${exitRes.exitCode} (#status-text=${exitRes.statusText})\n${exitRes.term.slice(-800)}`
+          );
+          assert.ok(
+            exitRes.term.trim().length > 0,
+            `Live preset ${preset.preset} produced empty terminal output`
+          );
+
+          const title = await browser.getText("#terminal-title");
+          const repoBasename = fields.repo.replace(/\.git$/, "").split("/").filter(Boolean).pop() || fields.repo;
+          assertIncludes(
+            title.toLowerCase(),
+            repoBasename.toLowerCase(),
+            `Live preset ${preset.preset}: #terminal-title (${JSON.stringify(title)}) should reflect repo ${repoBasename}`
+          );
+
+          // CDP Network Proof: same-origin only, zero POST, observed /api/v2/ and /api/git/archive 200
+          for (const req of browser.networkRequests) {
+            if (req.url.startsWith("http://") || req.url.startsWith("https://")) {
+              assert.equal(new URL(req.url).origin, hardenedOrigin, `Live preset ${preset.preset}: unexpected external origin ${req.url}`);
+              assert.notEqual(req.method, "POST", `Live preset ${preset.preset}: unexpected POST ${req.url}`);
+            }
+          }
+          assert.ok(
+            browser.networkResponses.some((r) => r.url.includes("/api/v2/") && r.status === 200),
+            `Live preset ${preset.preset}: expected /api/v2/ 200 response`
+          );
+          assert.ok(
+            browser.networkResponses.some((r) => r.url.includes("/api/git/archive") && r.status === 200),
+            `Live preset ${preset.preset}: expected /api/git/archive 200 response`
+          );
+
+          assert.deepEqual(browser.exceptions, [], `Live preset ${preset.preset} exceptions: ${JSON.stringify(browser.exceptions)}`);
+          assert.deepEqual(browser.consoleErrors, [], `Live preset ${preset.preset} consoleErrors: ${JSON.stringify(browser.consoleErrors)}`);
+        } finally {
+          await browser.close();
+        }
+      }
+    } finally {
+      await hardenedServer.close();
+    }
+  });
+
     return await suite.run(opts);
   } finally {
     if (localServer) await localServer.close();
+    if (gitServer) await gitServer.close();
     if (registry) await registry.close();
   }
 }
