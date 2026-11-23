@@ -37,6 +37,11 @@ pub enum PollKind {
         orig_read_mask: Vec<u8>,
         orig_write_mask: Vec<u8>,
     },
+    Epoll {
+        epfd: i32,
+        events_addr: u64,
+        maxevents: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +55,10 @@ pub enum PendingWakeup {
         pipe_id: u64,
         data: Vec<u8>,
         written: usize,
+    },
+    StdinRead {
+        buf_addr: u64,
+        count: usize,
     },
     Wait4 {
         target_pid: i32,
@@ -88,6 +97,10 @@ pub enum ThreadState {
         pipe_id: u64,
         data: Vec<u8>,
         written: usize,
+    },
+    StdinReadWait {
+        buf_addr: u64,
+        count: usize,
     },
     VforkWait {
         child_pid: i32,

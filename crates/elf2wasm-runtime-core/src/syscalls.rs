@@ -3,11 +3,12 @@ use crate::scheduler::{
     PendingWakeup, PollFdSpec, PollKind, Scheduler, ThreadContext, ThreadState, MAIN_PID,
     QUANTUM_TIME_STEP_NS,
 };
-use crate::stack::setup_guest_stack_ctx;
+use crate::stack::setup_guest_stack_ctx_with_ids;
 use crate::vfs::{
-    FileStat, OpenFile, SoEntry, VirtualFs, AT_FDCWD, AT_REMOVEDIR, EACCES,
-    EAGAIN, EBADF, ECHILD, EFAULT, EINVAL, ENOENT, ENOMEM, ENOSYS, ENOTTY, EPIPE, ERANGE,
-    ESRCH, ETIMEDOUT, O_NONBLOCK, S_IFDIR,
+    EpollEntry, FileStat, OpenFile, SoEntry, VirtualDevice, VirtualFs, AT_FDCWD, AT_REMOVEDIR,
+    AT_SYMLINK_NOFOLLOW, EACCES, EAFNOSUPPORT, EAGAIN, EBADF, ECHILD, EFAULT, EINTR, EINVAL,
+    ELOOP, ENOENT, ENOEXEC, ENOMEM, ENOSYS, ENOTTY, EPERM, EPIPE, ERANGE, ESRCH, ETIMEDOUT,
+    O_CLOEXEC, O_NONBLOCK, S_IFDIR,
 };
 use elf2wasm_core::elf_loader::{BRK_START, MMAP_START};
 use elf2wasm_core::lifter::DEFAULT_QUANTUM;
@@ -37,24 +38,33 @@ const SYS_RT_SIGPROCMASK: i64 = 14;
 const SYS_IOCTL: i64 = 16;
 const SYS_PREAD64: i64 = 17;
 const SYS_PWRITE64: i64 = 18;
+const SYS_READV: i64 = 19;
 const SYS_WRITEV: i64 = 20;
 const SYS_ACCESS: i64 = 21;
 const SYS_PIPE: i64 = 22;
 const SYS_SELECT: i64 = 23;
 const SYS_SCHED_YIELD: i64 = 24;
 const SYS_MREMAP: i64 = 25;
+const SYS_MADVISE: i64 = 28;
 const SYS_DUP: i64 = 32;
 const SYS_DUP2: i64 = 33;
 const SYS_NANOSLEEP: i64 = 35;
 const SYS_GETPID: i64 = 39;
+const SYS_SOCKET: i64 = 41;
+const SYS_SENDTO: i64 = 44;
+const SYS_RECVFROM: i64 = 45;
+const SYS_SOCKETPAIR: i64 = 53;
 const SYS_CLONE: i64 = 56;
 const SYS_FORK: i64 = 57;
 const SYS_VFORK: i64 = 58;
 const SYS_EXECVE: i64 = 59;
 const SYS_EXIT: i64 = 60;
 const SYS_WAIT4: i64 = 61;
+const SYS_KILL: i64 = 62;
 const SYS_UNAME: i64 = 63;
 const SYS_FCNTL: i64 = 72;
+const SYS_FSYNC: i64 = 74;
+const SYS_FDATASYNC: i64 = 75;
 const SYS_TRUNCATE: i64 = 76;
 const SYS_FTRUNCATE: i64 = 77;
 const SYS_GETCWD: i64 = 79;
@@ -63,23 +73,38 @@ const SYS_FCHDIR: i64 = 81;
 const SYS_RENAME: i64 = 82;
 const SYS_MKDIR: i64 = 83;
 const SYS_RMDIR: i64 = 84;
+const SYS_LINK: i64 = 86;
 const SYS_UNLINK: i64 = 87;
 const SYS_SYMLINK: i64 = 88;
 const SYS_READLINK: i64 = 89;
 const SYS_CHMOD: i64 = 90;
 const SYS_FCHMOD: i64 = 91;
+const SYS_CHOWN: i64 = 92;
+const SYS_FCHOWN: i64 = 93;
+const SYS_LCHOWN: i64 = 94;
+const SYS_UMASK: i64 = 95;
 const SYS_GETTIMEOFDAY: i64 = 96;
 const SYS_GETRLIMIT: i64 = 97;
+const SYS_GETRUSAGE: i64 = 98;
 const SYS_SYSINFO: i64 = 99;
+const SYS_TIMES: i64 = 100;
 const SYS_GETUID: i64 = 102;
 const SYS_GETGID: i64 = 104;
+const SYS_SETUID: i64 = 105;
+const SYS_SETGID: i64 = 106;
 const SYS_GETEUID: i64 = 107;
 const SYS_GETEGID: i64 = 108;
 const SYS_SETPGID: i64 = 109;
 const SYS_GETPPID: i64 = 110;
 const SYS_GETPGRP: i64 = 111;
+const SYS_SETSID: i64 = 112;
+const SYS_GETGROUPS: i64 = 115;
+const SYS_SETGROUPS: i64 = 116;
 const SYS_GETPGID: i64 = 121;
+const SYS_GETSID: i64 = 124;
 const SYS_SIGALTSTACK: i64 = 131;
+const SYS_STATFS: i64 = 137;
+const SYS_FSTATFS: i64 = 138;
 const SYS_PRCTL: i64 = 157;
 const SYS_ARCH_PRCTL: i64 = 158;
 const SYS_GETTID: i64 = 186;
@@ -93,13 +118,17 @@ const SYS_CLOCK_GETTIME: i64 = 228;
 const SYS_CLOCK_GETRES: i64 = 229;
 const SYS_CLOCK_NANOSLEEP: i64 = 230;
 const SYS_EXIT_GROUP: i64 = 231;
+const SYS_EPOLL_WAIT: i64 = 232;
+const SYS_EPOLL_CTL: i64 = 233;
 const SYS_TGKILL: i64 = 234;
 const SYS_WAITID: i64 = 247;
 const SYS_OPENAT: i64 = 257;
 const SYS_MKDIRAT: i64 = 258;
+const SYS_FCHOWNAT: i64 = 260;
 const SYS_NEWFSTATAT: i64 = 262;
 const SYS_UNLINKAT: i64 = 263;
 const SYS_RENAMEAT: i64 = 264;
+const SYS_LINKAT: i64 = 265;
 const SYS_SYMLINKAT: i64 = 266;
 const SYS_READLINKAT: i64 = 267;
 const SYS_FCHMODAT: i64 = 268;
@@ -108,6 +137,9 @@ const SYS_PSELECT6: i64 = 270;
 const SYS_PPOLL: i64 = 271;
 const SYS_SET_ROBUST_LIST: i64 = 273;
 const SYS_UTIMENSAT: i64 = 280;
+const SYS_EPOLL_PWAIT: i64 = 281;
+const SYS_EVENTFD2: i64 = 290;
+const SYS_EPOLL_CREATE1: i64 = 291;
 const SYS_DUP3: i64 = 292;
 const SYS_PIPE2: i64 = 293;
 const SYS_PRLIMIT64: i64 = 302;
@@ -145,18 +177,169 @@ const POLLERR: i16 = 0x0008;
 const POLLHUP: i16 = 0x0010;
 const POLLNVAL: i16 = 0x0020;
 
+#[derive(Debug, Clone)]
+pub struct MmapAllocator {
+    pub cursor: u32,
+    pub free_regions: BTreeMap<u32, u32>,
+}
+
+impl MmapAllocator {
+    pub fn new() -> Self {
+        Self {
+            cursor: MMAP_START,
+            free_regions: BTreeMap::new(),
+        }
+    }
+
+    pub fn alloc(&mut self, aligned_len: u32) -> Option<u32> {
+        if aligned_len == 0 {
+            return None;
+        }
+        let found = self
+            .free_regions
+            .iter()
+            .find(|(_, &len)| len >= aligned_len)
+            .map(|(&start, &len)| (start, len));
+        if let Some((start, len)) = found {
+            self.free_regions.remove(&start);
+            if len > aligned_len {
+                self.free_regions
+                    .insert(start + aligned_len, len - aligned_len);
+            }
+            return Some(start);
+        }
+        let next = self.cursor.checked_add(aligned_len)?;
+        if next > MMAP_ALLOC_END {
+            return None;
+        }
+        let addr = self.cursor;
+        self.cursor = next;
+        Some(addr)
+    }
+
+    pub fn free(&mut self, addr: u32, aligned_len: u32) {
+        if aligned_len == 0 {
+            return;
+        }
+        let mut start = addr.max(MMAP_START);
+        let mut end = addr.saturating_add(aligned_len).min(self.cursor);
+        if start >= end {
+            return;
+        }
+        if let Some((&pred_start, &pred_len)) = self.free_regions.range(..=start).next_back() {
+            let pred_end = pred_start.saturating_add(pred_len);
+            if pred_end >= start {
+                start = pred_start;
+                end = end.max(pred_end);
+                self.free_regions.remove(&pred_start);
+            }
+        }
+        let succs: Vec<(u32, u32)> = self
+            .free_regions
+            .range(start..=end)
+            .map(|(&k, &v)| (k, v))
+            .collect();
+        for (k, v) in succs {
+            self.free_regions.remove(&k);
+            end = end.max(k.saturating_add(v));
+        }
+        if end == self.cursor {
+            self.cursor = start;
+        } else {
+            self.free_regions.insert(start, end - start);
+        }
+    }
+
+    pub fn reserve_fixed(&mut self, addr: u32, aligned_len: u32) {
+        if aligned_len == 0 {
+            return;
+        }
+        let start = addr.max(MMAP_START);
+        let end = addr.saturating_add(aligned_len).min(MMAP_ALLOC_END);
+        if start >= end {
+            return;
+        }
+        if end > self.cursor {
+            if start > self.cursor {
+                let mut gap_start = self.cursor;
+                let gap_end = start;
+                if let Some((&pred_start, &pred_len)) =
+                    self.free_regions.range(..=gap_start).next_back()
+                {
+                    if pred_start.saturating_add(pred_len) >= gap_start {
+                        gap_start = pred_start;
+                        self.free_regions.remove(&pred_start);
+                    }
+                }
+                self.free_regions.insert(gap_start, gap_end - gap_start);
+            }
+            self.cursor = end;
+        }
+        let overlapping: Vec<(u32, u32)> = self
+            .free_regions
+            .iter()
+            .filter(|(&k, &v)| k < end && k.saturating_add(v) > start)
+            .map(|(&k, &v)| (k, v))
+            .collect();
+        for (k, v) in overlapping {
+            self.free_regions.remove(&k);
+            let k_end = k.saturating_add(v);
+            if k < start {
+                self.free_regions.insert(k, start - k);
+            }
+            if k_end > end {
+                self.free_regions.insert(end, k_end - end);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TtyState {
+    pub enabled: bool,
+    pub rows: u16,
+    pub cols: u16,
+    pub fg_pgid: i32,
+    pub termios: [u8; 36],
+}
+
+impl TtyState {
+    pub fn new() -> Self {
+        let mut termios = [0u8; 36];
+        termios[0..4].copy_from_slice(&0x4500u32.to_le_bytes()); // ICRNL | IXON | IUTF8
+        termios[4..8].copy_from_slice(&0x0005u32.to_le_bytes()); // OPOST | ONLCR
+        termios[8..12].copy_from_slice(&0x00bfu32.to_le_bytes()); // B38400 | CS8 | CREAD
+        termios[12..16].copy_from_slice(&0x8a3bu32.to_le_bytes()); // ISIG | ICANON | ECHO | ...
+        termios[16] = 0; // c_line
+        let cc: [u8; 19] = [
+            3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0,
+        ];
+        termios[17..36].copy_from_slice(&cc);
+        Self {
+            enabled: false,
+            rows: 24,
+            cols: 80,
+            fg_pgid: MAIN_PID,
+            termios,
+        }
+    }
+}
+
 pub struct ProcessState {
     pub pid: i32,
     pub ppid: i32,
     pub pgid: i32,
+    pub sid: i32,
+    pub umask: u32,
     pub fds: BTreeMap<i32, OpenFile>,
     pub next_fd: i32,
     pub cwd: String,
     pub elf_path: String,
     pub so_entries: Vec<SoEntry>,
     pub brk_curr: u32,
-    pub mmap_cursor: u32,
+    pub mmap_alloc: MmapAllocator,
     pub scheduler: Scheduler,
+    pub sig_handlers: BTreeMap<i32, u64>,
     pub exited: bool,
     pub zombie: bool,
     pub exit_status: i32,
@@ -164,19 +347,22 @@ pub struct ProcessState {
 }
 
 impl ProcessState {
-    fn empty_slot(pid: i32, ppid: i32, pgid: i32) -> Self {
+    fn empty_slot(pid: i32, ppid: i32, pgid: i32, sid: i32) -> Self {
         Self {
             pid,
             ppid,
             pgid,
+            sid,
+            umask: 0o022,
             fds: BTreeMap::new(),
             next_fd: 3,
             cwd: String::new(),
             elf_path: String::new(),
             so_entries: Vec::new(),
             brk_curr: BRK_START,
-            mmap_cursor: MMAP_START,
+            mmap_alloc: MmapAllocator::new(),
             scheduler: Scheduler::new_with_tid(pid, 0, 0),
+            sig_handlers: BTreeMap::new(),
             exited: false,
             zombie: false,
             exit_status: 0,
@@ -205,7 +391,7 @@ pub struct HostState {
     pub vfs: VirtualFs,
     pub scheduler: Scheduler,
     pub brk_curr: u32,
-    pub mmap_cursor: u32,
+    pub mmap_alloc: MmapAllocator,
     pub prng_state: u64,
     pub active_pid: i32,
     pub next_pid: i32,
@@ -213,17 +399,28 @@ pub struct HostState {
     pub processes: BTreeMap<i32, ProcessState>,
     pub pending_action: Option<PendingHostAction>,
     pub multiproc_enabled: bool,
+    pub tty: TtyState,
+    pub stdin_open: bool,
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub groups: Vec<u32>,
+    pub reaped_pids: Vec<i32>,
 }
 
 impl HostState {
     pub fn new(vfs: VirtualFs) -> Self {
         let mut processes = BTreeMap::new();
-        processes.insert(MAIN_PID, ProcessState::empty_slot(MAIN_PID, 1, MAIN_PID));
+        processes.insert(
+            MAIN_PID,
+            ProcessState::empty_slot(MAIN_PID, 1, MAIN_PID, MAIN_PID),
+        );
         Self {
             vfs,
             scheduler: Scheduler::new(),
             brk_curr: BRK_START,
-            mmap_cursor: MMAP_START,
+            mmap_alloc: MmapAllocator::new(),
             prng_state: 0x9e37_79b9_7f4a_7c15,
             active_pid: MAIN_PID,
             next_pid: MAIN_PID + 1,
@@ -231,7 +428,44 @@ impl HostState {
             processes,
             pending_action: None,
             multiproc_enabled: false,
+            tty: TtyState::new(),
+            stdin_open: false,
+            uid: 1000,
+            euid: 1000,
+            gid: 1000,
+            egid: 1000,
+            groups: vec![1000],
+            reaped_pids: Vec::new(),
         }
+    }
+
+    pub fn set_uid_gid(&mut self, uid: u32, gid: u32) {
+        self.uid = uid;
+        self.euid = uid;
+        self.gid = gid;
+        self.egid = gid;
+        self.groups = vec![gid];
+        self.vfs.uid = uid;
+        self.vfs.gid = gid;
+    }
+
+    pub fn set_tty_mode(&mut self, enabled: bool) {
+        self.tty.enabled = enabled;
+        self.vfs.stdin_eof = !(self.tty.enabled || self.stdin_open);
+    }
+
+    pub fn set_stdin_open(&mut self, open: bool) {
+        self.stdin_open = open;
+        self.vfs.stdin_eof = !(self.tty.enabled || self.stdin_open);
+    }
+
+    pub fn set_winsize(&mut self, rows: u32, cols: u32) {
+        self.tty.rows = rows.clamp(1, u16::MAX as u32) as u16;
+        self.tty.cols = cols.clamp(1, u16::MAX as u32) as u16;
+    }
+
+    pub fn take_reaped_pids(&mut self) -> Vec<i32> {
+        core::mem::take(&mut self.reaped_pids)
     }
 
     pub fn alloc_pid(&mut self) -> i32 {
@@ -247,12 +481,7 @@ impl HostState {
     }
 
     fn next_rand_u64(&mut self) -> u64 {
-        let mut x = self.prng_state;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.prng_state = x;
-        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        self.vfs.next_rand_u64()
     }
 
     pub fn switch_active_process(&mut self, new_pid: i32) {
@@ -264,25 +493,177 @@ impl HostState {
         if let Some(old_p) = self.processes.get_mut(&self.active_pid) {
             core::mem::swap(&mut self.vfs.fds, &mut old_p.fds);
             old_p.next_fd = self.vfs.next_fd;
+            old_p.umask = self.vfs.umask;
             core::mem::swap(&mut self.vfs.cwd, &mut old_p.cwd);
             core::mem::swap(&mut self.vfs.elf_path, &mut old_p.elf_path);
             core::mem::swap(&mut self.vfs.so_entries, &mut old_p.so_entries);
             old_p.brk_curr = self.brk_curr;
-            old_p.mmap_cursor = self.mmap_cursor;
+            core::mem::swap(&mut self.mmap_alloc, &mut old_p.mmap_alloc);
             core::mem::swap(&mut self.scheduler, &mut old_p.scheduler);
         }
         if let Some(new_p) = self.processes.get_mut(&new_pid) {
             core::mem::swap(&mut self.vfs.fds, &mut new_p.fds);
             self.vfs.next_fd = new_p.next_fd;
+            self.vfs.umask = new_p.umask;
             core::mem::swap(&mut self.vfs.cwd, &mut new_p.cwd);
             core::mem::swap(&mut self.vfs.elf_path, &mut new_p.elf_path);
             core::mem::swap(&mut self.vfs.so_entries, &mut new_p.so_entries);
             self.brk_curr = new_p.brk_curr;
-            self.mmap_cursor = new_p.mmap_cursor;
+            core::mem::swap(&mut self.mmap_alloc, &mut new_p.mmap_alloc);
             core::mem::swap(&mut self.scheduler, &mut new_p.scheduler);
             self.scheduler.virtual_mono_ns = mono;
             self.scheduler.realtime_base_ns = rt_base;
             self.active_pid = new_pid;
+            self.vfs.current_pid = new_p.pid;
+            self.vfs.current_ppid = new_p.ppid;
+            self.vfs.current_pgid = new_p.pgid;
+        }
+    }
+
+    pub fn send_sigint(&mut self) {
+        let fg_pgid = self.tty.fg_pgid;
+        let mut targets: Vec<i32> = self
+            .processes
+            .values()
+            .filter(|p| !p.exited && p.pgid == fg_pgid)
+            .map(|p| p.pid)
+            .collect();
+        if targets.is_empty() {
+            targets = self
+                .processes
+                .values()
+                .filter(|p| !p.exited && p.pid != MAIN_PID)
+                .map(|p| p.pid)
+                .collect();
+        }
+        if targets.is_empty() && !self.is_main_exited() {
+            targets.push(MAIN_PID);
+        }
+        for pid in targets {
+            self.deliver_signal(None, pid, 2);
+        }
+        self.wake_ready_waiters();
+    }
+
+    pub fn deliver_signal(
+        &mut self,
+        ctx: Option<&mut dyn GuestContext>,
+        target_pid: i32,
+        sig: i32,
+    ) {
+        let Some(exited) = self.processes.get(&target_pid).map(|p| p.exited) else {
+            return;
+        };
+        if exited || sig == 0 {
+            return;
+        }
+        let handler = self
+            .processes
+            .get(&target_pid)
+            .and_then(|p| p.sig_handlers.get(&sig).copied())
+            .unwrap_or(0);
+
+        let should_terminate = match sig {
+            9 => true, // SIGKILL
+            2 | 15 => handler == 0 && target_pid != MAIN_PID,
+            _ => false,
+        };
+
+        if should_terminate {
+            let pipe_ids: Vec<u64> = if target_pid == self.active_pid {
+                let ids = self
+                    .vfs
+                    .fds
+                    .values()
+                    .flat_map(|f| f.pipe_id.into_iter().chain(f.sock_write_pipe_id))
+                    .collect();
+                self.vfs.close_all_fds();
+                ids
+            } else {
+                let old_fds = if let Some(p) = self.processes.get_mut(&target_pid) {
+                    core::mem::take(&mut p.fds)
+                } else {
+                    BTreeMap::new()
+                };
+                let mut ids = Vec::new();
+                for f in old_fds.values() {
+                    if let Some(pid) = f.pipe_id {
+                        ids.push(pid);
+                    }
+                    if let Some(wpid) = f.sock_write_pipe_id {
+                        ids.push(wpid);
+                    }
+                }
+                // Decrement pipe refcounts for inactive process FDs
+                let saved = core::mem::replace(&mut self.vfs.fds, old_fds);
+                self.vfs.close_all_fds();
+                self.vfs.fds = saved;
+                ids
+            };
+            for pipe_id in pipe_ids {
+                self.wake_pipe_waiters(pipe_id);
+            }
+            self.wake_vfork_parent_for(target_pid);
+            if let Some(p) = self.processes.get_mut(&target_pid) {
+                if !p.exited {
+                    p.exited = true;
+                    p.zombie = target_pid != MAIN_PID;
+                    p.exit_status = sig & 0x7f;
+                    if target_pid != MAIN_PID {
+                        self.reaped_pids.push(target_pid);
+                    }
+                }
+            }
+            if target_pid == self.active_pid {
+                if let Some(c) = ctx {
+                    if target_pid == MAIN_PID {
+                        c.set_exit(128 + (sig & 0x7f));
+                    } else {
+                        c.set_yield_flag(1);
+                    }
+                }
+            }
+            self.wake_ready_waiters();
+            return;
+        }
+
+        if handler == 1 {
+            // SIG_IGN
+            return;
+        }
+
+        // Interrupt blocked threads in target_pid with -EINTR (for trapped signals or SIGINT on MAIN_PID)
+        let sched = if target_pid == self.active_pid {
+            &mut self.scheduler
+        } else if let Some(p) = self.processes.get_mut(&target_pid) {
+            &mut p.scheduler
+        } else {
+            return;
+        };
+        let tids: Vec<i32> = sched.threads.keys().copied().collect();
+        for tid in tids {
+            let is_blocked = sched.threads.get(&tid).map_or(false, |t| {
+                matches!(
+                    t.state,
+                    ThreadState::StdinReadWait { .. }
+                        | ThreadState::Sleeping { .. }
+                        | ThreadState::PollWait { .. }
+                        | ThreadState::Wait4Wait { .. }
+                        | ThreadState::PipeReadWait { .. }
+                        | ThreadState::PipeWriteWait { .. }
+                        | ThreadState::FutexWait { .. }
+                )
+            });
+            if is_blocked {
+                if let Some(t) = sched.threads.get_mut(&tid) {
+                    t.state = ThreadState::Runnable;
+                    t.pending_wakeup = None;
+                    t.set_rax(-EINTR);
+                    if !sched.run_queue.contains(&tid) {
+                        sched.run_queue.push_back(tid);
+                    }
+                }
+            }
         }
     }
 
@@ -450,6 +831,45 @@ impl HostState {
         let Some(f) = fds.get(&fd) else {
             return POLLNVAL;
         };
+        if let Some(wpid) = f.sock_write_pipe_id {
+            let mut revents = 0i16;
+            if let Some(rpid) = f.pipe_id {
+                match self.vfs.pipes.get(&rpid) {
+                    Some(p) => {
+                        if !p.buf.is_empty() && (events & POLLIN) != 0 {
+                            revents |= POLLIN;
+                        }
+                        if p.writers == 0 {
+                            revents |= POLLHUP;
+                        }
+                    }
+                    None => revents |= POLLHUP,
+                }
+            }
+            match self.vfs.pipes.get(&wpid) {
+                Some(p) => {
+                    if p.readers == 0 {
+                        revents |= POLLERR;
+                    } else if p.buf.len() < p.capacity && (events & POLLOUT) != 0 {
+                        revents |= POLLOUT;
+                    }
+                }
+                None => revents |= POLLERR,
+            }
+            return revents;
+        }
+        if let Some(eid) = f.eventfd_id {
+            let mut revents = 0i16;
+            if let Some(efd) = self.vfs.eventfds.get(&eid) {
+                if efd.counter > 0 && (events & POLLIN) != 0 {
+                    revents |= POLLIN;
+                }
+                if efd.counter < u64::MAX - 1 && (events & POLLOUT) != 0 {
+                    revents |= POLLOUT;
+                }
+            }
+            return revents;
+        }
         if let Some(pid) = f.pipe_id {
             let Some(p) = self.vfs.pipes.get(&pid) else {
                 return POLLHUP;
@@ -471,16 +891,22 @@ impl HostState {
             }
             return revents;
         }
+        if f.is_std == Some(0) || f.dev == Some(VirtualDevice::Tty) {
+            let mut revents = 0i16;
+            if (events & POLLIN) != 0
+                && (self.vfs.inherit_stdin
+                    || self.vfs.stdin_available() > 0
+                    || self.vfs.stdin_eof)
+            {
+                revents |= POLLIN;
+            }
+            if f.dev == Some(VirtualDevice::Tty) && f.writable && (events & POLLOUT) != 0 {
+                revents |= POLLOUT;
+            }
+            return revents;
+        }
         if let Some(std_fd) = f.is_std {
             let mut revents = 0i16;
-            if std_fd == 0 && (events & POLLIN) != 0 {
-                if self.vfs.inherit_stdin || self.vfs.stdin_data.len() > self.vfs.stdin_cursor_val()
-                {
-                    revents |= POLLIN;
-                } else {
-                    revents |= POLLIN;
-                }
-            }
             if (std_fd == 1 || std_fd == 2) && (events & POLLOUT) != 0 {
                 revents |= POLLOUT;
             }
@@ -522,10 +948,79 @@ impl HostState {
                 }
                 false
             }
+            PollKind::Epoll { epfd, .. } => {
+                let Some(eid) = fds.get(epfd).and_then(|f| f.epoll_id) else {
+                    return true;
+                };
+                let Some(inst) = self.vfs.epolls.get(&eid) else {
+                    return true;
+                };
+                inst.entries.iter().any(|(&fd, entry)| {
+                    let ev = (entry.events & 0xffff) as i16;
+                    let rev = self.eval_fd_events(fds, fd, ev);
+                    rev != 0 && rev != POLLNVAL
+                })
+            }
         }
     }
 
-    fn wake_ready_waiters(&mut self) {
+    fn poll_kind_watches_stdin(&self, pid: i32, kind: &PollKind) -> bool {
+        let fds = self.poll_fds_ref(pid);
+        let is_stdin_fd = |fd: i32| {
+            fds.get(&fd)
+                .map_or(false, |f| f.is_std == Some(0) || f.dev == Some(VirtualDevice::Tty))
+        };
+        match kind {
+            PollKind::Poll { fds: specs, .. } => specs
+                .iter()
+                .any(|s| s.fd >= 0 && (s.events & POLLIN) != 0 && is_stdin_fd(s.fd)),
+            PollKind::Select {
+                nfds,
+                orig_read_mask,
+                ..
+            } => (0..*nfds).any(|fd| {
+                let byte_idx = (fd / 8) as usize;
+                let bit = 1u8 << (fd % 8);
+                orig_read_mask.get(byte_idx).map_or(false, |b| (b & bit) != 0) && is_stdin_fd(fd)
+            }),
+            PollKind::Epoll { epfd, .. } => {
+                let Some(eid) = fds.get(epfd).and_then(|f| f.epoll_id) else {
+                    return false;
+                };
+                self.vfs.epolls.get(&eid).map_or(false, |inst| {
+                    inst.entries
+                        .iter()
+                        .any(|(&fd, entry)| (entry.events & (POLLIN as u32)) != 0 && is_stdin_fd(fd))
+                })
+            }
+        }
+    }
+
+    fn has_stdin_waiter(&self, pid: i32) -> bool {
+        let sched = if pid == self.active_pid {
+            &self.scheduler
+        } else if let Some(p) = self.processes.get(&pid) {
+            if p.exited {
+                return false;
+            }
+            &p.scheduler
+        } else {
+            return false;
+        };
+        if self.processes.get(&pid).map_or(true, |p| p.exited) {
+            return false;
+        }
+        sched.threads.values().any(|t| match &t.state {
+            ThreadState::StdinReadWait { .. } => true,
+            ThreadState::PollWait {
+                kind,
+                wake_ns: None,
+            } => self.poll_kind_watches_stdin(pid, kind),
+            _ => false,
+        })
+    }
+
+    pub fn wake_ready_waiters(&mut self) {
         let active_pid = self.active_pid;
         let all_pids: Vec<i32> = self.processes.keys().copied().collect();
         for pid in all_pids {
@@ -583,6 +1078,13 @@ impl HostState {
                             None
                         }
                     }
+                    ThreadState::StdinReadWait { buf_addr, count } => {
+                        if self.vfs.stdin_available() > 0 || self.vfs.stdin_eof {
+                            Some(PendingWakeup::StdinRead { buf_addr, count })
+                        } else {
+                            None
+                        }
+                    }
                     ThreadState::Wait4Wait {
                         target_pid,
                         wstatus_addr,
@@ -624,7 +1126,9 @@ impl HostState {
                     if let Some(t) = sched.threads.get_mut(&tid) {
                         t.state = ThreadState::Runnable;
                         t.pending_wakeup = Some(w);
-                        sched.run_queue.push_back(tid);
+                        if !sched.run_queue.contains(&tid) {
+                            sched.run_queue.push_back(tid);
+                        }
                     }
                 }
             }
@@ -645,6 +1149,35 @@ impl HostState {
             PendingWakeup::SetChildTid { addr, tid } => {
                 let _ = write_bytes(ctx, addr, &tid.to_le_bytes());
                 Ok(true)
+            }
+            PendingWakeup::StdinRead { buf_addr, count } => {
+                if self.vfs.stdin_available() > 0 {
+                    let cursor = self.vfs.stdin_cursor_val();
+                    let avail = self.vfs.stdin_available();
+                    let n = avail.min(count);
+                    let bytes = self.vfs.stdin_data[cursor..cursor + n].to_vec();
+                    let ret = match write_bytes(ctx, buf_addr, &bytes) {
+                        Ok(()) => {
+                            self.vfs.advance_read_cursor(0, n);
+                            n as i64
+                        }
+                        Err(e) => e,
+                    };
+                    if let Some(t) = self.scheduler.threads.get_mut(&cur_tid) {
+                        t.set_rax(ret);
+                    }
+                    Ok(true)
+                } else if self.vfs.stdin_eof {
+                    if let Some(t) = self.scheduler.threads.get_mut(&cur_tid) {
+                        t.set_rax(0);
+                    }
+                    Ok(true)
+                } else {
+                    if let Some(t) = self.scheduler.threads.get_mut(&cur_tid) {
+                        t.state = ThreadState::StdinReadWait { buf_addr, count };
+                    }
+                    Ok(false)
+                }
             }
             PendingWakeup::PipeRead {
                 pipe_id,
@@ -747,7 +1280,7 @@ impl HostState {
                                     si[0..4].copy_from_slice(&17i32.to_le_bytes()); // si_signo = SIGCHLD
                                     si[8..12].copy_from_slice(&1i32.to_le_bytes()); // si_code = CLD_EXITED
                                     si[16..20].copy_from_slice(&zpid.to_le_bytes()); // si_pid
-                                    si[20..24].copy_from_slice(&1000u32.to_le_bytes()); // si_uid
+                                    si[20..24].copy_from_slice(&self.uid.to_le_bytes()); // si_uid
                                     si[24..28].copy_from_slice(&((exit_status >> 8) & 0xff).to_le_bytes());
                                     match write_bytes(ctx, infop, &si) {
                                         Ok(()) => 0,
@@ -868,6 +1401,40 @@ impl HostState {
                     }
                 }
                 count
+            }
+            PollKind::Epoll {
+                epfd,
+                events_addr,
+                maxevents,
+            } => {
+                if timed_out {
+                    return 0;
+                }
+                let Some(eid) = self.vfs.fds.get(epfd).and_then(|f| f.epoll_id) else {
+                    return -EBADF;
+                };
+                let Some(inst) = self.vfs.epolls.get(&eid) else {
+                    return -EBADF;
+                };
+                let mut count = 0usize;
+                for (&fd, entry) in &inst.entries {
+                    if count >= *maxevents {
+                        break;
+                    }
+                    let ev = (entry.events & 0xffff) as i16;
+                    let rev = self.eval_fd_events(&self.vfs.fds, fd, ev);
+                    if rev != 0 && rev != POLLNVAL {
+                        // Linux x86-64 struct epoll_event is 12 bytes packed: u32 events, u64 data
+                        let mut buf = [0u8; 12];
+                        buf[0..4].copy_from_slice(&(rev as u16 as u32).to_le_bytes());
+                        buf[4..12].copy_from_slice(&entry.data.to_le_bytes());
+                        if let Err(e) = write_bytes(ctx, *events_addr + (count as u64) * 12, &buf) {
+                            return e;
+                        }
+                        count += 1;
+                    }
+                }
+                count as i64
             }
         }
     }
@@ -1073,6 +1640,19 @@ impl HostState {
             }
 
             let Some(target_ns) = min_wake else {
+                // Check if any live process is blocked waiting for interactive stdin
+                if self.has_stdin_waiter(self.active_pid) {
+                    return Ok(5);
+                }
+                let other_stdin_pid = self
+                    .processes
+                    .keys()
+                    .copied()
+                    .find(|&pid| pid != self.active_pid && self.has_stdin_waiter(pid));
+                if let Some(spid) = other_stdin_pid {
+                    self.switch_active_process(spid);
+                    return Ok(5);
+                }
                 return Ok(0);
             };
             let now_ns = self.scheduler.virtual_mono_ns.max(target_ns);
@@ -1100,12 +1680,45 @@ impl HostState {
     }
 
     pub fn resume_active(&mut self, ctx: &mut dyn GuestContext) -> Result<bool, i64> {
+        if self
+            .processes
+            .get(&self.active_pid)
+            .map_or(true, |p| p.exited)
+        {
+            ctx.set_yield_flag(1);
+            return Ok(false);
+        }
+        let cur_tid = self.scheduler.current_tid;
+        let cur_runnable = self
+            .scheduler
+            .threads
+            .get(&cur_tid)
+            .map_or(false, |t| t.state == ThreadState::Runnable);
+        if !cur_runnable {
+            if let Some(next_tid) = self.scheduler.pop_next_runnable() {
+                self.scheduler.current_tid = next_tid;
+            } else {
+                ctx.set_yield_flag(1);
+                return Ok(false);
+            }
+        }
+        let active_tid = self.scheduler.current_tid;
+        self.scheduler.run_queue.retain(|&id| id != active_tid);
+
         if !self.complete_pending_wakeup(ctx)? {
             ctx.set_yield_flag(1);
             return Ok(false);
         }
         let cur_tid = self.scheduler.current_tid;
-        let regs = self.scheduler.threads.get(&cur_tid).unwrap().regs;
+        let Some(thread) = self.scheduler.threads.get(&cur_tid) else {
+            ctx.set_yield_flag(1);
+            return Ok(false);
+        };
+        if thread.state != ThreadState::Runnable {
+            ctx.set_yield_flag(1);
+            return Ok(false);
+        }
+        let regs = thread.regs;
         ctx.load_ctx(self.scheduler.scratch_addr, &regs)?;
         ctx.set_yield_flag(0);
         ctx.set_quantum(DEFAULT_QUANTUM);
@@ -1128,13 +1741,19 @@ impl HostState {
         if !meta.elf_path.is_empty() {
             self.vfs.elf_path = meta.elf_path.clone();
         }
+        self.vfs.cmdline = args.to_vec();
+        if let Some(p) = self.processes.get_mut(&pid) {
+            // POSIX exec resets all caught signal handlers to SIG_DFL, preserving SIG_IGN (1)
+            p.sig_handlers.retain(|_, &mut h| h == 1);
+        }
         self.brk_curr = BRK_START;
-        self.mmap_cursor = MMAP_START;
+        self.mmap_alloc = MmapAllocator::new();
         let mono = self.scheduler.virtual_mono_ns;
         let rt_base = self.scheduler.realtime_base_ns;
         self.scheduler = Scheduler::new_with_tid(pid, mono, rt_base);
 
-        let rsp = setup_guest_stack_ctx(ctx, meta, args, env).map_err(|_| -ENOMEM)?;
+        let rsp = setup_guest_stack_ctx_with_ids(ctx, meta, args, env, self.uid, self.gid)
+            .map_err(|_| -ENOMEM)?;
         ctx.set_rsp(rsp as i64);
         ctx.set_rip(meta.entry_rip as i64);
         ctx.set_yield_flag(0);
@@ -1149,13 +1768,23 @@ impl HostState {
         self.next_pid = MAIN_PID + 1;
         self.next_tid = MAIN_PID + 1;
         self.pending_action = None;
+        self.reaped_pids.clear();
+        self.tty.fg_pgid = MAIN_PID;
         self.processes.clear();
-        self.processes
-            .insert(MAIN_PID, ProcessState::empty_slot(MAIN_PID, 1, MAIN_PID));
+        self.processes.insert(
+            MAIN_PID,
+            ProcessState::empty_slot(MAIN_PID, 1, MAIN_PID, MAIN_PID),
+        );
         self.brk_curr = BRK_START;
-        self.mmap_cursor = MMAP_START;
+        self.mmap_alloc = MmapAllocator::new();
         self.scheduler = Scheduler::new_with_tid(MAIN_PID, mono, rt_base);
         self.vfs.reset_fds_and_stdio();
+        self.vfs.stdin_eof = !(self.tty.enabled || self.stdin_open);
+        self.vfs.current_pid = MAIN_PID;
+        self.vfs.current_ppid = 1;
+        self.vfs.current_pgid = MAIN_PID;
+        self.vfs.uid = self.uid;
+        self.vfs.gid = self.gid;
     }
 }
 
@@ -1209,14 +1838,20 @@ fn read_timespec(ctx: &dyn GuestContext, addr: u64) -> Result<(i64, i64), i64> {
     Ok((sec, nsec))
 }
 
-fn write_stat(ctx: &mut dyn GuestContext, addr: u64, st: &FileStat) -> Result<(), i64> {
+fn write_stat(
+    ctx: &mut dyn GuestContext,
+    addr: u64,
+    st: &FileStat,
+    uid: u32,
+    gid: u32,
+) -> Result<(), i64> {
     let mut buf = [0u8; 144];
     buf[0..8].copy_from_slice(&1u64.to_le_bytes()); // st_dev
     buf[8..16].copy_from_slice(&st.st_ino.to_le_bytes());
     buf[16..24].copy_from_slice(&st.st_nlink.to_le_bytes());
     buf[24..28].copy_from_slice(&st.st_mode.to_le_bytes());
-    buf[28..32].copy_from_slice(&1000u32.to_le_bytes()); // st_uid
-    buf[32..36].copy_from_slice(&1000u32.to_le_bytes()); // st_gid
+    buf[28..32].copy_from_slice(&uid.to_le_bytes()); // st_uid
+    buf[32..36].copy_from_slice(&gid.to_le_bytes()); // st_gid
     buf[48..56].copy_from_slice(&st.st_size.to_le_bytes());
     buf[56..64].copy_from_slice(&4096i64.to_le_bytes()); // st_blksize
     let blocks = (st.st_size + 511) / 512;
@@ -1244,6 +1879,7 @@ pub fn handle_syscall(
     a5: i64,
 ) -> i64 {
     state.scheduler.advance_syscall_time();
+    state.vfs.uptime_ns = state.scheduler.virtual_mono_ns;
     let ret = handle_syscall_inner(ctx, state, nr, a0, a1, a2, a3, a4, a5);
     if ctx.trace_enabled() {
         ctx.trace_log(&format!(
@@ -1252,6 +1888,102 @@ pub fn handle_syscall(
         ));
     }
     ret
+}
+
+fn read_into_guest(
+    ctx: &mut dyn GuestContext,
+    state: &mut HostState,
+    fd: i32,
+    buf_addr: u64,
+    count: usize,
+) -> i64 {
+    if count > 0 {
+        let mem_size = ctx.mem_len();
+        if buf_addr == 0 || usize::try_from(buf_addr).map_or(true, |s| s >= mem_size) {
+            return -EFAULT;
+        }
+    }
+    if let Some(f) = state.vfs.get_fd(fd).cloned() {
+        if let Some(pipe_id) = f.pipe_id {
+            if f.writable && f.sock_write_pipe_id.is_none() {
+                return -EBADF;
+            }
+            if count == 0 {
+                return 0;
+            }
+            let (drained, writers) = match state.vfs.pipes.get_mut(&pipe_id) {
+                Some(p) => {
+                    let n = count.min(p.buf.len());
+                    let mut d = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        if let Some(b) = p.buf.pop_front() {
+                            d.push(b);
+                        }
+                    }
+                    (d, p.writers)
+                }
+                None => (Vec::new(), 0),
+            };
+            if !drained.is_empty() {
+                if let Err(e) = write_bytes(ctx, buf_addr, &drained) {
+                    return e;
+                }
+                state.wake_pipe_waiters(pipe_id);
+                return drained.len() as i64;
+            }
+            if writers == 0 {
+                return 0;
+            }
+            if f.nonblock {
+                return -EAGAIN;
+            }
+            state.scheduler.current_thread_mut().state = ThreadState::PipeReadWait {
+                pipe_id,
+                buf_addr,
+                count,
+            };
+            ctx.set_yield_flag(1);
+            return 0;
+        }
+        if (f.is_std == Some(0) || f.dev == Some(VirtualDevice::Tty))
+            && count > 0
+            && !state.vfs.inherit_stdin
+            && state.vfs.stdin_available() == 0
+        {
+            if state.vfs.stdin_eof {
+                return 0;
+            }
+            if f.nonblock {
+                return -EAGAIN;
+            }
+            state.scheduler.current_thread_mut().state = ThreadState::StdinReadWait {
+                buf_addr,
+                count,
+            };
+            ctx.set_yield_flag(1);
+            return 0;
+        }
+    }
+    let is_eventfd = state
+        .vfs
+        .get_fd(fd)
+        .map_or(false, |f| f.eventfd_id.is_some());
+    match state.vfs.read_no_advance(fd, count) {
+        Ok((bytes, host_consumed)) => {
+            let n = bytes.len();
+            if let Err(e) = write_bytes(ctx, buf_addr, &bytes) {
+                return e;
+            }
+            if !host_consumed {
+                state.vfs.advance_read_cursor(fd, n);
+            }
+            if is_eventfd {
+                state.wake_ready_waiters();
+            }
+            n as i64
+        }
+        Err(e) => e,
+    }
 }
 
 fn handle_syscall_inner(
@@ -1268,72 +2000,138 @@ fn handle_syscall_inner(
     let now_ns = state.scheduler.realtime_ns();
 
     match nr {
-        SYS_READ => {
+        SYS_READ => read_into_guest(ctx, state, a0 as i32, a1 as u64, a2 as usize),
+        SYS_READV => {
             let fd = a0 as i32;
-            let buf_addr = a1 as u64;
-            let count = a2 as usize;
-            if count > 0 {
-                let mem_size = ctx.mem_len();
-                if buf_addr == 0 || usize::try_from(buf_addr).map_or(true, |s| s >= mem_size) {
-                    return -EFAULT;
+            let iov_addr = a1 as u64;
+            let iovcnt = a2 as i32;
+            if iovcnt < 0 || iovcnt > 1024 {
+                return -EINVAL;
+            }
+            if state.vfs.get_fd(fd).is_none() {
+                return -EBADF;
+            }
+            let mut iovs: Vec<(u64, usize)> = Vec::with_capacity(iovcnt as usize);
+            let mut total_req: usize = 0;
+            for i in 0..(iovcnt as u64) {
+                let entry_addr = match i.checked_mul(16).and_then(|off| iov_addr.checked_add(off)) {
+                    Some(a) => a,
+                    None => return -EFAULT,
+                };
+                let len_addr = match entry_addr.checked_add(8) {
+                    Some(a) => a,
+                    None => return -EFAULT,
+                };
+                let base = match read_u64(ctx, entry_addr) {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
+                let len_u64 = match read_u64(ctx, len_addr) {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
+                let len = match usize::try_from(len_u64) {
+                    Ok(l) => l,
+                    Err(_) => return -EINVAL,
+                };
+                if len > 0 {
+                    total_req = total_req.saturating_add(len);
+                    iovs.push((base, len));
                 }
             }
-            if let Some(f) = state.vfs.get_fd(fd).cloned() {
-                if let Some(pipe_id) = f.pipe_id {
-                    if f.writable {
-                        return -EBADF;
-                    }
-                    if count == 0 {
-                        return 0;
-                    }
-                    let (drained, writers) = match state.vfs.pipes.get_mut(&pipe_id) {
-                        Some(p) => {
-                            let n = count.min(p.buf.len());
-                            let mut d = Vec::with_capacity(n);
-                            for _ in 0..n {
-                                if let Some(b) = p.buf.pop_front() {
-                                    d.push(b);
+            if total_req == 0 {
+                return 0;
+            }
+            // If only a single non-empty iovec, delegate directly so blocking pipes/stdin work seamlessly
+            if iovs.len() == 1 {
+                return read_into_guest(ctx, state, fd, iovs[0].0, iovs[0].1);
+            }
+            let first = iovs[0];
+            let mut total_read = 0usize;
+            for (base, len) in iovs {
+                if let Some(f) = state.vfs.get_fd(fd).cloned() {
+                    if let Some(pipe_id) = f.pipe_id {
+                        if f.writable && f.sock_write_pipe_id.is_none() {
+                            return -EBADF;
+                        }
+                        let (drained, writers) = match state.vfs.pipes.get_mut(&pipe_id) {
+                            Some(p) => {
+                                let n = len.min(p.buf.len());
+                                let mut d = Vec::with_capacity(n);
+                                for _ in 0..n {
+                                    if let Some(b) = p.buf.pop_front() {
+                                        d.push(b);
+                                    }
                                 }
+                                (d, p.writers)
                             }
-                            (d, p.writers)
+                            None => (Vec::new(), 0),
+                        };
+                        if !drained.is_empty() {
+                            if let Err(e) = write_bytes(ctx, base, &drained) {
+                                return if total_read > 0 { total_read as i64 } else { e };
+                            }
+                            state.wake_pipe_waiters(pipe_id);
+                            total_read += drained.len();
+                            if drained.len() < len {
+                                break;
+                            }
+                            continue;
                         }
-                        None => (Vec::new(), 0),
-                    };
-                    if !drained.is_empty() {
-                        if let Err(e) = write_bytes(ctx, buf_addr, &drained) {
-                            return e;
+                        if total_read > 0 || writers == 0 {
+                            break;
                         }
-                        state.wake_pipe_waiters(pipe_id);
-                        return drained.len() as i64;
-                    }
-                    if writers == 0 {
+                        if f.nonblock {
+                            return -EAGAIN;
+                        }
+                        state.scheduler.current_thread_mut().state = ThreadState::PipeReadWait {
+                            pipe_id,
+                            buf_addr: first.0,
+                            count: first.1,
+                        };
+                        ctx.set_yield_flag(1);
                         return 0;
                     }
-                    if f.nonblock {
-                        return -EAGAIN;
+                    if (f.is_std == Some(0) || f.dev == Some(VirtualDevice::Tty))
+                        && !state.vfs.inherit_stdin
+                        && state.vfs.stdin_available() == 0
+                    {
+                        if total_read > 0 || state.vfs.stdin_eof {
+                            break;
+                        }
+                        if f.nonblock {
+                            return -EAGAIN;
+                        }
+                        state.scheduler.current_thread_mut().state = ThreadState::StdinReadWait {
+                            buf_addr: first.0,
+                            count: first.1,
+                        };
+                        ctx.set_yield_flag(1);
+                        return 0;
                     }
-                    state.scheduler.current_thread_mut().state = ThreadState::PipeReadWait {
-                        pipe_id,
-                        buf_addr,
-                        count,
-                    };
-                    ctx.set_yield_flag(1);
-                    return 0;
+                }
+                match state.vfs.read_no_advance(fd, len) {
+                    Ok((bytes, host_consumed)) => {
+                        if bytes.is_empty() {
+                            break;
+                        }
+                        if let Err(e) = write_bytes(ctx, base, &bytes) {
+                            return if total_read > 0 { total_read as i64 } else { e };
+                        }
+                        if !host_consumed {
+                            state.vfs.advance_read_cursor(fd, bytes.len());
+                        }
+                        total_read += bytes.len();
+                        if bytes.len() < len {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        return if total_read > 0 { total_read as i64 } else { e };
+                    }
                 }
             }
-            match state.vfs.read_no_advance(fd, count) {
-                Ok((bytes, host_consumed)) => {
-                    let n = bytes.len();
-                    if let Err(e) = write_bytes(ctx, buf_addr, &bytes) {
-                        return e;
-                    }
-                    if !host_consumed {
-                        state.vfs.advance_read_cursor(fd, n);
-                    }
-                    n as i64
-                }
-                Err(e) => e,
-            }
+            total_read as i64
         }
         SYS_PREAD64 => {
             let fd = a0 as i32;
@@ -1472,11 +2270,17 @@ fn handle_syscall_inner(
         }
         SYS_CLOSE => {
             let fd = a0 as i32;
-            let pipe_id = state.vfs.get_fd(fd).and_then(|f| f.pipe_id);
+            let (pipe_id, sock_wpid) = state
+                .vfs
+                .get_fd(fd)
+                .map_or((None, None), |f| (f.pipe_id, f.sock_write_pipe_id));
             let ret = state.vfs.close(fd);
             if ret == 0 {
                 if let Some(pid) = pipe_id {
                     state.wake_pipe_waiters(pid);
+                }
+                if let Some(wpid) = sock_wpid {
+                    state.wake_pipe_waiters(wpid);
                 }
             }
             ret
@@ -1487,7 +2291,7 @@ fn handle_syscall_inner(
                 Ok(s) => s,
                 Err(e) => return e,
             };
-            match write_stat(ctx, a1 as u64, &st) {
+            match write_stat(ctx, a1 as u64, &st, state.uid, state.gid) {
                 Ok(()) => 0,
                 Err(e) => e,
             }
@@ -1507,7 +2311,7 @@ fn handle_syscall_inner(
                 Ok(s) => s,
                 Err(e) => return e,
             };
-            match write_stat(ctx, stat_ptr, &st) {
+            match write_stat(ctx, stat_ptr, &st, state.uid, state.gid) {
                 Ok(()) => 0,
                 Err(e) => e,
             }
@@ -1650,7 +2454,7 @@ fn handle_syscall_inner(
                     return Err(-EINVAL);
                 }
                 if (fixed_addr as usize)
-                    .checked_add(len)
+                    .checked_add(aligned as usize)
                     .map_or(true, |end| end > mem_size)
                 {
                     return Err(-ENOMEM);
@@ -1659,26 +2463,25 @@ fn handle_syscall_inner(
             };
 
             if is_anon {
-                let (target, new_cursor) = if is_fixed {
+                let (target, allocated) = if is_fixed {
                     match validate_fixed(addr) {
-                        Ok(t) => (t, None),
+                        Ok(t) => {
+                            state.mmap_alloc.reserve_fixed(t, aligned);
+                            (t, false)
+                        }
                         Err(e) => return e,
                     }
                 } else {
-                    let cur = state.mmap_cursor;
-                    let Some(next) = cur.checked_add(aligned) else {
-                        return -ENOMEM;
-                    };
-                    if next > MMAP_ALLOC_END {
-                        return -ENOMEM;
+                    match state.mmap_alloc.alloc(aligned) {
+                        Some(t) => (t, true),
+                        None => return -ENOMEM,
                     }
-                    (cur, Some(next))
                 };
-                if ctx.mem_zero(target as u64, len).is_err() {
+                if ctx.mem_zero(target as u64, aligned as usize).is_err() {
+                    if allocated {
+                        state.mmap_alloc.free(target, aligned);
+                    }
                     return -ENOMEM;
-                }
-                if let Some(next) = new_cursor {
-                    state.mmap_cursor = next;
                 }
                 return target as i64;
             }
@@ -1688,7 +2491,7 @@ fn handle_syscall_inner(
                     f.data.clone(),
                     f.so_base_addr,
                     f.is_dir,
-                    f.is_std.is_some() || f.is_pipe,
+                    f.is_std.is_some() || f.is_pipe || f.sock_write_pipe_id.is_some(),
                 ),
                 None => return -EBADF,
             };
@@ -1702,9 +2505,12 @@ fn handle_syscall_inner(
                 return -EINVAL;
             };
 
-            let (target, new_cursor) = if is_fixed {
+            let (target, allocated) = if is_fixed {
                 match validate_fixed(addr) {
-                    Ok(t) => (t, None),
+                    Ok(t) => {
+                        state.mmap_alloc.reserve_fixed(t, aligned);
+                        (t, false)
+                    }
                     Err(e) => return e,
                 }
             } else if let Some(base) = so_base {
@@ -1714,33 +2520,58 @@ fn handle_syscall_inner(
                 let Some(t) = base.checked_add(off_u32) else {
                     return -ENOMEM;
                 };
-                (t, None)
+                (t, false)
             } else {
-                let cur = state.mmap_cursor;
-                let Some(next) = cur.checked_add(aligned) else {
-                    return -ENOMEM;
-                };
-                if next > MMAP_ALLOC_END {
-                    return -ENOMEM;
+                match state.mmap_alloc.alloc(aligned) {
+                    Some(t) => (t, true),
+                    None => return -ENOMEM,
                 }
-                (cur, Some(next))
             };
 
-            if ctx.mem_zero(target as u64, len).is_err() {
+            let zero_len = if so_base.is_none() {
+                aligned as usize
+            } else {
+                len
+            };
+            if ctx.mem_zero(target as u64, zero_len).is_err() {
+                if allocated {
+                    state.mmap_alloc.free(target, aligned);
+                }
                 return -ENOMEM;
             }
             if offset < file_data.len() {
                 let copy_len = len.min(file_data.len() - offset);
                 if let Err(e) = write_bytes(ctx, target as u64, &file_data[offset..offset + copy_len]) {
+                    if allocated {
+                        state.mmap_alloc.free(target, aligned);
+                    }
                     return e;
                 }
             }
-            if let Some(next) = new_cursor {
-                state.mmap_cursor = next;
-            }
             target as i64
         }
-        SYS_MPROTECT | SYS_MUNMAP => 0,
+        SYS_MPROTECT => 0,
+        SYS_MUNMAP => {
+            let addr_u64 = a0 as u64;
+            let len_u64 = a1 as u64;
+            if len_u64 == 0 {
+                return -EINVAL;
+            }
+            let Ok(addr) = u32::try_from(addr_u64) else {
+                return -EINVAL;
+            };
+            if (addr & 0xfff) != 0 {
+                return -EINVAL;
+            }
+            let Ok(len_u32) = u32::try_from(len_u64) else {
+                return -EINVAL;
+            };
+            let Some(aligned) = align_up_4k(len_u32).filter(|&v| v > 0) else {
+                return -EINVAL;
+            };
+            state.mmap_alloc.free(addr, aligned);
+            0
+        }
         SYS_MREMAP => {
             let old_addr_u64 = a0 as u64;
             let old_size_u64 = a1 as u64;
@@ -1752,41 +2583,64 @@ fn handle_syscall_inner(
             let Ok(old_addr) = u32::try_from(old_addr_u64) else {
                 return -EFAULT;
             };
-            let Ok(old_size) = usize::try_from(old_size_u64) else {
+            let Ok(old_size_u32) = u32::try_from(old_size_u64) else {
                 return -EINVAL;
             };
+            let old_size = old_size_u32 as usize;
             let Ok(new_size_u32) = u32::try_from(new_size_u64) else {
                 return -ENOMEM;
             };
             let new_size = new_size_u32 as usize;
+            let old_aligned = align_up_4k(old_size_u32).unwrap_or(0);
+            let Some(new_aligned) = align_up_4k(new_size_u32).filter(|&v| v > 0) else {
+                return -ENOMEM;
+            };
             if new_size <= old_size {
+                if old_aligned > new_aligned {
+                    if let Some(tail_start) = old_addr.checked_add(new_aligned) {
+                        state.mmap_alloc.free(tail_start, old_aligned - new_aligned);
+                    }
+                }
                 return old_addr as i64;
             }
             if (flags & MREMAP_MAYMOVE) == 0 {
-                return -ENOMEM;
-            }
-            let Some(aligned) = align_up_4k(new_size_u32).filter(|&v| v > 0) else {
-                return -ENOMEM;
-            };
-            let target = state.mmap_cursor;
-            let Some(next) = target.checked_add(aligned) else {
-                return -ENOMEM;
-            };
-            if next > MMAP_ALLOC_END {
                 return -ENOMEM;
             }
             let old_bytes = match read_bytes(ctx, old_addr as u64, old_size) {
                 Ok(b) => b,
                 Err(e) => return e,
             };
-            if ctx.mem_zero(target as u64, aligned as usize).is_err() {
+            let Some(target) = state.mmap_alloc.alloc(new_aligned) else {
+                return -ENOMEM;
+            };
+            if ctx.mem_zero(target as u64, new_aligned as usize).is_err() {
+                state.mmap_alloc.free(target, new_aligned);
                 return -ENOMEM;
             }
             if let Err(e) = write_bytes(ctx, target as u64, &old_bytes) {
+                state.mmap_alloc.free(target, new_aligned);
                 return e;
             }
-            state.mmap_cursor = next;
+            if old_aligned > 0 {
+                state.mmap_alloc.free(old_addr, old_aligned);
+            }
             target as i64
+        }
+        SYS_MADVISE => {
+            let addr = a0 as u64;
+            let len = a1 as usize;
+            let advice = a2 as i32;
+            const MADV_DONTNEED: i32 = 4;
+            if advice == MADV_DONTNEED && len > 0 {
+                if let (Ok(start), Ok(len_u32)) = (u32::try_from(addr), u32::try_from(len)) {
+                    if let Some(end) = start.checked_add(len_u32) {
+                        if start >= MMAP_START && end <= MMAP_ALLOC_END {
+                            let _ = ctx.mem_zero(addr, len);
+                        }
+                    }
+                }
+            }
+            0
         }
         SYS_ARCH_PRCTL => {
             let code = a0;
@@ -2061,7 +2915,7 @@ fn handle_syscall_inner(
                     si[0..4].copy_from_slice(&17i32.to_le_bytes()); // si_signo = SIGCHLD
                     si[8..12].copy_from_slice(&1i32.to_le_bytes()); // si_code = CLD_EXITED
                     si[16..20].copy_from_slice(&zpid.to_le_bytes()); // si_pid
-                    si[20..24].copy_from_slice(&1000u32.to_le_bytes()); // si_uid
+                    si[20..24].copy_from_slice(&state.uid.to_le_bytes()); // si_uid
                     si[24..28].copy_from_slice(&((exit_status >> 8) & 0xff).to_le_bytes());
                     if let Err(e) = write_bytes(ctx, infop, &si) {
                         return e;
@@ -2174,7 +3028,438 @@ fn handle_syscall_inner(
                 Err(e) => e,
             }
         }
-        SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => 1000,
+        SYS_GETUID => state.uid as i64,
+        SYS_GETEUID => state.euid as i64,
+        SYS_GETGID => state.gid as i64,
+        SYS_GETEGID => state.egid as i64,
+        SYS_SETUID => {
+            let new_uid = a0 as u32;
+            if state.euid == 0 || new_uid == state.uid || new_uid == state.euid {
+                state.uid = new_uid;
+                state.euid = new_uid;
+                state.vfs.uid = new_uid;
+                0
+            } else {
+                -EPERM
+            }
+        }
+        SYS_SETGID => {
+            let new_gid = a0 as u32;
+            if state.euid == 0 || new_gid == state.gid || new_gid == state.egid {
+                state.gid = new_gid;
+                state.egid = new_gid;
+                state.vfs.gid = new_gid;
+                0
+            } else {
+                -EPERM
+            }
+        }
+        SYS_GETGROUPS => {
+            let size = a0 as i32;
+            let list_addr = a1 as u64;
+            if size < 0 {
+                return -EINVAL;
+            }
+            if size == 0 {
+                return state.groups.len() as i64;
+            }
+            if (size as usize) < state.groups.len() {
+                return -EINVAL;
+            }
+            let mut buf = Vec::with_capacity(state.groups.len() * 4);
+            for &g in &state.groups {
+                buf.extend_from_slice(&g.to_le_bytes());
+            }
+            if let Err(e) = write_bytes(ctx, list_addr, &buf) {
+                return e;
+            }
+            state.groups.len() as i64
+        }
+        SYS_SETGROUPS => {
+            let size = a0 as usize;
+            let list_addr = a1 as u64;
+            if size > 65536 {
+                return -EINVAL;
+            }
+            let mut new_groups = Vec::with_capacity(size);
+            if size > 0 {
+                let raw = match read_bytes(ctx, list_addr, size * 4) {
+                    Ok(b) => b,
+                    Err(e) => return e,
+                };
+                for chunk in raw.chunks_exact(4) {
+                    new_groups.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+                }
+            }
+            state.groups = new_groups;
+            0
+        }
+        SYS_SETSID => {
+            let pid = state.active_pid;
+            if let Some(p) = state.processes.get_mut(&pid) {
+                p.pgid = pid;
+                p.sid = pid;
+            }
+            state.vfs.current_pgid = pid;
+            pid as i64
+        }
+        SYS_GETSID => {
+            let pid = a0 as i32;
+            let target = if pid == 0 { state.active_pid } else { pid };
+            state
+                .processes
+                .get(&target)
+                .map_or(-ESRCH, |p| p.sid as i64)
+        }
+        SYS_UMASK => {
+            let old = state.vfs.umask;
+            state.vfs.umask = (a0 as u32) & 0o777;
+            old as i64
+        }
+        SYS_FSYNC | SYS_FDATASYNC => {
+            if state.vfs.get_fd(a0 as i32).is_some() {
+                0
+            } else {
+                -EBADF
+            }
+        }
+        SYS_LINK => {
+            let oldpath = match read_cstr(ctx, a0 as u64) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let newpath = match read_cstr(ctx, a1 as u64) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            state
+                .vfs
+                .linkat(AT_FDCWD, &oldpath, AT_FDCWD, &newpath, 0, now_ns)
+        }
+        SYS_LINKAT => {
+            let oldpath = match read_cstr(ctx, a1 as u64) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let newpath = match read_cstr(ctx, a3 as u64) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            state
+                .vfs
+                .linkat(a0 as i32, &oldpath, a2 as i32, &newpath, a4 as i32, now_ns)
+        }
+        SYS_CHOWN | SYS_LCHOWN => {
+            let path = match read_cstr(ctx, a0 as u64) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let flags = if nr == SYS_LCHOWN {
+                AT_SYMLINK_NOFOLLOW
+            } else {
+                0
+            };
+            match state.vfs.stat_path(AT_FDCWD, &path, flags) {
+                Ok(_) => 0,
+                Err(e) => e,
+            }
+        }
+        SYS_FCHOWN => {
+            if state.vfs.get_fd(a0 as i32).is_some() {
+                0
+            } else {
+                -EBADF
+            }
+        }
+        SYS_FCHOWNAT => {
+            let path = match read_cstr(ctx, a1 as u64) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            match state.vfs.stat_path(a0 as i32, &path, a4 as i32) {
+                Ok(_) => 0,
+                Err(e) => e,
+            }
+        }
+        SYS_STATFS | SYS_FSTATFS => {
+            let buf_addr = a1 as u64;
+            if nr == SYS_STATFS {
+                let path = match read_cstr(ctx, a0 as u64) {
+                    Ok(p) => p,
+                    Err(e) => return e,
+                };
+                if let Err(e) = state.vfs.stat_path(AT_FDCWD, &path, 0) {
+                    return e;
+                }
+            } else if state.vfs.get_fd(a0 as i32).is_none() {
+                return -EBADF;
+            }
+            let mut buf = [0u8; 120];
+            buf[0..8].copy_from_slice(&0x0102_1994i64.to_le_bytes()); // TMPFS_MAGIC
+            buf[8..16].copy_from_slice(&4096i64.to_le_bytes()); // f_bsize
+            buf[16..24].copy_from_slice(&65536u64.to_le_bytes()); // f_blocks
+            buf[24..32].copy_from_slice(&32768u64.to_le_bytes()); // f_bfree
+            buf[32..40].copy_from_slice(&32768u64.to_le_bytes()); // f_bavail
+            buf[40..48].copy_from_slice(&65536u64.to_le_bytes()); // f_files
+            buf[48..56].copy_from_slice(&60000u64.to_le_bytes()); // f_ffree
+            buf[64..72].copy_from_slice(&255i64.to_le_bytes()); // f_namelen
+            buf[72..80].copy_from_slice(&4096i64.to_le_bytes()); // f_frsize
+            match write_bytes(ctx, buf_addr, &buf) {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
+        }
+        SYS_TIMES => {
+            let buf_addr = a0 as u64;
+            let ticks = (state.scheduler.virtual_mono_ns / 10_000_000) as i64;
+            if buf_addr != 0 {
+                let mut buf = [0u8; 32];
+                buf[0..8].copy_from_slice(&ticks.to_le_bytes());
+                if let Err(e) = write_bytes(ctx, buf_addr, &buf) {
+                    return e;
+                }
+            }
+            ticks
+        }
+        SYS_GETRUSAGE => {
+            let who = a0 as i32;
+            let buf_addr = a1 as u64;
+            if who != 0 && who != -1 && who != 1 {
+                return -EINVAL;
+            }
+            let mut buf = [0u8; 144];
+            let ns = state.scheduler.virtual_mono_ns;
+            let sec = (ns / 1_000_000_000) as i64;
+            let usec = ((ns % 1_000_000_000) / 1_000) as i64;
+            buf[0..8].copy_from_slice(&sec.to_le_bytes());
+            buf[8..16].copy_from_slice(&usec.to_le_bytes());
+            buf[32..40].copy_from_slice(&4096i64.to_le_bytes()); // ru_maxrss
+            match write_bytes(ctx, buf_addr, &buf) {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
+        }
+        SYS_SOCKET => -EAFNOSUPPORT,
+        SYS_SOCKETPAIR => {
+            let domain = a0 as i32;
+            let sock_type = a1 as i32;
+            let sv_addr = a3 as u64;
+            if domain != 1 {
+                return -EAFNOSUPPORT;
+            }
+            let base_type = sock_type & 0xff;
+            if base_type != 1 && base_type != 2 && base_type != 5 {
+                return -EINVAL;
+            }
+            if sv_addr == 0 {
+                return -EFAULT;
+            }
+            let cloexec = (sock_type & O_CLOEXEC) != 0;
+            let nonblock = (sock_type & O_NONBLOCK) != 0;
+            let (fd0, fd1) = match state.vfs.create_socketpair(cloexec, nonblock) {
+                Ok(fds) => fds,
+                Err(e) => return e,
+            };
+            let mut buf = [0u8; 8];
+            buf[0..4].copy_from_slice(&fd0.to_le_bytes());
+            buf[4..8].copy_from_slice(&fd1.to_le_bytes());
+            match write_bytes(ctx, sv_addr, &buf) {
+                Ok(()) => 0,
+                Err(e) => {
+                    state.vfs.close(fd0);
+                    state.vfs.close(fd1);
+                    e
+                }
+            }
+        }
+        SYS_SENDTO => {
+            let fd = a0 as i32;
+            let buf_addr = a1 as u64;
+            let count = a2 as usize;
+            let dest_addr = a4 as u64;
+            if dest_addr != 0 {
+                return -EAFNOSUPPORT;
+            }
+            let bytes = match read_bytes(ctx, buf_addr, count) {
+                Ok(b) => b,
+                Err(e) => return e,
+            };
+            write_fd_data(ctx, state, fd, bytes, now_ns)
+        }
+        SYS_RECVFROM => {
+            let fd = a0 as i32;
+            let buf_addr = a1 as u64;
+            let count = a2 as usize;
+            read_into_guest(ctx, state, fd, buf_addr, count)
+        }
+        SYS_EVENTFD2 => {
+            let initval = a0 as u32 as u64;
+            let flags = a1 as i32;
+            const EFD_SEMAPHORE: i32 = 1;
+            if (flags & !(EFD_SEMAPHORE | O_CLOEXEC | O_NONBLOCK)) != 0 {
+                return -EINVAL;
+            }
+            match state.vfs.create_eventfd(
+                initval,
+                (flags & EFD_SEMAPHORE) != 0,
+                (flags & O_CLOEXEC) != 0,
+                (flags & O_NONBLOCK) != 0,
+            ) {
+                Ok(fd) => fd as i64,
+                Err(e) => e,
+            }
+        }
+        SYS_EPOLL_CREATE1 => {
+            let flags = a0 as i32;
+            if (flags & !O_CLOEXEC) != 0 {
+                return -EINVAL;
+            }
+            match state.vfs.create_epoll((flags & O_CLOEXEC) != 0) {
+                Ok(fd) => fd as i64,
+                Err(e) => e,
+            }
+        }
+        SYS_EPOLL_CTL => {
+            let epfd = a0 as i32;
+            let op = a1 as i32;
+            let fd = a2 as i32;
+            let event_addr = a3 as u64;
+            const EPOLL_CTL_ADD: i32 = 1;
+            const EPOLL_CTL_DEL: i32 = 2;
+            const EPOLL_CTL_MOD: i32 = 3;
+            let Some(eid) = state.vfs.get_fd(epfd).and_then(|f| f.epoll_id) else {
+                return if state.vfs.get_fd(epfd).is_some() {
+                    -EINVAL
+                } else {
+                    -EBADF
+                };
+            };
+            if fd == epfd {
+                return -EINVAL;
+            }
+            if state.vfs.get_fd(fd).is_none() {
+                return -EBADF;
+            }
+            match op {
+                EPOLL_CTL_DEL => {
+                    let Some(inst) = state.vfs.epolls.get_mut(&eid) else {
+                        return -EBADF;
+                    };
+                    if inst.entries.remove(&fd).is_some() {
+                        0
+                    } else {
+                        -ENOENT
+                    }
+                }
+                EPOLL_CTL_ADD | EPOLL_CTL_MOD => {
+                    let raw = match read_bytes(ctx, event_addr, 12) {
+                        Ok(b) => b,
+                        Err(e) => return e,
+                    };
+                    let events = u32::from_le_bytes(raw[0..4].try_into().unwrap());
+                    let data = u64::from_le_bytes(raw[4..12].try_into().unwrap());
+                    let Some(inst) = state.vfs.epolls.get_mut(&eid) else {
+                        return -EBADF;
+                    };
+                    if op == EPOLL_CTL_ADD {
+                        if inst.entries.contains_key(&fd) {
+                            return -crate::vfs::EEXIST;
+                        }
+                        inst.entries.insert(fd, EpollEntry { events, data });
+                    } else if let Some(entry) = inst.entries.get_mut(&fd) {
+                        entry.events = events;
+                        entry.data = data;
+                    } else {
+                        return -ENOENT;
+                    }
+                    0
+                }
+                _ => -EINVAL,
+            }
+        }
+        SYS_EPOLL_WAIT | SYS_EPOLL_PWAIT => {
+            let epfd = a0 as i32;
+            let events_addr = a1 as u64;
+            let maxevents = a2 as i32;
+            let timeout_ms = a3 as i32 as i64;
+            if maxevents <= 0 || maxevents > 4096 {
+                return -EINVAL;
+            }
+            let Some(f) = state.vfs.get_fd(epfd) else {
+                return -EBADF;
+            };
+            if f.epoll_id.is_none() {
+                return -EINVAL;
+            }
+            let kind = PollKind::Epoll {
+                epfd,
+                events_addr,
+                maxevents: maxevents as usize,
+            };
+            if state.is_poll_kind_ready(state.active_pid, &kind) || timeout_ms == 0 {
+                return state.finish_poll(ctx, &kind, false);
+            }
+            let wake_ns = if timeout_ms > 0 {
+                Some(
+                    state
+                        .scheduler
+                        .virtual_mono_ns
+                        .saturating_add((timeout_ms as u64).saturating_mul(1_000_000)),
+                )
+            } else {
+                None
+            };
+            state.scheduler.current_thread_mut().state = ThreadState::PollWait { kind, wake_ns };
+            ctx.set_yield_flag(1);
+            0
+        }
+        SYS_KILL => {
+            let pid = a0 as i32;
+            let sig = a1 as i32;
+            if !(0..=64).contains(&sig) {
+                return -EINVAL;
+            }
+            let cur_pgid = state.current_pgid();
+            let targets: Vec<i32> = if pid > 0 {
+                if state.processes.get(&pid).map_or(false, |p| !p.exited) {
+                    vec![pid]
+                } else {
+                    Vec::new()
+                }
+            } else if pid == 0 {
+                state
+                    .processes
+                    .values()
+                    .filter(|p| !p.exited && p.pgid == cur_pgid)
+                    .map(|p| p.pid)
+                    .collect()
+            } else if pid == -1 {
+                state
+                    .processes
+                    .values()
+                    .filter(|p| !p.exited && p.pid != 1)
+                    .map(|p| p.pid)
+                    .collect()
+            } else {
+                let target_pgid = -pid;
+                state
+                    .processes
+                    .values()
+                    .filter(|p| !p.exited && p.pgid == target_pgid)
+                    .map(|p| p.pid)
+                    .collect()
+            };
+            if targets.is_empty() {
+                return -ESRCH;
+            }
+            if sig == 0 {
+                return 0;
+            }
+            for tpid in targets {
+                state.deliver_signal(Some(ctx), tpid, sig);
+            }
+            0
+        }
         SYS_GETPID => state.active_pid as i64,
         SYS_GETPPID => state.current_ppid() as i64,
         SYS_GETPGRP => state.current_pgid() as i64,
@@ -2316,10 +3601,35 @@ fn handle_syscall_inner(
             sec
         }
         SYS_RT_SIGACTION => {
+            let signum = a0 as i32;
+            let act = a1 as u64;
             let oldact = a2 as u64;
+            if !(1..=64).contains(&signum) {
+                return -EINVAL;
+            }
+            let cur_pid = state.active_pid;
+            let prev = state
+                .processes
+                .get(&cur_pid)
+                .and_then(|p| p.sig_handlers.get(&signum).copied())
+                .unwrap_or(0);
             if oldact != 0 {
-                if let Err(e) = write_bytes(ctx, oldact, &[0u8; 32]) {
+                let mut buf = [0u8; 32];
+                buf[0..8].copy_from_slice(&prev.to_le_bytes());
+                if let Err(e) = write_bytes(ctx, oldact, &buf) {
                     return e;
+                }
+            }
+            if act != 0 {
+                if signum == 9 || signum == 19 {
+                    return -EINVAL;
+                }
+                let handler = match read_u64(ctx, act) {
+                    Ok(h) => h,
+                    Err(e) => return e,
+                };
+                if let Some(p) = state.processes.get_mut(&cur_pid) {
+                    p.sig_handlers.insert(signum, handler);
                 }
             }
             0
@@ -2383,7 +3693,155 @@ fn handle_syscall_inner(
                 _ => 0,
             }
         }
-        SYS_IOCTL => -ENOTTY,
+        SYS_IOCTL => {
+            let fd = a0 as i32;
+            let req = a1 as u32;
+            let arg = a2 as u64;
+            let Some(f) = state.vfs.get_fd(fd).cloned() else {
+                return -EBADF;
+            };
+            let is_tty = state.tty.enabled
+                && (f.is_std.is_some() || f.dev == Some(VirtualDevice::Tty));
+
+            const TCGETS: u32 = 0x5401;
+            const TCSETS: u32 = 0x5402;
+            const TCSETSW: u32 = 0x5403;
+            const TCSETSF: u32 = 0x5404;
+            const TIOCSCTTY: u32 = 0x540E;
+            const TIOCGPGRP: u32 = 0x540F;
+            const TIOCSPGRP: u32 = 0x5410;
+            const TIOCGWINSZ: u32 = 0x5413;
+            const TIOCSWINSZ: u32 = 0x5414;
+            const FIONREAD: u32 = 0x541B;
+            const FIONBIO: u32 = 0x5421;
+            const FIONCLEX: u32 = 0x5450;
+            const FIOCLEX: u32 = 0x5451;
+
+            match req {
+                TCGETS => {
+                    if !is_tty {
+                        return -ENOTTY;
+                    }
+                    match write_bytes(ctx, arg, &state.tty.termios) {
+                        Ok(()) => 0,
+                        Err(e) => e,
+                    }
+                }
+                TCSETS | TCSETSW | TCSETSF => {
+                    if !is_tty {
+                        return -ENOTTY;
+                    }
+                    let raw = match read_bytes(ctx, arg, 36) {
+                        Ok(b) => b,
+                        Err(e) => return e,
+                    };
+                    state.tty.termios.copy_from_slice(&raw);
+                    0
+                }
+                TIOCGWINSZ => {
+                    if !is_tty {
+                        return -ENOTTY;
+                    }
+                    let mut buf = [0u8; 8];
+                    buf[0..2].copy_from_slice(&state.tty.rows.to_le_bytes());
+                    buf[2..4].copy_from_slice(&state.tty.cols.to_le_bytes());
+                    match write_bytes(ctx, arg, &buf) {
+                        Ok(()) => 0,
+                        Err(e) => e,
+                    }
+                }
+                TIOCSWINSZ => {
+                    if !is_tty {
+                        return -ENOTTY;
+                    }
+                    let raw = match read_bytes(ctx, arg, 8) {
+                        Ok(b) => b,
+                        Err(e) => return e,
+                    };
+                    let rows = u16::from_le_bytes([raw[0], raw[1]]);
+                    let cols = u16::from_le_bytes([raw[2], raw[3]]);
+                    if rows > 0 {
+                        state.tty.rows = rows;
+                    }
+                    if cols > 0 {
+                        state.tty.cols = cols;
+                    }
+                    0
+                }
+                TIOCGPGRP => {
+                    if !is_tty {
+                        return -ENOTTY;
+                    }
+                    match write_bytes(ctx, arg, &state.tty.fg_pgid.to_le_bytes()) {
+                        Ok(()) => 0,
+                        Err(e) => e,
+                    }
+                }
+                TIOCSPGRP => {
+                    if !is_tty {
+                        return -ENOTTY;
+                    }
+                    let pgid = match read_u32(ctx, arg) {
+                        Ok(v) => v as i32,
+                        Err(e) => return e,
+                    };
+                    if pgid <= 0 {
+                        return -EINVAL;
+                    }
+                    state.tty.fg_pgid = pgid;
+                    0
+                }
+                TIOCSCTTY => {
+                    if !is_tty {
+                        return -ENOTTY;
+                    }
+                    0
+                }
+                FIONREAD => {
+                    let avail: i32 = if f.is_std == Some(0) || f.dev == Some(VirtualDevice::Tty) {
+                        state.vfs.stdin_available().min(i32::MAX as usize) as i32
+                    } else if let Some(pid) = f.pipe_id {
+                        state
+                            .vfs
+                            .pipes
+                            .get(&pid)
+                            .map_or(0, |p| p.buf.len().min(i32::MAX as usize) as i32)
+                    } else {
+                        f.data
+                            .len()
+                            .saturating_sub(f.cursor)
+                            .min(i32::MAX as usize) as i32
+                    };
+                    match write_bytes(ctx, arg, &avail.to_le_bytes()) {
+                        Ok(()) => 0,
+                        Err(e) => e,
+                    }
+                }
+                FIOCLEX => {
+                    if let Some(fm) = state.vfs.get_fd_mut(fd) {
+                        fm.cloexec = true;
+                    }
+                    0
+                }
+                FIONCLEX => {
+                    if let Some(fm) = state.vfs.get_fd_mut(fd) {
+                        fm.cloexec = false;
+                    }
+                    0
+                }
+                FIONBIO => {
+                    let val = match read_u32(ctx, arg) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    if let Some(fm) = state.vfs.get_fd_mut(fd) {
+                        fm.nonblock = val != 0;
+                    }
+                    0
+                }
+                _ => -ENOTTY,
+            }
+        }
         SYS_DUP => state.vfs.dup(a0 as i32),
         SYS_DUP2 | SYS_DUP3 => {
             let oldfd = a0 as i32;
@@ -2557,8 +4015,8 @@ fn handle_syscall_inner(
             buf[0..4].copy_from_slice(&0x0fffu32.to_le_bytes()); // stx_mask (STATX_BASIC_STATS)
             buf[4..8].copy_from_slice(&4096u32.to_le_bytes()); // stx_blksize
             buf[16..20].copy_from_slice(&(st.st_nlink as u32).to_le_bytes());
-            buf[20..24].copy_from_slice(&1000u32.to_le_bytes()); // stx_uid
-            buf[24..28].copy_from_slice(&1000u32.to_le_bytes()); // stx_gid
+            buf[20..24].copy_from_slice(&state.uid.to_le_bytes()); // stx_uid
+            buf[24..28].copy_from_slice(&state.gid.to_le_bytes()); // stx_gid
             buf[28..30].copy_from_slice(&(st.st_mode as u16).to_le_bytes());
             buf[32..40].copy_from_slice(&st.st_ino.to_le_bytes());
             buf[40..48].copy_from_slice(&(st.st_size as u64).to_le_bytes());
@@ -2598,7 +4056,7 @@ fn exit_process(ctx: &mut dyn GuestContext, state: &mut HostState, code: i32) {
         .vfs
         .fds
         .values()
-        .filter_map(|f| f.pipe_id)
+        .flat_map(|f| f.pipe_id.into_iter().chain(f.sock_write_pipe_id))
         .collect();
     state.vfs.close_all_fds();
     for pipe_id in pipe_ids {
@@ -2606,9 +4064,14 @@ fn exit_process(ctx: &mut dyn GuestContext, state: &mut HostState, code: i32) {
     }
     state.wake_vfork_parent_for(pid);
     if let Some(p) = state.processes.get_mut(&pid) {
-        p.exited = true;
-        p.zombie = pid != MAIN_PID;
-        p.exit_status = (code & 0xff) << 8;
+        if !p.exited {
+            p.exited = true;
+            p.zombie = pid != MAIN_PID;
+            p.exit_status = (code & 0xff) << 8;
+            if pid != MAIN_PID {
+                state.reaped_pids.push(pid);
+            }
+        }
     }
     if pid == MAIN_PID {
         ctx.set_exit(code);
@@ -2625,7 +4088,8 @@ fn write_fd_data(
     now_ns: u64,
 ) -> i64 {
     if let Some(f) = state.vfs.get_fd(fd).cloned() {
-        if let Some(pipe_id) = f.pipe_id {
+        let write_pipe_id = f.sock_write_pipe_id.or(f.pipe_id);
+        if let Some(pipe_id) = write_pipe_id {
             if !f.writable {
                 return -EBADF;
             }
@@ -2667,7 +4131,15 @@ fn write_fd_data(
             };
         }
     }
-    state.vfs.write_with_time(fd, &bytes, now_ns)
+    let is_eventfd = state
+        .vfs
+        .get_fd(fd)
+        .map_or(false, |f| f.eventfd_id.is_some());
+    let ret = state.vfs.write_with_time(fd, &bytes, now_ns);
+    if is_eventfd && ret > 0 {
+        state.wake_ready_waiters();
+    }
+    ret
 }
 
 fn do_fork(
@@ -2690,6 +4162,16 @@ fn do_fork(
 
     let parent_pid = state.active_pid;
     let parent_pgid = state.current_pgid();
+    let parent_sid = state
+        .processes
+        .get(&parent_pid)
+        .map(|p| p.sid)
+        .unwrap_or(MAIN_PID);
+    let parent_sig_handlers = state
+        .processes
+        .get(&parent_pid)
+        .map(|p| p.sig_handlers.clone())
+        .unwrap_or_default();
     let child_pid = state.alloc_pid();
 
     if (flags & CLONE_PARENT_SETTID) != 0 && ptid_ptr != 0 {
@@ -2730,14 +4212,17 @@ fn do_fork(
         pid: child_pid,
         ppid: parent_pid,
         pgid: parent_pgid,
+        sid: parent_sid,
+        umask: state.vfs.umask,
         fds: cloned_fds,
         next_fd: state.vfs.next_fd,
         cwd: state.vfs.cwd.clone(),
         elf_path: state.vfs.elf_path.clone(),
         so_entries: state.vfs.so_entries.clone(),
         brk_curr: state.brk_curr,
-        mmap_cursor: state.mmap_cursor,
+        mmap_alloc: state.mmap_alloc.clone(),
         scheduler: child_sched,
+        sig_handlers: parent_sig_handlers,
         exited: false,
         zombie: false,
         exit_status: 0,
@@ -2773,6 +4258,74 @@ fn read_cstr_array(ctx: &dyn GuestContext, arr_addr: u64) -> Result<Vec<String>,
     Ok(out)
 }
 
+pub fn is_valid_elf64_x86_64(bytes: &[u8]) -> bool {
+    if bytes.len() < 64 {
+        return false;
+    }
+    if &bytes[0..4] != b"\x7fELF" {
+        return false;
+    }
+    // EI_CLASS=2 (ELFCLASS64), EI_DATA=1 (ELFDATA2LSB), EI_VERSION=1 (EV_CURRENT)
+    if bytes[4] != 2 || bytes[5] != 1 || bytes[6] != 1 {
+        return false;
+    }
+    let e_type = u16::from_le_bytes([bytes[16], bytes[17]]);
+    let e_machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+    // ET_EXEC (2) or ET_DYN (3), EM_X86_64 (62)
+    if (e_type != 2 && e_type != 3) || e_machine != 62 {
+        return false;
+    }
+    let e_phoff = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+    let e_phentsize = u16::from_le_bytes([bytes[54], bytes[55]]);
+    let e_phnum = u16::from_le_bytes([bytes[56], bytes[57]]);
+    if e_phentsize != 56 || e_phnum == 0 {
+        return false;
+    }
+    let file_len = bytes.len() as u64;
+    let ph_table_size = match (e_phnum as u64).checked_mul(56) {
+        Some(sz) => sz,
+        None => return false,
+    };
+    match e_phoff.checked_add(ph_table_size) {
+        Some(end) if end <= file_len => {}
+        _ => return false,
+    }
+
+    let mut has_exec_load = false;
+    for i in 0..(e_phnum as usize) {
+        let off = (e_phoff as usize) + i * 56;
+        let p_type = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        let p_flags = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+        let p_offset = u64::from_le_bytes(bytes[off + 8..off + 16].try_into().unwrap());
+        let p_filesz = u64::from_le_bytes(bytes[off + 32..off + 40].try_into().unwrap());
+        let p_memsz = u64::from_le_bytes(bytes[off + 40..off + 48].try_into().unwrap());
+
+        if p_type == 1 {
+            // PT_LOAD
+            if p_filesz > p_memsz {
+                return false;
+            }
+            match p_offset.checked_add(p_filesz) {
+                Some(end) if end <= file_len => {}
+                _ => return false,
+            }
+            if (p_flags & 1) != 0 && p_filesz > 0 {
+                has_exec_load = true;
+            }
+        } else if p_type == 3 {
+            // PT_INTERP
+            if p_filesz == 0 {
+                return false;
+            }
+            match p_offset.checked_add(p_filesz) {
+                Some(end) if end <= file_len => {}
+                _ => return false,
+            }
+        }
+    }
+    has_exec_load
+}
+
 fn do_execve(
     ctx: &mut dyn GuestContext,
     state: &mut HostState,
@@ -2790,7 +4343,7 @@ fn do_execve(
         Err(e) => return e,
     };
     const AT_EMPTY_PATH: i32 = 0x1000;
-    let norm_path = if raw_path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+    let initial_norm_path = if raw_path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
         if dirfd == AT_FDCWD {
             return -ENOENT;
         } else if let Some(df) = state.vfs.get_fd(dirfd) {
@@ -2808,19 +4361,7 @@ fn do_execve(
         }
     };
 
-    match state.vfs.stat_path(AT_FDCWD, &norm_path, 0) {
-        Ok(st) => {
-            if (st.st_mode & S_IFDIR) != 0 {
-                return -EACCES;
-            }
-        }
-        Err(e) => return e,
-    }
-    if state.vfs.vfs_read_file(&norm_path).is_none() {
-        return -ENOENT;
-    }
-
-    let argv = match read_cstr_array(ctx, argv_addr) {
+    let mut cur_argv = match read_cstr_array(ctx, argv_addr) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -2829,11 +4370,76 @@ fn do_execve(
         Err(e) => return e,
     };
 
+    // Resolve `#!` shebang chains and validate ELF magic BEFORE closing O_CLOEXEC FDs
+    // or waking a vfork parent, so `-ENOEXEC` leaves process state untouched.
+    let mut cur_path = initial_norm_path;
+    for depth in 0..=4usize {
+        match state.vfs.stat_path(AT_FDCWD, &cur_path, 0) {
+            Ok(st) => {
+                if (st.st_mode & S_IFDIR) != 0 {
+                    return -EACCES;
+                }
+            }
+            Err(e) => return e,
+        }
+        let Some(bytes) = state.vfs.vfs_read_file(&cur_path) else {
+            return -ENOENT;
+        };
+        if bytes.starts_with(b"\x7fELF") {
+            if is_valid_elf64_x86_64(&bytes) {
+                break;
+            }
+            return -ENOEXEC;
+        }
+        if bytes.starts_with(b"#!") {
+            if depth == 4 {
+                return -ELOOP;
+            }
+            let cap = bytes.len().min(256);
+            let first_line_end = bytes[..cap]
+                .iter()
+                .position(|&b| b == b'\n')
+                .unwrap_or(cap);
+            let line = String::from_utf8_lossy(&bytes[2..first_line_end]);
+            let trimmed = line.trim_end_matches('\r').trim_matches(|c| c == ' ' || c == '\t');
+            let (interp, rest) = match trimmed.find(|c| c == ' ' || c == '\t') {
+                Some(idx) => (&trimmed[..idx], trimmed[idx..].trim_matches(|c| c == ' ' || c == '\t')),
+                None => (trimmed, ""),
+            };
+            if interp.is_empty() {
+                return -ENOEXEC;
+            }
+            let resolved_interp = match state.vfs.resolve_path(AT_FDCWD, interp, true) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let script_arg = if depth == 0 && !raw_path.is_empty() {
+                raw_path.clone()
+            } else {
+                cur_path.clone()
+            };
+            let mut new_argv = Vec::with_capacity(cur_argv.len() + 2);
+            new_argv.push(interp.to_string());
+            if !rest.is_empty() {
+                new_argv.push(rest.to_string());
+            }
+            new_argv.push(script_arg);
+            if cur_argv.len() > 1 {
+                new_argv.extend(cur_argv.into_iter().skip(1));
+            }
+            cur_argv = new_argv;
+            cur_path = resolved_interp;
+            continue;
+        }
+        return -ENOEXEC;
+    }
+
     let closed_pipes: Vec<u64> = state
         .vfs
         .fds
         .values()
-        .filter_map(|f| if f.cloexec { f.pipe_id } else { None })
+        .filter(|f| f.cloexec)
+        .flat_map(|f| f.pipe_id.into_iter().chain(f.sock_write_pipe_id))
         .collect();
     state.vfs.close_cloexec_fds();
     for pipe_id in closed_pipes {
@@ -2844,8 +4450,8 @@ fn do_execve(
     state.wake_vfork_parent_for(pid);
     state.pending_action = Some(PendingHostAction::Exec {
         pid,
-        path: norm_path,
-        argv,
+        path: cur_path,
+        argv: cur_argv,
         envp,
     });
     ctx.set_yield_flag(1);

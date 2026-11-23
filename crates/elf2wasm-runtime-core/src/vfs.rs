@@ -8,9 +8,12 @@ use crate::context::StdHostFs;
 #[cfg(feature = "std-fs")]
 use std::path::PathBuf;
 
+pub const EPERM: i64 = 1;
 pub const ENOENT: i64 = 2;
 pub const ESRCH: i64 = 3;
+pub const EINTR: i64 = 4;
 pub const EIO: i64 = 5;
+pub const ENOEXEC: i64 = 8;
 pub const EBADF: i64 = 9;
 pub const ECHILD: i64 = 10;
 pub const EAGAIN: i64 = 11;
@@ -32,6 +35,9 @@ pub const ERANGE: i64 = 34;
 pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
+pub const ENOTSOCK: i64 = 88;
+pub const EOPNOTSUPP: i64 = 95;
+pub const EAFNOSUPPORT: i64 = 97;
 pub const ETIMEDOUT: i64 = 110;
 
 pub const MAX_FDS: i32 = 4096;
@@ -40,6 +46,7 @@ pub const PIPE_CAPACITY: usize = 65536;
 pub const AT_FDCWD: i32 = -100;
 pub const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
 pub const AT_REMOVEDIR: i32 = 0x200;
+pub const AT_SYMLINK_FOLLOW: i32 = 0x400;
 pub const AT_EMPTY_PATH: i32 = 0x1000;
 
 pub const O_ACCMODE: i32 = 0x3;
@@ -56,15 +63,20 @@ pub const O_NOFOLLOW: i32 = 0x20000;
 pub const O_CLOEXEC: i32 = 0x80000;
 pub const MAX_SYMLINK_HOPS: usize = 40;
 
+pub const S_IFSOCK: u32 = 0o140000;
 pub const S_IFLNK: u32 = 0o120000;
 pub const S_IFREG: u32 = 0o100000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFCHR: u32 = 0o020000;
+pub const S_IFIFO: u32 = 0o010000;
 
 pub const DT_UNKNOWN: u8 = 0;
+pub const DT_FIFO: u8 = 1;
+pub const DT_CHR: u8 = 2;
 pub const DT_DIR: u8 = 4;
 pub const DT_REG: u8 = 8;
 pub const DT_LNK: u8 = 10;
+pub const DT_SOCK: u8 = 12;
 
 pub const SEEK_SET: i32 = 0;
 pub const SEEK_CUR: i32 = 1;
@@ -135,6 +147,31 @@ impl PipeBuffer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualDevice {
+    Null,
+    Zero,
+    Random,
+    Tty,
+}
+
+#[derive(Debug, Clone)]
+pub struct EventFdState {
+    pub counter: u64,
+    pub semaphore: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpollEntry {
+    pub events: u32,
+    pub data: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EpollInstance {
+    pub entries: BTreeMap<i32, EpollEntry>,
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenFile {
     pub data: Arc<Vec<u8>>,
@@ -146,12 +183,42 @@ pub struct OpenFile {
     pub is_std: Option<u8>,
     pub is_pipe: bool,
     pub pipe_id: Option<u64>,
+    pub sock_write_pipe_id: Option<u64>,
+    pub dev: Option<VirtualDevice>,
+    pub epoll_id: Option<u64>,
+    pub eventfd_id: Option<u64>,
     pub writable: bool,
     pub append: bool,
     pub cloexec: bool,
     pub nonblock: bool,
     pub dir_entries: Vec<DirEntry>,
     pub unlinked: bool,
+}
+
+impl OpenFile {
+    fn base(guest_path: String, data: Arc<Vec<u8>>) -> Self {
+        Self {
+            data,
+            cursor: 0,
+            so_index: None,
+            so_base_addr: None,
+            guest_path,
+            is_dir: false,
+            is_std: None,
+            is_pipe: false,
+            pipe_id: None,
+            sock_write_pipe_id: None,
+            dev: None,
+            epoll_id: None,
+            eventfd_id: None,
+            writable: false,
+            append: false,
+            cloexec: false,
+            nonblock: false,
+            dir_entries: Vec::new(),
+            unlinked: false,
+        }
+    }
 }
 
 pub fn normalize_guest_path(path: &str) -> String {
@@ -199,13 +266,29 @@ pub struct VirtualFs {
     pub next_fd: i32,
     pub pipes: BTreeMap<u64, PipeBuffer>,
     pub next_pipe_id: u64,
+    pub epolls: BTreeMap<u64, EpollInstance>,
+    pub next_epoll_id: u64,
+    pub eventfds: BTreeMap<u64, EventFdState>,
+    pub next_eventfd_id: u64,
     pub cwd: String,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub stdout_drain_cursor: usize,
+    pub stderr_drain_cursor: usize,
     pub stdin_data: Vec<u8>,
     stdin_cursor: usize,
+    pub stdin_eof: bool,
     pub inherit_stdin: bool,
     pub elf_path: String,
+    pub prng_state: u64,
+    pub current_pid: i32,
+    pub current_ppid: i32,
+    pub current_pgid: i32,
+    pub uid: u32,
+    pub gid: u32,
+    pub cmdline: Vec<String>,
+    pub uptime_ns: u64,
+    pub umask: u32,
 }
 
 impl VirtualFs {
@@ -254,66 +337,16 @@ impl VirtualFs {
 
         let mut fds = BTreeMap::new();
         let empty = Arc::new(Vec::new());
-        fds.insert(
-            0,
-            OpenFile {
-                data: Arc::clone(&empty),
-                cursor: 0,
-                so_index: None,
-                so_base_addr: None,
-                guest_path: "/dev/stdin".to_string(),
-                is_dir: false,
-                is_std: Some(0),
-                is_pipe: false,
-                pipe_id: None,
-                writable: false,
-                append: false,
-                cloexec: false,
-                nonblock: false,
-                dir_entries: Vec::new(),
-                    unlinked: false,
-            },
-        );
-        fds.insert(
-            1,
-            OpenFile {
-                data: Arc::clone(&empty),
-                cursor: 0,
-                so_index: None,
-                so_base_addr: None,
-                guest_path: "/dev/stdout".to_string(),
-                is_dir: false,
-                is_std: Some(1),
-                is_pipe: false,
-                pipe_id: None,
-                writable: true,
-                append: false,
-                cloexec: false,
-                nonblock: false,
-                dir_entries: Vec::new(),
-                    unlinked: false,
-            },
-        );
-        fds.insert(
-            2,
-            OpenFile {
-                data: empty,
-                cursor: 0,
-                so_index: None,
-                so_base_addr: None,
-                guest_path: "/dev/stderr".to_string(),
-                is_dir: false,
-                is_std: Some(2),
-                is_pipe: false,
-                pipe_id: None,
-                writable: true,
-                append: false,
-                cloexec: false,
-                nonblock: false,
-                dir_entries: Vec::new(),
-                    unlinked: false,
-            },
-        );
+        for (fd, path, writable) in [
+            (0, "/dev/stdin", false),
+            (1, "/dev/stdout", true),
+            (2, "/dev/stderr", true),
+        ] {
+            let mut f = OpenFile::base(path.to_string(), Arc::clone(&empty));
+            f.is_std = Some(fd as u8);
+            f.writable = writable;
+            fds.insert(fd, f);
+        }
 
         Self {
             so_entries,
@@ -323,23 +356,85 @@ impl VirtualFs {
             next_fd: 3,
             pipes: BTreeMap::new(),
             next_pipe_id: 1,
+            epolls: BTreeMap::new(),
+            next_epoll_id: 1,
+            eventfds: BTreeMap::new(),
+            next_eventfd_id: 1,
             cwd: "/".to_string(),
             stdout: Vec::new(),
             stderr: Vec::new(),
+            stdout_drain_cursor: 0,
+            stderr_drain_cursor: 0,
             stdin_data: Vec::new(),
             stdin_cursor: 0,
+            stdin_eof: true,
             inherit_stdin: false,
             elf_path: String::new(),
+            prng_state: 0x9e37_79b9_7f4a_7c15,
+            current_pid: 1000,
+            current_ppid: 1,
+            current_pgid: 1000,
+            uid: 1000,
+            gid: 1000,
+            cmdline: Vec::new(),
+            uptime_ns: 0,
+            umask: 0o022,
         }
+    }
+
+    pub fn next_rand_u64(&mut self) -> u64 {
+        let mut x = self.prng_state;
+        if x == 0 {
+            x = 0x9e37_79b9_7f4a_7c15;
+        }
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.prng_state = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
 
     pub fn stdin_cursor_val(&self) -> usize {
         self.stdin_cursor
     }
 
+    pub fn stdin_available(&self) -> usize {
+        self.stdin_data.len().saturating_sub(self.stdin_cursor)
+    }
+
+    pub fn push_stdin(&mut self, data: &[u8]) {
+        if self.stdin_cursor > 0 && self.stdin_cursor >= self.stdin_data.len() {
+            self.stdin_data.clear();
+            self.stdin_cursor = 0;
+        }
+        self.stdin_data.extend_from_slice(data);
+    }
+
+    pub fn close_stdin(&mut self) {
+        self.stdin_eof = true;
+    }
+
+    pub fn drain_stdout(&mut self) -> Vec<u8> {
+        let cur = self.stdout_drain_cursor.min(self.stdout.len());
+        let out = self.stdout[cur..].to_vec();
+        self.stdout_drain_cursor = self.stdout.len();
+        out
+    }
+
+    pub fn drain_stderr(&mut self) -> Vec<u8> {
+        let cur = self.stderr_drain_cursor.min(self.stderr.len());
+        let out = self.stderr[cur..].to_vec();
+        self.stderr_drain_cursor = self.stderr.len();
+        out
+    }
+
     pub fn reset_fds_and_stdio(&mut self) {
         self.pipes.clear();
         self.next_pipe_id = 1;
+        self.epolls.clear();
+        self.next_epoll_id = 1;
+        self.eventfds.clear();
+        self.next_eventfd_id = 1;
         self.fds.clear();
         let empty = Arc::new(Vec::new());
         for (fd, path, writable) in [
@@ -347,32 +442,19 @@ impl VirtualFs {
             (1, "/dev/stdout", true),
             (2, "/dev/stderr", true),
         ] {
-            self.fds.insert(
-                fd,
-                OpenFile {
-                    data: Arc::clone(&empty),
-                    cursor: 0,
-                    so_index: None,
-                    so_base_addr: None,
-                    guest_path: path.to_string(),
-                    is_dir: false,
-                    is_std: Some(fd as u8),
-                    is_pipe: false,
-                    pipe_id: None,
-                    writable,
-                    append: false,
-                    cloexec: false,
-                    nonblock: false,
-                    dir_entries: Vec::new(),
-                    unlinked: false,
-                },
-            );
+            let mut f = OpenFile::base(path.to_string(), Arc::clone(&empty));
+            f.is_std = Some(fd as u8);
+            f.writable = writable;
+            self.fds.insert(fd, f);
         }
         self.next_fd = 3;
         self.cwd = "/".to_string();
         self.stdout.clear();
         self.stderr.clear();
+        self.stdout_drain_cursor = 0;
+        self.stderr_drain_cursor = 0;
         self.stdin_cursor = 0;
+        self.umask = 0o022;
     }
 
     pub fn set_so_files(&mut self, so_files: &[MetaSoFile]) {
@@ -451,8 +533,57 @@ impl VirtualFs {
         );
     }
 
+    pub fn vfs_add_dir(&mut self, path: &str, mode: u32) {
+        let norm = normalize_guest_path(path);
+        if norm == "/" {
+            self.overlay.insert(
+                "/".to_string(),
+                OverlayNode::Dir {
+                    mode: mode & 0o7777,
+                    mtime_ns: 0,
+                },
+            );
+            return;
+        }
+        let Some(final_path) = self.resolve_and_ensure_parent(path) else {
+            return;
+        };
+        self.overlay.insert(
+            final_path,
+            OverlayNode::Dir {
+                mode: mode & 0o7777,
+                mtime_ns: 0,
+            },
+        );
+    }
+
+    pub fn vfs_remove_path(&mut self, path: &str) -> bool {
+        let norm = self
+            .resolve_path(AT_FDCWD, path, false)
+            .unwrap_or_else(|_| normalize_guest_path(path));
+        if norm == "/" {
+            return false;
+        }
+        let mut removed = self.overlay.remove(&norm).is_some();
+        let prefix = format!("{}/", norm);
+        let descendants: Vec<String> = self
+            .overlay
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for key in descendants {
+            self.overlay.remove(&key);
+            removed = true;
+        }
+        removed
+    }
+
     pub fn vfs_read_file(&self, path: &str) -> Option<Vec<u8>> {
         let norm = self.resolve_path(AT_FDCWD, path, true).ok()?;
+        if let Some(bytes) = self.virtual_proc_file(&norm) {
+            return Some(bytes);
+        }
         if let Some(OverlayNode::File { data, .. }) = self.overlay.get(&norm) {
             return Some(data.as_ref().clone());
         }
@@ -460,6 +591,163 @@ impl VirtualFs {
             return Some(so.bytes.as_ref().clone());
         }
         self.host_fs.read_host_ro(&norm)
+    }
+
+    fn virtual_symlink_target(&self, path: &str) -> Option<String> {
+        match path {
+            "/dev/stdin" => Some("/proc/self/fd/0".to_string()),
+            "/dev/stdout" => Some("/proc/self/fd/1".to_string()),
+            "/dev/stderr" => Some("/proc/self/fd/2".to_string()),
+            "/dev/fd" => Some("/proc/self/fd".to_string()),
+            "/proc/self" => Some(self.current_pid.to_string()),
+            _ => None,
+        }
+    }
+
+    fn virtual_dev_kind(norm_path: &str) -> Option<VirtualDevice> {
+        match norm_path {
+            "/dev/null" => Some(VirtualDevice::Null),
+            "/dev/zero" => Some(VirtualDevice::Zero),
+            "/dev/urandom" | "/dev/random" => Some(VirtualDevice::Random),
+            "/dev/tty" => Some(VirtualDevice::Tty),
+            _ => None,
+        }
+    }
+
+    fn parse_proc_fd(&self, norm_path: &str) -> Option<i32> {
+        let rest = norm_path.strip_prefix("/proc/")?;
+        let (who, tail) = rest.split_once("/fd/")?;
+        if tail.contains('/') {
+            return None;
+        }
+        if who != "self" && who != self.current_pid.to_string() {
+            return None;
+        }
+        tail.parse::<i32>().ok().filter(|&n| n >= 0)
+    }
+
+    fn is_proc_self_prefix(&self, who: &str) -> bool {
+        who == "self" || who == self.current_pid.to_string()
+    }
+
+    fn is_virtual_dir(&self, norm_path: &str) -> bool {
+        if norm_path == "/dev" || norm_path == "/proc" {
+            return true;
+        }
+        if let Some(rest) = norm_path.strip_prefix("/proc/") {
+            if self.is_proc_self_prefix(rest) {
+                return true;
+            }
+            if let Some(who) = rest.strip_suffix("/fd") {
+                if self.is_proc_self_prefix(who) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn virtual_proc_file(&self, norm_path: &str) -> Option<Vec<u8>> {
+        match norm_path {
+            "/proc/uptime" => {
+                let secs = (self.uptime_ns as f64 / 1e9).max(1.0);
+                Some(format!("{:.2} {:.2}\n", secs, secs).into_bytes())
+            }
+            "/proc/meminfo" => Some(
+                b"MemTotal:         262144 kB\n\
+MemFree:          131072 kB\n\
+MemAvailable:     131072 kB\n\
+Buffers:               0 kB\n\
+Cached:                0 kB\n\
+SwapTotal:             0 kB\n\
+SwapFree:              0 kB\n"
+                    .to_vec(),
+            ),
+            "/proc/cpuinfo" => Some(
+                b"processor\t: 0\n\
+vendor_id\t: GenuineIntel\n\
+cpu family\t: 6\n\
+model\t\t: 142\n\
+model name\t: elf2wasm Virtual x86_64 CPU\n\
+stepping\t: 0\n\
+cpu MHz\t\t: 2400.000\n\
+cache size\t: 4096 KB\n\
+flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 syscall nx lm\n\n"
+                    .to_vec(),
+            ),
+            "/proc/version" => {
+                Some(b"Linux version 6.12.0 (elf2wasm@sandbox) (gcc 12.2.0) #1 SMP\n".to_vec())
+            }
+            _ => {
+                let rest = norm_path.strip_prefix("/proc/")?;
+                let (who, leaf) = rest.split_once('/')?;
+                if !self.is_proc_self_prefix(who) {
+                    return None;
+                }
+                let comm = self
+                    .cmdline
+                    .first()
+                    .map(|s| s.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        if !self.elf_path.is_empty() {
+                            Some(self.elf_path.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or("app")
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("app");
+                match leaf {
+                    "cmdline" => {
+                        let mut out = Vec::new();
+                        if self.cmdline.is_empty() {
+                            let s = if self.elf_path.is_empty() {
+                                "app"
+                            } else {
+                                self.elf_path.as_str()
+                            };
+                            out.extend_from_slice(s.as_bytes());
+                            out.push(0);
+                        } else {
+                            for arg in &self.cmdline {
+                                out.extend_from_slice(arg.as_bytes());
+                                out.push(0);
+                            }
+                        }
+                        Some(out)
+                    }
+                    "stat" => Some(
+                        format!(
+                            "{} ({}) R {} {} {} 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 0 268435456 1024 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                            self.current_pid, comm, self.current_ppid, self.current_pgid, self.current_pgid
+                        )
+                        .into_bytes(),
+                    ),
+                    "status" => Some(
+                        format!(
+                            "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nThreads:\t1\nVmSize:\t  262144 kB\nVmRSS:\t    4096 kB\n",
+                            comm,
+                            self.current_pid,
+                            self.current_pid,
+                            self.current_ppid,
+                            self.uid,
+                            self.uid,
+                            self.uid,
+                            self.uid,
+                            self.gid,
+                            self.gid,
+                            self.gid,
+                            self.gid
+                        )
+                        .into_bytes(),
+                    ),
+                    _ => None,
+                }
+            }
+        }
     }
 
     fn alloc_fd(&mut self) -> Result<i32, i64> {
@@ -527,7 +815,11 @@ impl VirtualFs {
             let is_last = queue.is_empty();
             if !is_last || eff_follow_final {
                 let cur_path = format!("/{}", resolved_parts.join("/"));
-                if let Some(OverlayNode::Symlink { target, .. }) = self.overlay.get(&cur_path) {
+                let sym_target = match self.overlay.get(&cur_path) {
+                    Some(OverlayNode::Symlink { target, .. }) => Some(target.clone()),
+                    _ => self.virtual_symlink_target(&cur_path),
+                };
+                if let Some(target) = sym_target {
                     hops += 1;
                     if hops > MAX_SYMLINK_HOPS {
                         return Err(-ELOOP);
@@ -566,6 +858,9 @@ impl VirtualFs {
     }
 
     pub fn is_read_only_path(&self, norm_path: &str) -> bool {
+        if self.parse_proc_fd(norm_path).is_some() {
+            return false;
+        }
         if self.find_so(norm_path).is_some() || self.is_untranslated_so(norm_path) {
             return true;
         }
@@ -579,7 +874,7 @@ impl VirtualFs {
     }
 
     fn is_virtual_parent_dir(&self, norm_path: &str) -> bool {
-        if norm_path == "/" {
+        if norm_path == "/" || self.is_virtual_dir(norm_path) {
             return true;
         }
         let prefix_slash = format!("{}/", norm_path);
@@ -741,6 +1036,53 @@ impl VirtualFs {
             add_child_from_path(&allow, is_file);
         }
 
+        // 4. Virtual /dev and /proc entries
+        let mut add_virtual_entry = |name: &str, d_type: u8| {
+            if !seen.contains(name) {
+                seen.insert(name.to_string());
+                let child_guest = format!("{}{}", prefix_slash, name);
+                entries.push(DirEntry {
+                    d_ino: path_hash(&child_guest),
+                    d_type,
+                    name: name.to_string(),
+                });
+            }
+        };
+
+        if norm_path == "/" {
+            add_virtual_entry("dev", DT_DIR);
+            add_virtual_entry("proc", DT_DIR);
+        } else if norm_path == "/dev" {
+            for dev_name in ["null", "zero", "urandom", "random", "tty"] {
+                add_virtual_entry(dev_name, DT_CHR);
+            }
+            for link_name in ["stdin", "stdout", "stderr", "fd"] {
+                add_virtual_entry(link_name, DT_LNK);
+            }
+        } else if norm_path == "/proc" {
+            add_virtual_entry("self", DT_LNK);
+            let pid_str = self.current_pid.to_string();
+            add_virtual_entry(&pid_str, DT_DIR);
+            for f in ["uptime", "meminfo", "cpuinfo", "version"] {
+                add_virtual_entry(f, DT_REG);
+            }
+        } else if let Some(rest) = norm_path.strip_prefix("/proc/") {
+            if self.is_proc_self_prefix(rest) {
+                add_virtual_entry("exe", DT_LNK);
+                add_virtual_entry("fd", DT_DIR);
+                for f in ["cmdline", "stat", "status"] {
+                    add_virtual_entry(f, DT_REG);
+                }
+            } else if let Some(who) = rest.strip_suffix("/fd") {
+                if self.is_proc_self_prefix(who) {
+                    let fd_names: Vec<String> = self.fds.keys().map(|k| k.to_string()).collect();
+                    for name in fd_names {
+                        add_virtual_entry(&name, DT_LNK);
+                    }
+                }
+            }
+        }
+
         entries
     }
 
@@ -787,6 +1129,73 @@ impl VirtualFs {
             return -EACCES;
         }
 
+        // Virtual /proc/<self|pid>/fd/<N> (including /dev/stdin, /dev/stdout, /dev/stderr, /dev/fd/<N>)
+        if let Some(target_fd) = self.parse_proc_fd(&norm_path) {
+            if (flags & O_DIRECTORY) != 0 {
+                let is_dir = self.fds.get(&target_fd).map_or(false, |f| f.is_dir);
+                if !is_dir {
+                    return -ENOTDIR;
+                }
+            }
+            let Some(mut cloned) = self.fds.get(&target_fd).cloned() else {
+                return -ENOENT;
+            };
+            cloned.cloexec = (flags & O_CLOEXEC) != 0;
+            cloned.nonblock = (flags & O_NONBLOCK) != 0;
+            let newfd = match self.alloc_fd() {
+                Ok(fd) => fd,
+                Err(e) => return e,
+            };
+            self.inc_pipe_ref(&cloned);
+            self.fds.insert(newfd, cloned);
+            return newfd as i64;
+        }
+
+        // Virtual /dev/* devices (checked before overlay so container tarballs with placeholder
+        // /dev/null files still get real character device semantics)
+        if let Some(dev_kind) = Self::virtual_dev_kind(&norm_path) {
+            if (flags & O_DIRECTORY) != 0 {
+                return -ENOTDIR;
+            }
+            if (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 {
+                return -EEXIST;
+            }
+            let fd = match self.alloc_fd() {
+                Ok(fd) => fd,
+                Err(e) => return e,
+            };
+            let mut f = OpenFile::base(norm_path, Arc::new(Vec::new()));
+            f.dev = Some(dev_kind);
+            f.writable = acc == O_WRONLY || acc == O_RDWR;
+            f.append = (flags & O_APPEND) != 0;
+            f.cloexec = (flags & O_CLOEXEC) != 0;
+            f.nonblock = (flags & O_NONBLOCK) != 0;
+            self.fds.insert(fd, f);
+            return fd as i64;
+        }
+
+        // Virtual /proc/* regular files
+        if let Some(bytes) = self.virtual_proc_file(&norm_path) {
+            if (flags & O_DIRECTORY) != 0 {
+                return -ENOTDIR;
+            }
+            if (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 {
+                return -EEXIST;
+            }
+            if wants_write {
+                return -EACCES;
+            }
+            let fd = match self.alloc_fd() {
+                Ok(fd) => fd,
+                Err(e) => return e,
+            };
+            let mut f = OpenFile::base(norm_path, Arc::new(bytes));
+            f.cloexec = (flags & O_CLOEXEC) != 0;
+            f.nonblock = (flags & O_NONBLOCK) != 0;
+            self.fds.insert(fd, f);
+            return fd as i64;
+        }
+
         if let Some((idx, so)) = self.find_so(&norm_path) {
             if (flags & O_DIRECTORY) != 0 {
                 return -ENOTDIR;
@@ -797,28 +1206,12 @@ impl VirtualFs {
                 Ok(fd) => fd,
                 Err(e) => return e,
             };
-            let cloexec = (flags & O_CLOEXEC) != 0;
-            let nonblock = (flags & O_NONBLOCK) != 0;
-            self.fds.insert(
-                fd,
-                OpenFile {
-                    data: so_bytes,
-                    cursor: 0,
-                    so_index: Some(idx),
-                    so_base_addr: Some(so_base),
-                    guest_path: norm_path,
-                    is_dir: false,
-                    is_std: None,
-                    is_pipe: false,
-                    pipe_id: None,
-                    writable: false,
-                    append: false,
-                    cloexec,
-                    nonblock,
-                    dir_entries: Vec::new(),
-                    unlinked: false,
-                },
-            );
+            let mut f = OpenFile::base(norm_path, so_bytes);
+            f.so_index = Some(idx);
+            f.so_base_addr = Some(so_base);
+            f.cloexec = (flags & O_CLOEXEC) != 0;
+            f.nonblock = (flags & O_NONBLOCK) != 0;
+            self.fds.insert(fd, f);
             return fd as i64;
         }
 
@@ -838,28 +1231,12 @@ impl VirtualFs {
                         Ok(fd) => fd,
                         Err(e) => return e,
                     };
-                    let cloexec = (flags & O_CLOEXEC) != 0;
-                    let nonblock = (flags & O_NONBLOCK) != 0;
-                    self.fds.insert(
-                        fd,
-                        OpenFile {
-                            data: Arc::new(Vec::new()),
-                            cursor: 0,
-                            so_index: None,
-                            so_base_addr: None,
-                            guest_path: norm_path,
-                            is_dir: true,
-                            is_std: None,
-                            is_pipe: false,
-                            pipe_id: None,
-                            writable: false,
-                            append: false,
-                            cloexec,
-                            nonblock,
-                            dir_entries,
-                        unlinked: false,
-                        },
-                    );
+                    let mut f = OpenFile::base(norm_path, Arc::new(Vec::new()));
+                    f.is_dir = true;
+                    f.cloexec = (flags & O_CLOEXEC) != 0;
+                    f.nonblock = (flags & O_NONBLOCK) != 0;
+                    f.dir_entries = dir_entries;
+                    self.fds.insert(fd, f);
                     return fd as i64;
                 }
                 OverlayNode::File { data, .. } => {
@@ -890,28 +1267,12 @@ impl VirtualFs {
                         Ok(fd) => fd,
                         Err(e) => return e,
                     };
-                    let cloexec = (flags & O_CLOEXEC) != 0;
-                    let nonblock = (flags & O_NONBLOCK) != 0;
-                    self.fds.insert(
-                        fd,
-                        OpenFile {
-                            data: file_data,
-                            cursor: 0,
-                            so_index: None,
-                            so_base_addr: None,
-                            guest_path: norm_path,
-                            is_dir: false,
-                            is_std: None,
-                            is_pipe: false,
-                            pipe_id: None,
-                            writable,
-                            append,
-                            cloexec,
-                            nonblock,
-                            dir_entries: Vec::new(),
-                    unlinked: false,
-                        },
-                    );
+                    let mut f = OpenFile::base(norm_path, file_data);
+                    f.writable = writable;
+                    f.append = append;
+                    f.cloexec = (flags & O_CLOEXEC) != 0;
+                    f.nonblock = (flags & O_NONBLOCK) != 0;
+                    self.fds.insert(fd, f);
                     return fd as i64;
                 }
             }
@@ -931,28 +1292,12 @@ impl VirtualFs {
                     Ok(fd) => fd,
                     Err(e) => return e,
                 };
-                let cloexec = (flags & O_CLOEXEC) != 0;
-                let nonblock = (flags & O_NONBLOCK) != 0;
-                self.fds.insert(
-                    fd,
-                    OpenFile {
-                        data: Arc::new(Vec::new()),
-                        cursor: 0,
-                        so_index: None,
-                        so_base_addr: None,
-                        guest_path: norm_path,
-                        is_dir: true,
-                        is_std: None,
-                        is_pipe: false,
-                        pipe_id: None,
-                        writable: false,
-                        append: false,
-                        cloexec,
-                        nonblock,
-                        dir_entries,
-                        unlinked: false,
-                    },
-                );
+                let mut f = OpenFile::base(norm_path, Arc::new(Vec::new()));
+                f.is_dir = true;
+                f.cloexec = (flags & O_CLOEXEC) != 0;
+                f.nonblock = (flags & O_NONBLOCK) != 0;
+                f.dir_entries = dir_entries;
+                self.fds.insert(fd, f);
                 return fd as i64;
             }
             if (flags & O_DIRECTORY) != 0 {
@@ -970,28 +1315,10 @@ impl VirtualFs {
                         Ok(fd) => fd,
                         Err(e) => return e,
                     };
-                    let cloexec = (flags & O_CLOEXEC) != 0;
-                    let nonblock = (flags & O_NONBLOCK) != 0;
-                    self.fds.insert(
-                        fd,
-                        OpenFile {
-                            data: Arc::new(bytes),
-                            cursor: 0,
-                            so_index: None,
-                            so_base_addr: None,
-                            guest_path: norm_path,
-                            is_dir: false,
-                            is_std: None,
-                            is_pipe: false,
-                            pipe_id: None,
-                            writable: false,
-                            append: false,
-                            cloexec,
-                            nonblock,
-                            dir_entries: Vec::new(),
-                    unlinked: false,
-                        },
-                    );
+                    let mut f = OpenFile::base(norm_path, Arc::new(bytes));
+                    f.cloexec = (flags & O_CLOEXEC) != 0;
+                    f.nonblock = (flags & O_NONBLOCK) != 0;
+                    self.fds.insert(fd, f);
                     return fd as i64;
                 }
                 None => return -ENOENT,
@@ -1011,28 +1338,12 @@ impl VirtualFs {
                 Ok(fd) => fd,
                 Err(e) => return e,
             };
-            let cloexec = (flags & O_CLOEXEC) != 0;
-            let nonblock = (flags & O_NONBLOCK) != 0;
-            self.fds.insert(
-                fd,
-                OpenFile {
-                    data: Arc::new(Vec::new()),
-                    cursor: 0,
-                    so_index: None,
-                    so_base_addr: None,
-                    guest_path: norm_path,
-                    is_dir: true,
-                    is_std: None,
-                    is_pipe: false,
-                    pipe_id: None,
-                    writable: false,
-                    append: false,
-                    cloexec,
-                    nonblock,
-                    dir_entries,
-                        unlinked: false,
-                },
-            );
+            let mut f = OpenFile::base(norm_path, Arc::new(Vec::new()));
+            f.is_dir = true;
+            f.cloexec = (flags & O_CLOEXEC) != 0;
+            f.nonblock = (flags & O_NONBLOCK) != 0;
+            f.dir_entries = dir_entries;
+            self.fds.insert(fd, f);
             return fd as i64;
         }
 
@@ -1050,7 +1361,7 @@ impl VirtualFs {
                 norm_path.clone(),
                 OverlayNode::File {
                     data: Arc::clone(&empty),
-                    mode: mode & 0o7777,
+                    mode: (mode & !self.umask) & 0o7777,
                     mtime_ns: now_ns,
                 },
             );
@@ -1058,30 +1369,12 @@ impl VirtualFs {
                 Ok(fd) => fd,
                 Err(e) => return e,
             };
-            let writable = acc == O_WRONLY || acc == O_RDWR;
-            let append = (flags & O_APPEND) != 0;
-            let cloexec = (flags & O_CLOEXEC) != 0;
-            let nonblock = (flags & O_NONBLOCK) != 0;
-            self.fds.insert(
-                fd,
-                OpenFile {
-                    data: empty,
-                    cursor: 0,
-                    so_index: None,
-                    so_base_addr: None,
-                    guest_path: norm_path,
-                    is_dir: false,
-                    is_std: None,
-                    is_pipe: false,
-                    pipe_id: None,
-                    writable,
-                    append,
-                    cloexec,
-                    nonblock,
-                    dir_entries: Vec::new(),
-                    unlinked: false,
-                },
-            );
+            let mut f = OpenFile::base(norm_path, empty);
+            f.writable = acc == O_WRONLY || acc == O_RDWR;
+            f.append = (flags & O_APPEND) != 0;
+            f.cloexec = (flags & O_CLOEXEC) != 0;
+            f.nonblock = (flags & O_NONBLOCK) != 0;
+            self.fds.insert(fd, f);
             return fd as i64;
         }
 
@@ -1097,6 +1390,18 @@ impl VirtualFs {
     }
 
     fn inc_pipe_ref(&mut self, file: &OpenFile) {
+        if let Some(wpid) = file.sock_write_pipe_id {
+            // Bidirectional socketpair: pipe_id is read pipe, sock_write_pipe_id is write pipe.
+            if let Some(rpid) = file.pipe_id {
+                if let Some(p) = self.pipes.get_mut(&rpid) {
+                    p.readers += 1;
+                }
+            }
+            if let Some(p) = self.pipes.get_mut(&wpid) {
+                p.writers += 1;
+            }
+            return;
+        }
         if let Some(pid) = file.pipe_id {
             if let Some(p) = self.pipes.get_mut(&pid) {
                 if file.writable {
@@ -1109,6 +1414,31 @@ impl VirtualFs {
     }
 
     fn dec_pipe_ref(&mut self, file: &OpenFile) {
+        if let Some(wpid) = file.sock_write_pipe_id {
+            if let Some(rpid) = file.pipe_id {
+                let mut remove = false;
+                if let Some(p) = self.pipes.get_mut(&rpid) {
+                    p.readers = p.readers.saturating_sub(1);
+                    if p.readers == 0 && p.writers == 0 {
+                        remove = true;
+                    }
+                }
+                if remove {
+                    self.pipes.remove(&rpid);
+                }
+            }
+            let mut remove = false;
+            if let Some(p) = self.pipes.get_mut(&wpid) {
+                p.writers = p.writers.saturating_sub(1);
+                if p.readers == 0 && p.writers == 0 {
+                    remove = true;
+                }
+            }
+            if remove {
+                self.pipes.remove(&wpid);
+            }
+            return;
+        }
         if let Some(pid) = file.pipe_id {
             let mut remove_pipe = false;
             if let Some(p) = self.pipes.get_mut(&pid) {
@@ -1165,6 +1495,10 @@ impl VirtualFs {
         if !file.unlinked
             && file.so_index.is_none()
             && file.is_std.is_none()
+            && file.dev.is_none()
+            && file.epoll_id.is_none()
+            && file.eventfd_id.is_none()
+            && file.sock_write_pipe_id.is_none()
             && !file.is_dir
             && !file.is_pipe
         {
@@ -1176,11 +1510,79 @@ impl VirtualFs {
     }
 
     /// Reads up to `count` bytes without advancing `stdin_cursor` or `file.cursor`
-    /// (except when reading directly from inherited host stdin).
+    /// (except when reading directly from inherited host stdin or virtual devices).
     /// Returns `(bytes, already_consumed_from_host)`.
     pub fn read_no_advance(&mut self, fd: i32, count: usize) -> Result<(Vec<u8>, bool), i64> {
-        let file = self.fds.get(&fd).ok_or(-EBADF)?;
-        if let Some(std_fd) = file.is_std {
+        let (is_std, dev, is_dir, eventfd_id, nonblock, epoll_id) = {
+            let file = self.fds.get(&fd).ok_or(-EBADF)?;
+            (
+                file.is_std,
+                file.dev,
+                file.is_dir,
+                file.eventfd_id,
+                file.nonblock,
+                file.epoll_id,
+            )
+        };
+        if epoll_id.is_some() {
+            return Err(-EINVAL);
+        }
+        if let Some(eid) = eventfd_id {
+            if count < 8 {
+                return Err(-EINVAL);
+            }
+            let Some(efd) = self.eventfds.get_mut(&eid) else {
+                return Err(-EBADF);
+            };
+            if efd.counter == 0 {
+                return Err(-EAGAIN);
+            }
+            let val = if efd.semaphore {
+                efd.counter -= 1;
+                1u64
+            } else {
+                let v = efd.counter;
+                efd.counter = 0;
+                v
+            };
+            let _ = nonblock;
+            return Ok((val.to_le_bytes().to_vec(), true));
+        }
+        if let Some(d) = dev {
+            return match d {
+                VirtualDevice::Null => Ok((Vec::new(), true)),
+                VirtualDevice::Zero => Ok((vec![0u8; count.min(64 * 1024)], true)),
+                VirtualDevice::Random => {
+                    let n = count.min(64 * 1024);
+                    let mut out = vec![0u8; n];
+                    let mut off = 0;
+                    while off < n {
+                        let r = self.next_rand_u64().to_le_bytes();
+                        let take = (n - off).min(8);
+                        out[off..off + take].copy_from_slice(&r[..take]);
+                        off += take;
+                    }
+                    Ok((out, true))
+                }
+                VirtualDevice::Tty => {
+                    if count == 0 {
+                        return Ok((Vec::new(), false));
+                    }
+                    if self.inherit_stdin && self.stdin_data.is_empty() {
+                        let out = self.host_fs.read_inherited_stdin(count)?;
+                        return Ok((out, true));
+                    }
+                    if self.stdin_cursor >= self.stdin_data.len() {
+                        return Ok((Vec::new(), false));
+                    }
+                    let avail = self.stdin_data.len() - self.stdin_cursor;
+                    let n = avail.min(count);
+                    let out = self.stdin_data[self.stdin_cursor..self.stdin_cursor + n].to_vec();
+                    Ok((out, false))
+                }
+            };
+        }
+        if let Some(std_fd) = is_std {
             if std_fd == 0 {
                 if count == 0 {
                     return Ok((Vec::new(), false));
@@ -1199,9 +1601,10 @@ impl VirtualFs {
             }
             return Err(-EBADF);
         }
-        if file.is_dir {
+        if is_dir {
             return Err(-EISDIR);
         }
+        let file = self.fds.get(&fd).ok_or(-EBADF)?;
         let data = self.current_file_data(file);
         if file.cursor >= data.len() {
             return Ok((Vec::new(), false));
@@ -1214,9 +1617,9 @@ impl VirtualFs {
 
     pub fn advance_read_cursor(&mut self, fd: i32, n: usize) {
         if let Some(file) = self.fds.get_mut(&fd) {
-            if file.is_std == Some(0) {
+            if file.is_std == Some(0) || file.dev == Some(VirtualDevice::Tty) {
                 self.stdin_cursor = self.stdin_cursor.saturating_add(n);
-            } else if file.is_std.is_none() {
+            } else if file.is_std.is_none() && file.dev.is_none() {
                 file.cursor = file.cursor.saturating_add(n);
             }
         }
@@ -1263,23 +1666,77 @@ impl VirtualFs {
     }
 
     fn write_at(&mut self, fd: i32, data: &[u8], explicit_offset: Option<usize>, now_ns: u64) -> i64 {
-        let Some((is_std, is_dir, is_pipe, writable, append, cursor, guest_path, unlinked)) =
-            self.fds.get(&fd).map(|f| {
-                (
-                    f.is_std,
-                    f.is_dir,
-                    f.is_pipe,
-                    f.writable,
-                    f.append,
-                    f.cursor,
-                    f.guest_path.clone(),
-                    f.unlinked,
-                )
-            })
+        let Some((
+            is_std,
+            dev,
+            eventfd_id,
+            epoll_id,
+            is_dir,
+            is_pipe,
+            writable,
+            append,
+            cursor,
+            guest_path,
+            unlinked,
+        )) = self.fds.get(&fd).map(|f| {
+            (
+                f.is_std,
+                f.dev,
+                f.eventfd_id,
+                f.epoll_id,
+                f.is_dir,
+                f.is_pipe,
+                f.writable,
+                f.append,
+                f.cursor,
+                f.guest_path.clone(),
+                f.unlinked,
+            )
+        })
         else {
             return -EBADF;
         };
 
+        if epoll_id.is_some() {
+            return -EINVAL;
+        }
+        if let Some(eid) = eventfd_id {
+            if explicit_offset.is_some() {
+                return -ESPIPE;
+            }
+            if data.len() < 8 {
+                return -EINVAL;
+            }
+            let val = u64::from_le_bytes(data[..8].try_into().unwrap());
+            if val == u64::MAX {
+                return -EINVAL;
+            }
+            let Some(efd) = self.eventfds.get_mut(&eid) else {
+                return -EBADF;
+            };
+            if efd.counter > (u64::MAX - 1).saturating_sub(val) {
+                return -EAGAIN;
+            }
+            efd.counter += val;
+            return 8;
+        }
+        if let Some(d) = dev {
+            if !writable {
+                return -EBADF;
+            }
+            return match d {
+                VirtualDevice::Null | VirtualDevice::Zero | VirtualDevice::Random => {
+                    data.len() as i64
+                }
+                VirtualDevice::Tty => {
+                    if explicit_offset.is_some() {
+                        return -ESPIPE;
+                    }
+                    self.stdout.extend_from_slice(data);
+                    data.len() as i64
+                }
+            };
+        }
         if let Some(std_fd) = is_std {
             if explicit_offset.is_some() {
                 return -ESPIPE;
@@ -1384,7 +1841,18 @@ impl VirtualFs {
             let Some(file) = self.fds.get(&fd) else {
                 return -EBADF;
             };
-            if file.is_std.is_some() || file.is_pipe {
+            if let Some(d) = file.dev {
+                return match d {
+                    VirtualDevice::Null | VirtualDevice::Zero | VirtualDevice::Random => 0,
+                    VirtualDevice::Tty => -ESPIPE,
+                };
+            }
+            if file.is_std.is_some()
+                || file.is_pipe
+                || file.sock_write_pipe_id.is_some()
+                || file.epoll_id.is_some()
+                || file.eventfd_id.is_some()
+            {
                 return -ESPIPE;
             }
             if file.is_dir {
@@ -1460,6 +1928,33 @@ impl VirtualFs {
                 mtime_ns: 0,
             });
         }
+        if file.dev.is_some() {
+            return Ok(FileStat {
+                st_ino: path_hash(&file.guest_path),
+                st_mode: S_IFCHR | 0o666,
+                st_nlink: 1,
+                st_size: 0,
+                mtime_ns: 0,
+            });
+        }
+        if file.sock_write_pipe_id.is_some() {
+            return Ok(FileStat {
+                st_ino: path_hash(&file.guest_path),
+                st_mode: S_IFSOCK | 0o777,
+                st_nlink: 1,
+                st_size: 0,
+                mtime_ns: 0,
+            });
+        }
+        if file.is_pipe {
+            return Ok(FileStat {
+                st_ino: path_hash(&file.guest_path),
+                st_mode: S_IFIFO | 0o600,
+                st_nlink: 1,
+                st_size: 0,
+                mtime_ns: 0,
+            });
+        }
         if file.is_dir {
             let (mode, mtime_ns) = match self.overlay.get(&file.guest_path) {
                 Some(OverlayNode::Dir { mode, mtime_ns }) => (*mode, *mtime_ns),
@@ -1506,6 +2001,50 @@ impl VirtualFs {
         let norm_path = self.resolve_path(dirfd, raw_path, follow)?;
         if DENY_PATHS.contains(&norm_path.as_str()) {
             return Err(-ENOENT);
+        }
+        if !follow {
+            if let Some(target) = self.virtual_symlink_target(&norm_path) {
+                return Ok(FileStat {
+                    st_ino: path_hash(&norm_path),
+                    st_mode: S_IFLNK | 0o777,
+                    st_nlink: 1,
+                    st_size: target.len() as i64,
+                    mtime_ns: 0,
+                });
+            }
+        }
+        if let Some(target_fd) = self.parse_proc_fd(&norm_path) {
+            let Some(file) = self.fds.get(&target_fd) else {
+                return Err(-ENOENT);
+            };
+            if !follow {
+                return Ok(FileStat {
+                    st_ino: path_hash(&norm_path),
+                    st_mode: S_IFLNK | 0o700,
+                    st_nlink: 1,
+                    st_size: file.guest_path.len() as i64,
+                    mtime_ns: 0,
+                });
+            }
+            return self.stat_fd(target_fd);
+        }
+        if Self::virtual_dev_kind(&norm_path).is_some() {
+            return Ok(FileStat {
+                st_ino: path_hash(&norm_path),
+                st_mode: S_IFCHR | 0o666,
+                st_nlink: 1,
+                st_size: 0,
+                mtime_ns: 0,
+            });
+        }
+        if let Some(bytes) = self.virtual_proc_file(&norm_path) {
+            return Ok(FileStat {
+                st_ino: path_hash(&norm_path),
+                st_mode: S_IFREG | 0o444,
+                st_nlink: 1,
+                st_size: bytes.len() as i64,
+                mtime_ns: 0,
+            });
         }
         if let Some((_, so)) = self.find_so(&norm_path) {
             return Ok(FileStat {
@@ -1605,6 +2144,15 @@ impl VirtualFs {
                 b"/usr/bin/python3.11"
             };
             return Ok(target.to_vec());
+        }
+        if let Some(target_fd) = self.parse_proc_fd(&norm_path) {
+            let Some(file) = self.fds.get(&target_fd) else {
+                return Err(-ENOENT);
+            };
+            return Ok(file.guest_path.as_bytes().to_vec());
+        }
+        if let Some(target) = self.virtual_symlink_target(&norm_path) {
+            return Ok(target.into_bytes());
         }
         if let Some(OverlayNode::Symlink { target, .. }) = self.overlay.get(&norm_path) {
             return Ok(target.as_bytes().to_vec());
@@ -1739,26 +2287,12 @@ impl VirtualFs {
 
         let rfd = self.alloc_fd()?;
         let empty = Arc::new(Vec::new());
-        self.fds.insert(
-            rfd,
-            OpenFile {
-                data: Arc::clone(&empty),
-                cursor: 0,
-                so_index: None,
-                so_base_addr: None,
-                guest_path: format!("pipe:[{}]", pipe_id),
-                is_dir: false,
-                is_std: None,
-                is_pipe: true,
-                pipe_id: Some(pipe_id),
-                writable: false,
-                append: false,
-                cloexec,
-                nonblock,
-                dir_entries: Vec::new(),
-                    unlinked: false,
-            },
-        );
+        let mut rf = OpenFile::base(format!("pipe:[{}]", pipe_id), Arc::clone(&empty));
+        rf.is_pipe = true;
+        rf.pipe_id = Some(pipe_id);
+        rf.cloexec = cloexec;
+        rf.nonblock = nonblock;
+        self.fds.insert(rfd, rf);
         let wfd = match self.alloc_fd() {
             Ok(fd) => fd,
             Err(e) => {
@@ -1766,33 +2300,173 @@ impl VirtualFs {
                 return Err(e);
             }
         };
-        self.fds.insert(
-            wfd,
-            OpenFile {
-                data: empty,
-                cursor: 0,
-                so_index: None,
-                so_base_addr: None,
-                guest_path: format!("pipe:[{}]", pipe_id),
-                is_dir: false,
-                is_std: None,
-                is_pipe: true,
-                pipe_id: Some(pipe_id),
-                writable: true,
-                append: false,
-                cloexec,
-                nonblock,
-                dir_entries: Vec::new(),
-                    unlinked: false,
-            },
-        );
+        let mut wf = OpenFile::base(format!("pipe:[{}]", pipe_id), empty);
+        wf.is_pipe = true;
+        wf.pipe_id = Some(pipe_id);
+        wf.writable = true;
+        wf.cloexec = cloexec;
+        wf.nonblock = nonblock;
+        self.fds.insert(wfd, wf);
         self.pipes.insert(pipe_id, PipeBuffer::new());
         Ok((rfd, wfd))
     }
 
+    pub fn create_socketpair(&mut self, cloexec: bool, nonblock: bool) -> Result<(i32, i32), i64> {
+        let pipe_a = self.next_pipe_id;
+        self.next_pipe_id += 1;
+        let pipe_b = self.next_pipe_id;
+        self.next_pipe_id += 1;
+
+        let fd0 = self.alloc_fd()?;
+        let empty = Arc::new(Vec::new());
+        let mut f0 = OpenFile::base(format!("socket:[{}]", pipe_a), Arc::clone(&empty));
+        f0.pipe_id = Some(pipe_b);
+        f0.sock_write_pipe_id = Some(pipe_a);
+        f0.writable = true;
+        f0.cloexec = cloexec;
+        f0.nonblock = nonblock;
+        self.fds.insert(fd0, f0);
+
+        let fd1 = match self.alloc_fd() {
+            Ok(fd) => fd,
+            Err(e) => {
+                self.fds.remove(&fd0);
+                return Err(e);
+            }
+        };
+        let mut f1 = OpenFile::base(format!("socket:[{}]", pipe_b), empty);
+        f1.pipe_id = Some(pipe_a);
+        f1.sock_write_pipe_id = Some(pipe_b);
+        f1.writable = true;
+        f1.cloexec = cloexec;
+        f1.nonblock = nonblock;
+        self.fds.insert(fd1, f1);
+
+        self.pipes.insert(pipe_a, PipeBuffer::new());
+        self.pipes.insert(pipe_b, PipeBuffer::new());
+        Ok((fd0, fd1))
+    }
+
+    pub fn create_epoll(&mut self, cloexec: bool) -> Result<i32, i64> {
+        let id = self.next_epoll_id;
+        self.next_epoll_id += 1;
+        let fd = self.alloc_fd()?;
+        let mut f = OpenFile::base(format!("anon_inode:[eventpoll:{}]", id), Arc::new(Vec::new()));
+        f.epoll_id = Some(id);
+        f.cloexec = cloexec;
+        self.fds.insert(fd, f);
+        self.epolls.insert(id, EpollInstance::default());
+        Ok(fd)
+    }
+
+    pub fn create_eventfd(
+        &mut self,
+        initval: u64,
+        semaphore: bool,
+        cloexec: bool,
+        nonblock: bool,
+    ) -> Result<i32, i64> {
+        let id = self.next_eventfd_id;
+        self.next_eventfd_id += 1;
+        let fd = self.alloc_fd()?;
+        let mut f = OpenFile::base(format!("anon_inode:[eventfd:{}]", id), Arc::new(Vec::new()));
+        f.eventfd_id = Some(id);
+        f.writable = true;
+        f.cloexec = cloexec;
+        f.nonblock = nonblock;
+        self.fds.insert(fd, f);
+        self.eventfds.insert(
+            id,
+            EventFdState {
+                counter: initval,
+                semaphore,
+            },
+        );
+        Ok(fd)
+    }
+
+    pub fn linkat(
+        &mut self,
+        olddirfd: i32,
+        oldpath: &str,
+        newdirfd: i32,
+        newpath: &str,
+        flags: i32,
+        now_ns: u64,
+    ) -> i64 {
+        let follow = (flags & AT_SYMLINK_FOLLOW) != 0;
+        let old_norm = match self.resolve_path(olddirfd, oldpath, follow) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let new_norm = match self.resolve_path(newdirfd, newpath, false) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        if self.is_read_only_path(&new_norm) {
+            return -EACCES;
+        }
+        if self.overlay.contains_key(&new_norm)
+            || self.host_fs.stat_host_ro(&new_norm).is_some()
+            || self.is_virtual_parent_dir(&new_norm)
+            || self.find_so(&new_norm).is_some()
+        {
+            return -EEXIST;
+        }
+        let parent = parent_guest_path(&new_norm);
+        if !self.is_existing_dir(parent) {
+            return self.missing_parent_errno(parent);
+        }
+        if let Some(node) = self.overlay.get(&old_norm).cloned() {
+            match node {
+                OverlayNode::Dir { .. } => return -EPERM,
+                OverlayNode::File { .. } | OverlayNode::Symlink { .. } => {
+                    self.overlay.insert(new_norm, node);
+                    return 0;
+                }
+            }
+        }
+        if let Some(st) = self.host_fs.stat_host_ro(&old_norm) {
+            if (st.st_mode & S_IFDIR) != 0 {
+                return -EPERM;
+            }
+            if let Some(bytes) = self.host_fs.read_host_ro(&old_norm) {
+                self.overlay.insert(
+                    new_norm,
+                    OverlayNode::File {
+                        data: Arc::new(bytes),
+                        mode: st.st_mode & 0o7777,
+                        mtime_ns: now_ns,
+                    },
+                );
+                return 0;
+            }
+        }
+        if let Some((_, so)) = self.find_so(&old_norm) {
+            let bytes = Arc::clone(&so.bytes);
+            self.overlay.insert(
+                new_norm,
+                OverlayNode::File {
+                    data: bytes,
+                    mode: 0o755,
+                    mtime_ns: now_ns,
+                },
+            );
+            return 0;
+        }
+        -ENOENT
+    }
+
     pub fn access(&self, dirfd: i32, raw_path: &str, mode: i32) -> i64 {
-        if let Err(e) = self.stat_path(dirfd, raw_path, 0) {
-            return e;
+        if (mode & !7) != 0 {
+            return -EINVAL;
+        }
+        let st = match self.stat_path(dirfd, raw_path, 0) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        if (mode & 1) != 0 && (st.st_mode & S_IFDIR) == 0 && (st.st_mode & 0o111) == 0 {
+            return -EACCES;
         }
         if (mode & 2) != 0 {
             let norm_path = match self.resolve_path(dirfd, raw_path, true) {
@@ -1830,7 +2504,7 @@ impl VirtualFs {
         self.overlay.insert(
             norm_path,
             OverlayNode::Dir {
-                mode: mode & 0o7777,
+                mode: (mode & !self.umask) & 0o7777,
                 mtime_ns: now_ns,
             },
         );

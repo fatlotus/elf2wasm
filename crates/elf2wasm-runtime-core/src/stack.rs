@@ -104,6 +104,17 @@ pub fn setup_guest_stack_ctx(
     args: &[String],
     env: &[String],
 ) -> Result<u32> {
+    setup_guest_stack_ctx_with_ids(ctx, meta, args, env, 1000, 1000)
+}
+
+pub fn setup_guest_stack_ctx_with_ids(
+    ctx: &mut dyn GuestContext,
+    meta: &WasmMeta,
+    args: &[String],
+    env: &[String],
+    uid: u32,
+    gid: u32,
+) -> Result<u32> {
     let mut sp = STACK_TOP;
 
     let rand_bytes: [u8; 16] = [
@@ -146,10 +157,10 @@ pub fn setup_guest_stack_ctx(
         (7, meta.at_base as u64),   // AT_BASE
         (8, 0),                     // AT_FLAGS
         (9, meta.at_entry as u64),  // AT_ENTRY
-        (11, 1000),                 // AT_UID
-        (12, 1000),                 // AT_EUID
-        (13, 1000),                 // AT_GID
-        (14, 1000),                 // AT_EGID
+        (11, uid as u64),           // AT_UID
+        (12, uid as u64),           // AT_EUID
+        (13, gid as u64),           // AT_GID
+        (14, gid as u64),           // AT_EGID
         (15, platform_addr as u64), // AT_PLATFORM
         (16, 0x078bfbff),           // AT_HWCAP (baseline x86-64 + SSE2, no AVX)
         (17, 100),                  // AT_CLKTCK
@@ -271,10 +282,10 @@ pub fn setup_guest_stack(mem: &mut [u8], meta: &WasmMeta, config: &RunConfig) ->
         fn set_exit(&mut self, _code: i32) {}
         fn set_yield_flag(&mut self, _val: i32) {}
         fn set_quantum(&mut self, _val: i32) {}
-        fn save_ctx(&mut self, _scratch_addr: u32) -> Result<[u8; 464], i64> {
+        fn save_ctx(&mut self, _scratch_addr: u32) -> Result<[u8; elf2wasm_core::lifter::CTX_SIZE], i64> {
             Err(-38)
         }
-        fn load_ctx(&mut self, _scratch_addr: u32, _buf: &[u8; 464]) -> Result<(), i64> {
+        fn load_ctx(&mut self, _scratch_addr: u32, _buf: &[u8; elf2wasm_core::lifter::CTX_SIZE]) -> Result<(), i64> {
             Err(-38)
         }
     }

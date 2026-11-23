@@ -8,7 +8,7 @@ use elf2wasm_core::lifter::{CTX_SIZE, YIELD_SYSCALL_PENDING};
 use elf2wasm_core::meta::WasmMeta;
 use elf2wasm_runtime_core::context::{GuestContext, HostFsProvider};
 use elf2wasm_runtime_core::scheduler::ThreadState;
-use elf2wasm_runtime_core::stack::setup_guest_stack_ctx;
+use elf2wasm_runtime_core::stack::setup_guest_stack_ctx_with_ids;
 use elf2wasm_runtime_core::syscalls::{handle_syscall, HostState, PendingHostAction};
 use elf2wasm_runtime_core::vfs::{
     path_hash, DirEntry, FileStat, VirtualFs, AT_FDCWD, EFAULT, EINVAL, ENOMEM,
@@ -586,9 +586,12 @@ pub extern "C" fn runtime_init_guest_stack(
     state.reset_for_new_run();
     state.vfs.set_so_files(&meta.so_files);
     state.vfs.elf_path = meta.elf_path.clone();
+    state.vfs.cmdline = args.clone();
 
     let mut ctx = WasmGuestContext;
-    let Ok(rsp) = setup_guest_stack_ctx(&mut ctx, &meta, &args, &env) else {
+    let Ok(rsp) =
+        setup_guest_stack_ctx_with_ids(&mut ctx, &meta, &args, &env, state.uid, state.gid)
+    else {
         return -3;
     };
     ctx.set_rsp(rsp as i64);
@@ -853,4 +856,163 @@ pub extern "C" fn runtime_get_virtual_time_ns() -> u64 {
     state_ref()
         .map(|s| s.scheduler.virtual_mono_ns)
         .unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_push_stdin(ptr: *const u8, len: usize) -> i32 {
+    let Some(state) = state_mut() else {
+        return -1;
+    };
+    if len > 0 {
+        if ptr.is_null() {
+            return -1;
+        }
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+        state.vfs.push_stdin(bytes);
+    }
+    state.wake_ready_waiters();
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_close_stdin() {
+    if let Some(state) = state_mut() {
+        state.vfs.close_stdin();
+        state.wake_ready_waiters();
+    }
+}
+
+fn export_owned_bytes(mut bytes: Vec<u8>, out_len_ptr: *mut usize) -> *mut u8 {
+    if bytes.is_empty() {
+        if !out_len_ptr.is_null() {
+            unsafe { *out_len_ptr = 0 };
+        }
+        return core::ptr::null_mut();
+    }
+    bytes.shrink_to_fit();
+    let len = bytes.len();
+    let ptr = bytes.as_mut_ptr();
+    core::mem::forget(bytes);
+    if !out_len_ptr.is_null() {
+        unsafe { *out_len_ptr = len };
+    }
+    ptr
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_drain_stdout(out_len_ptr: *mut usize) -> *mut u8 {
+    if out_len_ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    let Some(state) = state_mut() else {
+        unsafe { *out_len_ptr = 0 };
+        return core::ptr::null_mut();
+    };
+    let bytes = state.vfs.drain_stdout();
+    export_owned_bytes(bytes, out_len_ptr)
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_drain_stderr(out_len_ptr: *mut usize) -> *mut u8 {
+    if out_len_ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    let Some(state) = state_mut() else {
+        unsafe { *out_len_ptr = 0 };
+        return core::ptr::null_mut();
+    };
+    let bytes = state.vfs.drain_stderr();
+    export_owned_bytes(bytes, out_len_ptr)
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_take_reaped_pids(out_len_ptr: *mut usize) -> *mut u8 {
+    if out_len_ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    let Some(state) = state_mut() else {
+        unsafe { *out_len_ptr = 0 };
+        return core::ptr::null_mut();
+    };
+    let pids = state.take_reaped_pids();
+    if pids.is_empty() {
+        unsafe { *out_len_ptr = 0 };
+        return core::ptr::null_mut();
+    }
+    let mut out = Vec::with_capacity(pids.len() * 4);
+    for pid in pids {
+        out.extend_from_slice(&(pid as u32).to_le_bytes());
+    }
+    export_owned_bytes(out, out_len_ptr)
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_set_winsize(rows: u32, cols: u32) {
+    if let Some(state) = state_mut() {
+        state.set_winsize(rows, cols);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_set_tty_mode(enabled: i32) {
+    if let Some(state) = state_mut() {
+        state.set_tty_mode(enabled != 0);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_set_stdin_open(open: i32) {
+    if let Some(state) = state_mut() {
+        state.set_stdin_open(open != 0);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_send_sigint() {
+    if let Some(state) = state_mut() {
+        state.send_sigint();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_set_uid_gid(uid: u32, gid: u32) {
+    if let Some(state) = state_mut() {
+        state.set_uid_gid(uid, gid);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_add_vfs_dir(
+    path_ptr: *const u8,
+    path_len: usize,
+    mode: u32,
+) -> i32 {
+    let Some(state) = state_mut() else {
+        return -1;
+    };
+    if path_ptr.is_null() || path_len == 0 {
+        return -1;
+    }
+    let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
+    let Ok(path) = core::str::from_utf8(path_bytes) else {
+        return -1;
+    };
+    state.vfs.vfs_add_dir(path, mode);
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_remove_vfs_path(path_ptr: *const u8, path_len: usize) -> i32 {
+    let Some(state) = state_mut() else {
+        return -1;
+    };
+    if path_ptr.is_null() || path_len == 0 {
+        return -1;
+    }
+    let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
+    let Ok(path) = core::str::from_utf8(path_bytes) else {
+        return -1;
+    };
+    state.vfs.vfs_remove_path(path);
+    0
 }
