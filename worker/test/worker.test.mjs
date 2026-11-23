@@ -755,8 +755,16 @@ describe("Static Assets Staging Script (worker/scripts/build_assets.mjs)", () =>
       const webIndex = await fs.readFile(path.join(testDistDir, "web", "index.html"), "utf8");
       assert.equal(rootIndex, webIndex);
       await fs.access(path.join(testDistDir, "web", "app.mjs"));
+      await fs.access(path.join(testDistDir, "web", "url_state.mjs"));
       await fs.access(path.join(testDistDir, "web", "styles.css"));
       await fs.access(path.join(testDistDir, "web", "terminal.mjs"));
+      const stagedWebFiles = await fs.readdir(path.join(testDistDir, "web"));
+      for (const name of stagedWebFiles) {
+        assert.ok(
+          !/^(test_|\.test\.)/i.test(name) && !/\.test\.mjs$/i.test(name),
+          `Test file must not be staged in worker/dist/web/: ${name}`
+        );
+      }
 
       // Verify runtime js/*.mjs staged and test/CLI files excluded
       for (const jsFile of BROWSER_JS_FILES) {
@@ -764,6 +772,7 @@ describe("Static Assets Staging Script (worker/scripts/build_assets.mjs)", () =>
       }
       await assert.rejects(() => fs.access(path.join(testDistDir, "js", "cli.mjs")));
       await assert.rejects(() => fs.access(path.join(testDistDir, "js", "test_docker_sdk.mjs")));
+      await assert.rejects(() => fs.access(path.join(testDistDir, "js", "test_url_state.mjs")));
 
       // Verify WASM files staged with exact bytes
       for (const wasmFile of WASM_FILES) {

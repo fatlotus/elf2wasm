@@ -191,6 +191,19 @@ describe("F7: Static & WASM Serving + COOP/COEP Headers", () => {
     assert.match(text, /<title>test<\/title>/);
   });
 
+  test("GET /?image=...&cmd=ls%20.. returns 200 text/html with COOP/COEP (query string not blocked as traversal)", async () => {
+    for (const rawQuery of [
+      "/?image=python:3.12-slim&repo=bottlepy/bottle&ref=0.13.4&cmd=ls%20..",
+      "/?cmd=cat%20%2e%2e%2FREADME.md&env=FOO=bar",
+    ]) {
+      const res = await rawHttpRequest(srv.port, rawQuery);
+      assert.equal(res.status, 200, `Expected 200 for ${rawQuery}, got ${res.status}`);
+      assert.equal(res.headers["content-type"], "text/html; charset=utf-8");
+      assertIsolationHeaders(res.headers, `GET ${rawQuery}`);
+      assert.match(res.body.toString("utf8"), /<title>test<\/title>/);
+    }
+  });
+
   test("GET /web/styles.css returns 200 text/css with COOP/COEP", async () => {
     const res = await fetch(`${srv.url}/web/styles.css`);
     assert.equal(res.status, 200);
