@@ -128,19 +128,25 @@ Optional flags: `--compiler <path>` and `--runtime <path>` override the default 
 - `await extractZipToVfs(systemOrBytes, maybeZipBytes)` — Extracts a `.zip` archive (stored or deflate-compressed) (same `(system, bytes)` or `(bytes)` calling convention, returning `{ files, symlinks }`).
 - `await compileAndRunInVfs({ compilerWasm, runtimeWasm, ccBytes, ccPath = "/usr/bin/gcc", soEntries = [], vfsRo = [], vfsRw = [], sourceBytes, guestSourcePath, guestOutPath })` — Writes `sourceBytes` to `guestSourcePath` in a fresh VFS, runs the hosted C compiler `ccBytes` (`ccPath`) to compile `guestSourcePath` into `guestOutPath`, and executes `guestOutPath`.
 
-### HTML Web UI (`web/index.html`)
+### Docker WASM Web Shell & Browser JS SDK (`server/server.mjs`, `web/index.html`)
 
-Serve the repository root over HTTP so the browser can fetch `/js/elf2wasm_shim.mjs` and the compiled `.wasm` modules:
+First build the compiler and runtime `.wasm` modules (required so `/wasm/*.wasm` is available):
 
 ```bash
-python3 -m http.server 8000
+rustup target add wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown -p elf2wasm-compiler-wasm -p elf2wasm-runtime-wasm
 ```
 
-Then open `http://localhost:8000/web/index.html` in a browser. From the UI you can:
-1. Upload individual ELF64 binaries or `.so` files directly to a chosen guest VFS path.
-2. Upload `.tar`, `.tar.gz`/`.tgz`, or `.zip` filesystem overlays (for example, a packaged Python runtime overlay) into the VFS.
-3. Enter a command path and arguments (e.g., `/usr/bin/python3 -c "print(1 + 2)"`).
-4. Run the program and inspect `stdout`, `stderr`, exit code, and deterministic virtual time.
+Then start the zero-dependency Node.js web server (which serves the static web UI, `/js/*`, `/wasm/*` with COOP/COEP headers, and the stateless OCI v2 streaming proxy):
+
+```bash
+node server/server.mjs --port 8080
+```
+
+Open `http://127.0.0.1:8080/` in your browser:
+1. Click **Start Shell** to pull and boot `alpine:latest` client-side in WebAssembly inside a Dedicated Web Worker, or enter any other OCI/Docker image reference (e.g., `busybox:latest`).
+2. Run interactive shell commands in the built-in VT100 web terminal — all layer decompression, ELF64-to-WASM compilation, and execution happen 100% client-side.
+3. Call `window.Elf2WasmDocker` or `window.runDockerImage("alpine:latest", { cmd: ["/bin/sh", "-c", "uname -a"] })` directly from JavaScript (or import `/js/docker_sdk.mjs`).
 
 ---
 
