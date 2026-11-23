@@ -165,6 +165,7 @@ pub struct EventFdState {
 pub struct EpollEntry {
     pub events: u32,
     pub data: u64,
+    pub last_reported_revents: u16,
 }
 
 #[derive(Debug, Clone, Default)]

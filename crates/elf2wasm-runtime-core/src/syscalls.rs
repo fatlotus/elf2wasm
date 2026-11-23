@@ -63,6 +63,7 @@ const SYS_WAIT4: i64 = 61;
 const SYS_KILL: i64 = 62;
 const SYS_UNAME: i64 = 63;
 const SYS_FCNTL: i64 = 72;
+const SYS_FLOCK: i64 = 73;
 const SYS_FSYNC: i64 = 74;
 const SYS_FDATASYNC: i64 = 75;
 const SYS_TRUNCATE: i64 = 76;
@@ -180,6 +181,14 @@ const POLLOUT: i16 = 0x0004;
 const POLLERR: i16 = 0x0008;
 const POLLHUP: i16 = 0x0010;
 const POLLNVAL: i16 = 0x0020;
+const EPOLLET: u32 = 0x8000_0000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PipeEvent {
+    Write,
+    Read { was_full: bool },
+    Close,
+}
 
 #[derive(Debug, Clone)]
 pub struct MmapAllocator {
@@ -1049,7 +1058,7 @@ impl HostState {
                 ids
             };
             for pipe_id in pipe_ids {
-                self.wake_pipe_waiters(pipe_id);
+                self.wake_pipe_waiters(pipe_id, PipeEvent::Close);
             }
             self.wake_vfork_parent_for(target_pid);
             if let Some(p) = self.processes.get_mut(&target_pid) {
@@ -1217,7 +1226,72 @@ impl HostState {
         }
     }
 
-    fn wake_pipe_waiters(&mut self, pipe_id: u64) {
+    fn rearm_epoll_for_pipe(&mut self, pipe_id: u64, event: PipeEvent) {
+        if self.vfs.epolls.is_empty() {
+            return;
+        }
+        let (read_clear_mask, write_clear_mask): (u16, u16) = match event {
+            PipeEvent::Write => (POLLIN as u16, 0),
+            PipeEvent::Read { was_full } => (0, if was_full { POLLOUT as u16 } else { 0 }),
+            PipeEvent::Close => {
+                let (writers, readers) = match self.vfs.pipes.get(&pipe_id) {
+                    Some(p) => (p.writers, p.readers),
+                    None => (0, 0),
+                };
+                let rmask = if writers == 0 {
+                    (POLLHUP | POLLIN) as u16
+                } else {
+                    0
+                };
+                let wmask = if readers == 0 {
+                    (POLLERR | POLLOUT) as u16
+                } else {
+                    0
+                };
+                (rmask, wmask)
+            }
+        };
+        if read_clear_mask == 0 && write_clear_mask == 0 {
+            return;
+        }
+        let mut fd_masks: Vec<(i32, u16)> = Vec::new();
+        let mut collect_from = |fds: &BTreeMap<i32, OpenFile>| {
+            for (&fd, f) in fds {
+                let is_read_end =
+                    f.pipe_id == Some(pipe_id) && (f.sock_write_pipe_id.is_some() || !f.writable);
+                let is_write_end = f.sock_write_pipe_id == Some(pipe_id)
+                    || (f.pipe_id == Some(pipe_id)
+                        && f.writable
+                        && f.sock_write_pipe_id.is_none());
+                let mut mask = 0u16;
+                if is_read_end {
+                    mask |= read_clear_mask;
+                }
+                if is_write_end {
+                    mask |= write_clear_mask;
+                }
+                if mask != 0 {
+                    fd_masks.push((fd, mask));
+                }
+            }
+        };
+        collect_from(&self.vfs.fds);
+        for (&pid, proc) in &self.processes {
+            if pid != self.active_pid {
+                collect_from(&proc.fds);
+            }
+        }
+        for inst in self.vfs.epolls.values_mut() {
+            for &(fd, mask) in &fd_masks {
+                if let Some(entry) = inst.entries.get_mut(&fd) {
+                    entry.last_reported_revents &= !mask;
+                }
+            }
+        }
+    }
+
+    fn wake_pipe_waiters(&mut self, pipe_id: u64, event: PipeEvent) {
+        self.rearm_epoll_for_pipe(pipe_id, event);
         let (has_data, writers, readers, has_space) = match self.vfs.pipes.get(&pipe_id) {
             Some(p) => (!p.buf.is_empty(), p.writers, p.readers, p.buf.len() < p.capacity),
             None => (false, 0, 0, false),
@@ -1406,8 +1480,44 @@ impl HostState {
                 inst.entries.iter().any(|(&fd, entry)| {
                     let ev = (entry.events & 0xffff) as i16;
                     let rev = self.eval_fd_events(fds, fd, ev);
-                    rev != 0 && rev != POLLNVAL
+                    if rev == 0 || rev == POLLNVAL {
+                        return false;
+                    }
+                    if (entry.events & EPOLLET) != 0 {
+                        let rev_u16 = rev as u16;
+                        (rev_u16 & !entry.last_reported_revents) != 0
+                    } else {
+                        true
+                    }
                 })
+            }
+        }
+    }
+
+    fn sync_epoll_et_state(&mut self, epfd: i32) {
+        let Some(eid) = self.vfs.fds.get(&epfd).and_then(|f| f.epoll_id) else {
+            return;
+        };
+        let snapshot: Vec<(i32, u16)> = {
+            let Some(inst) = self.vfs.epolls.get(&eid) else {
+                return;
+            };
+            inst.entries
+                .iter()
+                .filter(|(_, entry)| (entry.events & EPOLLET) != 0)
+                .map(|(&fd, entry)| {
+                    let ev = (entry.events & 0xffff) as i16;
+                    let rev = self.eval_fd_events(&self.vfs.fds, fd, ev);
+                    let rev_u16 = if rev == POLLNVAL { 0 } else { rev as u16 };
+                    (fd, rev_u16)
+                })
+                .collect()
+        };
+        if let Some(inst) = self.vfs.epolls.get_mut(&eid) {
+            for (fd, rev_u16) in snapshot {
+                if let Some(entry) = inst.entries.get_mut(&fd) {
+                    entry.last_reported_revents &= rev_u16;
+                }
             }
         }
     }
@@ -1634,8 +1744,10 @@ impl HostState {
             } => {
                 let mut drained = Vec::new();
                 let mut writers = 0usize;
+                let mut was_full = false;
                 if let Some(p) = self.vfs.pipes.get_mut(&pipe_id) {
                     writers = p.writers;
+                    was_full = p.buf.len() >= p.capacity;
                     let n = count.min(p.buf.len());
                     drained.reserve(n);
                     for _ in 0..n {
@@ -1657,7 +1769,7 @@ impl HostState {
                 let ret = match write_bytes(ctx, buf_addr, &drained) {
                     Ok(()) => {
                         if !drained.is_empty() {
-                            self.wake_pipe_waiters(pipe_id);
+                            self.wake_pipe_waiters(pipe_id, PipeEvent::Read { was_full });
                         }
                         drained.len() as i64
                     }
@@ -1697,7 +1809,7 @@ impl HostState {
                         let rem = data.len().saturating_sub(written);
                         let n = rem.min(space);
                         p.buf.extend(&data[written..written + n]);
-                        self.wake_pipe_waiters(pipe_id);
+                        self.wake_pipe_waiters(pipe_id, PipeEvent::Write);
                         (written + n) as i64
                     }
                 };
@@ -1778,7 +1890,7 @@ impl HostState {
         }
     }
 
-    fn finish_poll(&self, ctx: &mut dyn GuestContext, kind: &PollKind, timed_out: bool) -> i64 {
+    fn finish_poll(&mut self, ctx: &mut dyn GuestContext, kind: &PollKind, timed_out: bool) -> i64 {
         match kind {
             PollKind::Poll { fds_addr, fds } => {
                 let mut ready = 0i64;
@@ -1861,25 +1973,59 @@ impl HostState {
                 let Some(eid) = self.vfs.fds.get(epfd).and_then(|f| f.epoll_id) else {
                     return -EBADF;
                 };
-                let Some(inst) = self.vfs.epolls.get(&eid) else {
-                    return -EBADF;
+                let evaluated: Vec<(i32, u32, u64, u16, u16)> = {
+                    let Some(inst) = self.vfs.epolls.get(&eid) else {
+                        return -EBADF;
+                    };
+                    inst.entries
+                        .iter()
+                        .map(|(&fd, entry)| {
+                            let ev = (entry.events & 0xffff) as i16;
+                            let rev = self.eval_fd_events(&self.vfs.fds, fd, ev);
+                            let rev_u16 = if rev == POLLNVAL { 0 } else { rev as u16 };
+                            (fd, entry.events, entry.data, rev_u16, entry.last_reported_revents)
+                        })
+                        .collect()
                 };
                 let mut count = 0usize;
-                for (&fd, entry) in &inst.entries {
-                    if count >= *maxevents {
-                        break;
-                    }
-                    let ev = (entry.events & 0xffff) as i16;
-                    let rev = self.eval_fd_events(&self.vfs.fds, fd, ev);
-                    if rev != 0 && rev != POLLNVAL {
-                        // Linux x86-64 struct epoll_event is 12 bytes packed: u32 events, u64 data
+                let mut updates: Vec<(i32, u16)> = Vec::new();
+                for (fd, events, data, rev_u16, last_reported) in evaluated {
+                    let is_et = (events & EPOLLET) != 0;
+                    if is_et {
+                        let newly_ready = rev_u16 & !last_reported;
+                        if newly_ready != 0 && count < *maxevents {
+                            // Linux x86-64 struct epoll_event is 12 bytes packed: u32 events, u64 data
+                            let mut buf = [0u8; 12];
+                            buf[0..4].copy_from_slice(&(rev_u16 as u32).to_le_bytes());
+                            buf[4..12].copy_from_slice(&data.to_le_bytes());
+                            if let Err(e) = write_bytes(ctx, *events_addr + (count as u64) * 12, &buf) {
+                                return e;
+                            }
+                            updates.push((fd, rev_u16));
+                            count += 1;
+                        } else if newly_ready == 0 {
+                            let cleared = last_reported & rev_u16;
+                            if cleared != last_reported {
+                                updates.push((fd, cleared));
+                            }
+                        }
+                    } else if rev_u16 != 0 && count < *maxevents {
                         let mut buf = [0u8; 12];
-                        buf[0..4].copy_from_slice(&(rev as u16 as u32).to_le_bytes());
-                        buf[4..12].copy_from_slice(&entry.data.to_le_bytes());
+                        buf[0..4].copy_from_slice(&(rev_u16 as u32).to_le_bytes());
+                        buf[4..12].copy_from_slice(&data.to_le_bytes());
                         if let Err(e) = write_bytes(ctx, *events_addr + (count as u64) * 12, &buf) {
                             return e;
                         }
                         count += 1;
+                    }
+                }
+                if !updates.is_empty() {
+                    if let Some(inst) = self.vfs.epolls.get_mut(&eid) {
+                        for (fd, new_reported) in updates {
+                            if let Some(entry) = inst.entries.get_mut(&fd) {
+                                entry.last_reported_revents = new_reported;
+                            }
+                        }
                     }
                 }
                 count as i64
@@ -2373,8 +2519,9 @@ fn read_into_guest(
             if count == 0 {
                 return 0;
             }
-            let (drained, writers) = match state.vfs.pipes.get_mut(&pipe_id) {
+            let (drained, writers, was_full) = match state.vfs.pipes.get_mut(&pipe_id) {
                 Some(p) => {
+                    let was_full = p.buf.len() >= p.capacity;
                     let n = count.min(p.buf.len());
                     let mut d = Vec::with_capacity(n);
                     for _ in 0..n {
@@ -2382,15 +2529,15 @@ fn read_into_guest(
                             d.push(b);
                         }
                     }
-                    (d, p.writers)
+                    (d, p.writers, was_full)
                 }
-                None => (Vec::new(), 0),
+                None => (Vec::new(), 0, false),
             };
             if !drained.is_empty() {
                 if let Err(e) = write_bytes(ctx, buf_addr, &drained) {
                     return e;
                 }
-                state.wake_pipe_waiters(pipe_id);
+                state.wake_pipe_waiters(pipe_id, PipeEvent::Read { was_full });
                 return drained.len() as i64;
             }
             if writers == 0 {
@@ -2516,8 +2663,9 @@ fn handle_syscall_inner(
                         if f.writable && f.sock_write_pipe_id.is_none() {
                             return -EBADF;
                         }
-                        let (drained, writers) = match state.vfs.pipes.get_mut(&pipe_id) {
+                        let (drained, writers, was_full) = match state.vfs.pipes.get_mut(&pipe_id) {
                             Some(p) => {
+                                let was_full = p.buf.len() >= p.capacity;
                                 let n = len.min(p.buf.len());
                                 let mut d = Vec::with_capacity(n);
                                 for _ in 0..n {
@@ -2525,15 +2673,15 @@ fn handle_syscall_inner(
                                         d.push(b);
                                     }
                                 }
-                                (d, p.writers)
+                                (d, p.writers, was_full)
                             }
-                            None => (Vec::new(), 0),
+                            None => (Vec::new(), 0, false),
                         };
                         if !drained.is_empty() {
                             if let Err(e) = write_bytes(ctx, base, &drained) {
                                 return if total_read > 0 { total_read as i64 } else { e };
                             }
-                            state.wake_pipe_waiters(pipe_id);
+                            state.wake_pipe_waiters(pipe_id, PipeEvent::Read { was_full });
                             total_read += drained.len();
                             if drained.len() < len {
                                 break;
@@ -2739,10 +2887,10 @@ fn handle_syscall_inner(
             let ret = state.vfs.close(fd);
             if ret == 0 {
                 if let Some(pid) = pipe_id {
-                    state.wake_pipe_waiters(pid);
+                    state.wake_pipe_waiters(pid, PipeEvent::Close);
                 }
                 if let Some(wpid) = sock_wpid {
-                    state.wake_pipe_waiters(wpid);
+                    state.wake_pipe_waiters(wpid, PipeEvent::Close);
                 }
             }
             ret
@@ -3608,6 +3756,23 @@ fn handle_syscall_inner(
             state.vfs.umask = (a0 as u32) & 0o777;
             old as i64
         }
+        SYS_FLOCK => {
+            let fd = a0 as i32;
+            let operation = a1 as i32;
+            const LOCK_SH: i32 = 1;
+            const LOCK_EX: i32 = 2;
+            const LOCK_NB: i32 = 4;
+            const LOCK_UN: i32 = 8;
+            if state.vfs.get_fd(fd).is_none() {
+                return -EBADF;
+            }
+            let base_op = operation & !LOCK_NB;
+            if matches!(base_op, LOCK_SH | LOCK_EX | LOCK_UN) {
+                0
+            } else {
+                -EINVAL
+            }
+        }
         SYS_FSYNC | SYS_FDATASYNC => {
             if state.vfs.get_fd(a0 as i32).is_some() {
                 0
@@ -3867,10 +4032,18 @@ fn handle_syscall_inner(
                         if inst.entries.contains_key(&fd) {
                             return -crate::vfs::EEXIST;
                         }
-                        inst.entries.insert(fd, EpollEntry { events, data });
+                        inst.entries.insert(
+                            fd,
+                            EpollEntry {
+                                events,
+                                data,
+                                last_reported_revents: 0,
+                            },
+                        );
                     } else if let Some(entry) = inst.entries.get_mut(&fd) {
                         entry.events = events;
                         entry.data = data;
+                        entry.last_reported_revents = 0;
                     } else {
                         return -ENOENT;
                     }
@@ -3893,6 +4066,7 @@ fn handle_syscall_inner(
             if f.epoll_id.is_none() {
                 return -EINVAL;
             }
+            state.sync_epoll_et_state(epfd);
             let kind = PollKind::Epoll {
                 epfd,
                 events_addr,
@@ -4365,7 +4539,7 @@ fn handle_syscall_inner(
             };
             if ret >= 0 {
                 if let Some(pid) = displaced_pipe {
-                    state.wake_pipe_waiters(pid);
+                    state.wake_pipe_waiters(pid, PipeEvent::Close);
                 }
             }
             ret
@@ -4611,7 +4785,7 @@ fn exit_process(ctx: &mut dyn GuestContext, state: &mut HostState, code: i32) {
         .collect();
     state.vfs.close_all_fds();
     for pipe_id in pipe_ids {
-        state.wake_pipe_waiters(pipe_id);
+        state.wake_pipe_waiters(pipe_id, PipeEvent::Close);
     }
     state.wake_vfork_parent_for(pid);
     if let Some(p) = state.processes.get_mut(&pid) {
@@ -4664,7 +4838,7 @@ fn write_fd_data(
             return match res {
                 Err(e) => e,
                 Ok(Some(n)) => {
-                    state.wake_pipe_waiters(pipe_id);
+                    state.wake_pipe_waiters(pipe_id, PipeEvent::Write);
                     n as i64
                 }
                 Ok(None) => {
@@ -4998,7 +5172,7 @@ fn do_execve(
         .collect();
     state.vfs.close_cloexec_fds();
     for pipe_id in closed_pipes {
-        state.wake_pipe_waiters(pipe_id);
+        state.wake_pipe_waiters(pipe_id, PipeEvent::Close);
     }
 
     let pid = state.active_pid;
@@ -5689,6 +5863,363 @@ mod tests {
         state.reset_for_new_run();
         assert!(state.mmap_alloc.prot_none_ranges.is_empty());
         assert_eq!(state.fork_copy_ranges(initial), vec![(0, initial)]);
+    }
+
+    #[test]
+    fn test_sys_flock_validation() {
+        let mut ctx = MockGuestContext::new(4 * 1024 * 1024, 4 * 1024 * 1024);
+        let mut state = make_state();
+        let (rfd, _wfd) = state.vfs.create_pipe().unwrap();
+
+        const LOCK_SH: i64 = 1;
+        const LOCK_EX: i64 = 2;
+        const LOCK_NB: i64 = 4;
+        const LOCK_UN: i64 = 8;
+
+        for op in [
+            LOCK_SH,
+            LOCK_EX,
+            LOCK_UN,
+            LOCK_SH | LOCK_NB,
+            LOCK_EX | LOCK_NB,
+            LOCK_UN | LOCK_NB,
+        ] {
+            let rc = handle_syscall(&mut ctx, &mut state, SYS_FLOCK, rfd as i64, op, 0, 0, 0, 0);
+            assert_eq!(rc, 0, "valid flock op {op} should succeed");
+        }
+
+        // Invalid fds -> -EBADF
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_FLOCK, 999, LOCK_EX, 0, 0, 0, 0),
+            -EBADF
+        );
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_FLOCK, -1, LOCK_EX, 0, 0, 0, 0),
+            -EBADF
+        );
+
+        // Invalid operations -> -EINVAL
+        for bad_op in [0, LOCK_NB, LOCK_SH | LOCK_EX, 0x100, -1] {
+            let rc = handle_syscall(&mut ctx, &mut state, SYS_FLOCK, rfd as i64, bad_op, 0, 0, 0, 0);
+            assert_eq!(rc, -EINVAL, "invalid flock op {bad_op} should return -EINVAL");
+        }
+    }
+
+    #[test]
+    fn test_epoll_et_edge_triggered_and_level_triggered() {
+        let mut ctx = MockGuestContext::new(4 * 1024 * 1024, 4 * 1024 * 1024);
+        let mut state = make_state();
+        let (rfd, wfd) = state.vfs.create_pipe().unwrap();
+
+        const EPOLL_CTL_ADD: i64 = 1;
+        const EPOLL_CTL_MOD: i64 = 3;
+        let ev_in_addr = 0x1000u64;
+        let ev_out_addr = 0x2000u64;
+        let io_buf_addr = 0x3000u64;
+
+        let write_ev = |ctx: &mut MockGuestContext, addr: u64, events: u32, data: u64| {
+            let mut buf = [0u8; 12];
+            buf[0..4].copy_from_slice(&events.to_le_bytes());
+            buf[4..12].copy_from_slice(&data.to_le_bytes());
+            ctx.mem_write(addr, &buf).unwrap();
+        };
+        let read_ev = |ctx: &MockGuestContext, addr: u64| -> (u32, u64) {
+            let mut buf = [0u8; 12];
+            ctx.mem_read(addr, &mut buf).unwrap();
+            (
+                u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+                u64::from_le_bytes(buf[4..12].try_into().unwrap()),
+            )
+        };
+
+        // 1. Edge-triggered epoll on writable pipe wfd
+        let epfd = handle_syscall(&mut ctx, &mut state, SYS_EPOLL_CREATE1, 0, 0, 0, 0, 0, 0);
+        assert!(epfd >= 0);
+
+        let et_events = (POLLIN as u32) | (POLLOUT as u32) | EPOLLET;
+        write_ev(&mut ctx, ev_in_addr, et_events, 0xAAAA);
+        assert_eq!(
+            handle_syscall(
+                &mut ctx,
+                &mut state,
+                SYS_EPOLL_CTL,
+                epfd,
+                EPOLL_CTL_ADD,
+                wfd as i64,
+                ev_in_addr as i64,
+                0,
+                0
+            ),
+            0
+        );
+
+        // First epoll_pwait fires POLLOUT
+        let n1 = handle_syscall(
+            &mut ctx,
+            &mut state,
+            SYS_EPOLL_PWAIT,
+            epfd,
+            ev_out_addr as i64,
+            4,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(n1, 1);
+        let (ev1, data1) = read_ev(&ctx, ev_out_addr);
+        assert_eq!(ev1, POLLOUT as u32);
+        assert_eq!(data1, 0xAAAA);
+
+        // Second epoll_pwait(timeout=0) returns 0 (does NOT spin!)
+        let n2 = handle_syscall(
+            &mut ctx,
+            &mut state,
+            SYS_EPOLL_PWAIT,
+            epfd,
+            ev_out_addr as i64,
+            4,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(n2, 0, "EPOLLET must not re-fire unchanged EPOLLOUT");
+
+        // EPOLL_CTL_MOD re-arms edge-triggered entry
+        write_ev(&mut ctx, ev_in_addr, et_events, 0xBBBB);
+        assert_eq!(
+            handle_syscall(
+                &mut ctx,
+                &mut state,
+                SYS_EPOLL_CTL,
+                epfd,
+                EPOLL_CTL_MOD,
+                wfd as i64,
+                ev_in_addr as i64,
+                0,
+                0
+            ),
+            0
+        );
+        let n3 = handle_syscall(
+            &mut ctx,
+            &mut state,
+            SYS_EPOLL_PWAIT,
+            epfd,
+            ev_out_addr as i64,
+            4,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(n3, 1, "EPOLL_CTL_MOD must re-arm EPOLLET");
+        assert_eq!(read_ev(&ctx, ev_out_addr), (POLLOUT as u32, 0xBBBB));
+
+        // 2. Register read-end rfd with EPOLLIN | EPOLLET and write data to pipe
+        write_ev(&mut ctx, ev_in_addr, (POLLIN as u32) | EPOLLET, 0xCCCC);
+        assert_eq!(
+            handle_syscall(
+                &mut ctx,
+                &mut state,
+                SYS_EPOLL_CTL,
+                epfd,
+                EPOLL_CTL_ADD,
+                rfd as i64,
+                ev_in_addr as i64,
+                0,
+                0
+            ),
+            0
+        );
+        // Empty pipe -> 0 events
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_EPOLL_PWAIT, epfd, ev_out_addr as i64, 4, 0, 0, 0),
+            0
+        );
+        // Write "hi" to wfd -> wakes ONLY rfd with POLLIN (does not spuriously re-arm wfd)
+        ctx.mem_write(io_buf_addr, b"hi").unwrap();
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_WRITE, wfd as i64, io_buf_addr as i64, 2, 0, 0, 0),
+            2
+        );
+        let n4 = handle_syscall(
+            &mut ctx,
+            &mut state,
+            SYS_EPOLL_PWAIT,
+            epfd,
+            ev_out_addr as i64,
+            4,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(
+            n4, 1,
+            "writing to pipe must trigger only EPOLLIN on ET rfd, not spurious EPOLLOUT on wfd"
+        );
+        assert_eq!(read_ev(&ctx, ev_out_addr), (POLLIN as u32, 0xCCCC));
+
+        // Immediate re-poll without new activity returns 0
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_EPOLL_PWAIT, epfd, ev_out_addr as i64, 4, 0, 0, 0),
+            0
+        );
+
+        // 3. Level-triggered control (no EPOLLET): fires POLLOUT on both calls
+        let epfd_lt = handle_syscall(&mut ctx, &mut state, SYS_EPOLL_CREATE1, 0, 0, 0, 0, 0, 0);
+        assert!(epfd_lt >= 0);
+        write_ev(&mut ctx, ev_in_addr, POLLOUT as u32, 0xDDDD);
+        assert_eq!(
+            handle_syscall(
+                &mut ctx,
+                &mut state,
+                SYS_EPOLL_CTL,
+                epfd_lt,
+                EPOLL_CTL_ADD,
+                wfd as i64,
+                ev_in_addr as i64,
+                0,
+                0
+            ),
+            0
+        );
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_EPOLL_PWAIT, epfd_lt, ev_out_addr as i64, 4, 0, 0, 0),
+            1
+        );
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_EPOLL_PWAIT, epfd_lt, ev_out_addr as i64, 4, 0, 0, 0),
+            1,
+            "level-triggered epoll must continue firing POLLOUT"
+        );
+    }
+
+    #[test]
+    fn test_epoll_et_pipe_directional_rearm() {
+        let mut ctx = MockGuestContext::new(4 * 1024 * 1024, 4 * 1024 * 1024);
+        let mut state = make_state();
+
+        const EPOLL_CTL_ADD: i64 = 1;
+        let (rfd, wfd) = state.vfs.create_pipe().unwrap();
+        let epfd = handle_syscall(&mut ctx, &mut state, SYS_EPOLL_CREATE1, 0, 0, 0, 0, 0, 0);
+        assert!(epfd >= 0);
+
+        let ev_in_addr = 0x1000u64;
+        let ev_out_addr = 0x2000u64;
+        let io_buf_addr = 0x3000u64;
+
+        let write_ev = |ctx: &mut MockGuestContext, addr: u64, events: u32, data: u64| {
+            let mut buf = [0u8; 12];
+            buf[0..4].copy_from_slice(&events.to_le_bytes());
+            buf[4..12].copy_from_slice(&data.to_le_bytes());
+            ctx.mem_write(addr, &buf).unwrap();
+        };
+        let read_ev = |ctx: &MockGuestContext, addr: u64| -> (u32, u64) {
+            let mut buf = [0u8; 12];
+            ctx.mem_read(addr, &mut buf).unwrap();
+            (
+                u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+                u64::from_le_bytes(buf[4..12].try_into().unwrap()),
+            )
+        };
+
+        // Register rfd (EPOLLIN | EPOLLET) and wfd (EPOLLOUT | EPOLLET) in one epfd
+        write_ev(&mut ctx, ev_in_addr, (POLLIN as u32) | EPOLLET, 1);
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_EPOLL_CTL, epfd, EPOLL_CTL_ADD, rfd as i64, ev_in_addr as i64, 0, 0),
+            0
+        );
+        write_ev(&mut ctx, ev_in_addr, (POLLOUT as u32) | EPOLLET, 2);
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_EPOLL_CTL, epfd, EPOLL_CTL_ADD, wfd as i64, ev_in_addr as i64, 0, 0),
+            0
+        );
+
+        // Consume initial EPOLLOUT on wfd
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_EPOLL_PWAIT, epfd, ev_out_addr as i64, 4, 0, 0, 0),
+            1
+        );
+        assert_eq!(read_ev(&ctx, ev_out_addr), (POLLOUT as u32, 2));
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_EPOLL_PWAIT, epfd, ev_out_addr as i64, 4, 0, 0, 0),
+            0
+        );
+
+        // 1. Write 10 bytes to wfd: must fire ONLY EPOLLIN on rfd, NOT spurious EPOLLOUT on wfd
+        ctx.mem_write(io_buf_addr, b"0123456789").unwrap();
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_WRITE, wfd as i64, io_buf_addr as i64, 10, 0, 0, 0),
+            10
+        );
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_EPOLL_PWAIT, epfd, ev_out_addr as i64, 4, 0, 0, 0),
+            1,
+            "write must not spuriously re-arm EPOLLOUT on wfd"
+        );
+        assert_eq!(read_ev(&ctx, ev_out_addr), (POLLIN as u32, 1));
+
+        // 2. Partial read of 4 bytes from rfd: must NOT re-arm EPOLLIN on rfd or EPOLLOUT on wfd
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_READ, rfd as i64, io_buf_addr as i64, 4, 0, 0, 0),
+            4
+        );
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_EPOLL_PWAIT, epfd, ev_out_addr as i64, 4, 0, 0, 0),
+            0,
+            "partial read must not spuriously re-arm EPOLLIN on rfd or EPOLLOUT on wfd"
+        );
+
+        // 3. Drain remaining 6 bytes from rfd (pipe was NOT full): must NOT re-arm EPOLLOUT on wfd
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_READ, rfd as i64, io_buf_addr as i64, 6, 0, 0, 0),
+            6
+        );
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_EPOLL_PWAIT, epfd, ev_out_addr as i64, 4, 0, 0, 0),
+            0,
+            "draining a non-full pipe must not spuriously re-arm EPOLLOUT on wfd"
+        );
+
+        // 4. Fill pipe completely to capacity, then read 1 byte: MUST re-arm EPOLLOUT on wfd
+        let pipe_id = state.vfs.get_fd(wfd).unwrap().pipe_id.unwrap();
+        let cap = state.vfs.pipes.get(&pipe_id).unwrap().capacity;
+        let fill = vec![b'x'; cap];
+        ctx.mem_write(io_buf_addr, &fill).unwrap();
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_WRITE, wfd as i64, io_buf_addr as i64, cap as i64, 0, 0, 0),
+            cap as i64
+        );
+        // Consume EPOLLIN on rfd
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_EPOLL_PWAIT, epfd, ev_out_addr as i64, 4, 0, 0, 0),
+            1
+        );
+        assert_eq!(read_ev(&ctx, ev_out_addr), (POLLIN as u32, 1));
+        // Now read 1 byte (full -> non-full transition): must re-arm EPOLLOUT on wfd only
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_READ, rfd as i64, io_buf_addr as i64, 1, 0, 0, 0),
+            1
+        );
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_EPOLL_PWAIT, epfd, ev_out_addr as i64, 4, 0, 0, 0),
+            1,
+            "reading from a full pipe must re-arm EPOLLOUT on wfd"
+        );
+        assert_eq!(read_ev(&ctx, ev_out_addr), (POLLOUT as u32, 2));
+
+        // 5. Close wfd -> rfd receives EPOLLHUP
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_CLOSE, wfd as i64, 0, 0, 0, 0, 0),
+            0
+        );
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_EPOLL_PWAIT, epfd, ev_out_addr as i64, 4, 0, 0, 0),
+            1,
+            "closing write end must wake rfd with EPOLLHUP"
+        );
+        let (ev_hup, data_hup) = read_ev(&ctx, ev_out_addr);
+        assert_eq!(data_hup, 1);
+        assert_ne!(ev_hup & (POLLHUP as u32), 0);
     }
 }
 
