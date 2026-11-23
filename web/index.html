@@ -3,486 +3,188 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>elf2wasm — Linux x86-64 in WebAssembly</title>
-  <style>
-    :root {
-      --bg: #0f1117;
-      --panel: #181c25;
-      --border: #2a3140;
-      --text: #e6edf3;
-      --muted: #8b949e;
-      --accent: #3b82f6;
-      --accent-hover: #2563eb;
-      --danger: #ef4444;
-      --ok: #22c55e;
-      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      padding: 24px;
-      background: var(--bg);
-      color: var(--text);
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      line-height: 1.5;
-    }
-    .container {
-      max-width: 960px;
-      margin: 0 auto;
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-    }
-    header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 12px;
-      border-bottom: 1px solid var(--border);
-      padding-bottom: 12px;
-    }
-    h1 {
-      margin: 0;
-      font-size: 1.35rem;
-      font-weight: 600;
-    }
-    .status-badge {
-      font-family: var(--mono);
-      font-size: 0.85rem;
-      padding: 4px 10px;
-      border-radius: 999px;
-      background: var(--panel);
-      border: 1px solid var(--border);
-      color: var(--muted);
-    }
-    .status-badge.ok { color: var(--ok); border-color: rgba(34, 197, 94, 0.4); }
-    .status-badge.err { color: var(--danger); border-color: rgba(239, 68, 68, 0.4); }
-    .card {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 16px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-    .card h2 {
-      margin: 0;
-      font-size: 1rem;
-      font-weight: 600;
-      color: var(--text);
-    }
-    .row {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-      align-items: center;
-    }
-    label {
-      font-size: 0.85rem;
-      color: var(--muted);
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-      flex: 1 1 240px;
-    }
-    input[type="text"] {
-      width: 100%;
-      padding: 8px 10px;
-      background: var(--bg);
-      color: var(--text);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      font-family: var(--mono);
-      font-size: 0.9rem;
-    }
-    input[type="file"] {
-      color: var(--text);
-      font-size: 0.9rem;
-    }
-    button {
-      padding: 8px 16px;
-      border-radius: 6px;
-      border: 1px solid var(--border);
-      background: var(--accent);
-      color: #fff;
-      font-weight: 600;
-      font-size: 0.9rem;
-      cursor: pointer;
-    }
-    button:hover { background: var(--accent-hover); }
-    button.secondary {
-      background: transparent;
-      color: var(--text);
-    }
-    button.secondary:hover { background: rgba(255, 255, 255, 0.06); }
-    .vfs-summary {
-      font-family: var(--mono);
-      font-size: 0.82rem;
-      color: var(--muted);
-    }
-    .vfs-list {
-      max-height: 140px;
-      overflow-y: auto;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 8px 10px;
-      font-family: var(--mono);
-      font-size: 0.8rem;
-      color: var(--muted);
-      margin: 0;
-      white-space: pre-wrap;
-    }
-    pre.console {
-      margin: 0;
-      min-height: 100px;
-      max-height: 360px;
-      overflow: auto;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 12px;
-      font-family: var(--mono);
-      font-size: 0.88rem;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-    #stderr { color: #fca5a5; min-height: 48px; }
-  </style>
+  <title>elf2wasm — Client-Side Docker-on-WASM Web Shell</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b0e14'/%3E%3Ctext x='50%25' y='56%25' text-anchor='middle' dominant-baseline='middle' fill='%2338bdf8' font-family='monospace' font-size='15' font-weight='bold'%3E%24_%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/web/styles.css">
 </head>
 <body>
-  <div class="container">
-    <header>
-      <h1>elf2wasm — Deterministic Linux x86-64 Sandbox</h1>
-      <span id="status" class="status-badge">Loading WASM...</span>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-logo" aria-hidden="true">$_</span>
+        <div class="brand-text">
+          <h1>
+            elf2wasm
+            <span class="brand-pill">100% Client-Side WASM</span>
+          </h1>
+          <p class="brand-subtitle">Run Linux x86-64 Docker images in your browser — unpack, compile &amp; execute locally in WebAssembly</p>
+        </div>
+      </div>
+      <div id="status-pill" class="status-pill" data-state="idle" role="status" aria-live="polite">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="status-text">Idle — click Start Shell to boot alpine:latest</span>
+      </div>
     </header>
 
-    <section class="card">
-      <h2>1. Virtual Filesystem (ELF binaries, .tar.gz, .tgz, .zip)</h2>
-      <div class="row">
-        <input id="vfs-upload" type="file" accept=".tar.gz,.tgz,.gz,.zip,.elf,*" multiple>
-        <button id="clear-vfs-btn" type="button" class="secondary">Clear VFS</button>
+    <section class="control-panel" aria-label="Container controls">
+      <div class="control-grid">
+        <div class="field">
+          <label for="image-input">Docker Image</label>
+          <input
+            id="image-input"
+            name="image"
+            type="text"
+            value="alpine:latest"
+            placeholder="alpine:latest"
+            autocomplete="off"
+            spellcheck="false"
+          >
+        </div>
+
+        <div class="field">
+          <label for="cmd-input">Command Override (optional)</label>
+          <input
+            id="cmd-input"
+            name="cmd"
+            type="text"
+            placeholder="/bin/sh (image default)"
+            autocomplete="off"
+            spellcheck="false"
+          >
+        </div>
+
+        <div class="actions">
+          <button id="start-btn" type="button" class="btn btn-primary">Start Shell</button>
+          <button id="stop-btn" type="button" class="btn btn-danger" disabled>Stop</button>
+          <button id="clear-btn" type="button" class="btn btn-secondary">Clear</button>
+        </div>
       </div>
-      <div id="vfs-summary" class="vfs-summary">VFS empty (0 files, 0 symlinks)</div>
-      <div id="vfs-list" class="vfs-list"></div>
+
+      <div class="presets-row" aria-label="Quick image presets">
+        <span class="presets-label">Presets:</span>
+        <button type="button" class="preset-chip" data-image="alpine:latest">alpine:latest</button>
+        <button type="button" class="preset-chip" data-image="busybox:latest">busybox:latest</button>
+        <button type="button" class="preset-chip" data-image="debian:bookworm-slim">debian:bookworm-slim</button>
+      </div>
+
+      <details class="panel-drawer" id="advanced-options">
+        <summary>Advanced Options (Environment &amp; Working Directory)</summary>
+        <div class="advanced-grid">
+          <div class="field">
+            <label for="env-input">Environment Variables (one KEY=VALUE per line)</label>
+            <textarea
+              id="env-input"
+              rows="2"
+              placeholder="FOO=bar&#10;MY_VAR=hello"
+              spellcheck="false"
+            ></textarea>
+          </div>
+          <div class="field">
+            <label for="cwd-input">Working Directory</label>
+            <input
+              id="cwd-input"
+              type="text"
+              placeholder="/ (image default)"
+              autocomplete="off"
+              spellcheck="false"
+            >
+          </div>
+        </div>
+      </details>
+
+      <div class="progress-wrap">
+        <div
+          id="progress-bar"
+          class="progress-bar"
+          role="progressbar"
+          aria-label="Client-side pipeline progress"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow="0"
+          data-stage="idle"
+          data-state="idle"
+        >
+          <div id="progress-fill" class="progress-fill"></div>
+        </div>
+        <div class="stage-steps" aria-hidden="true">
+          <span class="stage-step" data-step="pull">1. Pull Image</span>
+          <span class="stage-step" data-step="unpack">2. Unpack Rootfs</span>
+          <span class="stage-step" data-step="compile">3. Compile ELF &rarr; WASM</span>
+          <span class="stage-step" data-step="run">4. Run in Browser</span>
+        </div>
+      </div>
     </section>
 
-    <section class="card">
-      <h2>2. Execute Guest Program</h2>
-      <div class="row">
-        <label>
-          <span>Command</span>
-          <input id="command" name="command" type="text" placeholder="/usr/bin/python3">
-        </label>
-        <label>
-          <span>Arguments</span>
-          <input id="args" name="args" type="text" placeholder='-S -c "print(6 * 7)"'>
-        </label>
+    <section class="terminal-section" aria-label="Interactive terminal">
+      <div class="terminal-header">
+        <div class="terminal-dots" aria-hidden="true">
+          <span class="terminal-dot red"></span>
+          <span class="terminal-dot yellow"></span>
+          <span class="terminal-dot green"></span>
+        </div>
+        <span id="terminal-title" class="terminal-title">alpine:latest — /bin/sh</span>
+        <div class="terminal-meta">
+          <span class="terminal-hints">Ctrl+C interrupt &middot; Ctrl+D EOF &middot; Ctrl+L clear</span>
+          <span id="terminal-size">80&times;24</span>
+        </div>
       </div>
-      <div class="row">
-        <label style="flex: 1 1 240px;">
-          <span>Guest path for next individual binary upload (optional)</span>
-          <input id="upload-path" type="text" placeholder="/bin/<filename>">
-        </label>
-      </div>
-      <div class="row">
-        <button id="run-btn" type="button">Run</button>
-      </div>
+      <div
+        id="terminal"
+        class="terminal"
+        tabindex="0"
+        role="application"
+        aria-label="Interactive container shell"
+      ></div>
     </section>
 
-    <section class="card">
-      <h2>Stdout</h2>
-      <pre id="output" class="console"></pre>
-      <h2>Stderr</h2>
-      <pre id="stderr" class="console"></pre>
+    <section class="manual-card" aria-label="Manual local file upload">
+      <details class="panel-drawer" id="manual-upload-drawer">
+        <summary>Manual Local Archive / ELF64 Upload (.tar.gz, .tgz, .tar, .zip, raw ELF64)</summary>
+        <div class="manual-body">
+          <div class="manual-row">
+            <div class="field">
+              <label for="manual-file-input">Select OCI/rootfs tarball, .zip, or ELF64 binary</label>
+              <input
+                id="manual-file-input"
+                type="file"
+                accept=".tar.gz,.tgz,.tar,.gz,.zip,.elf,*"
+                multiple
+              >
+            </div>
+            <div class="field">
+              <label for="manual-upload-path">Guest path for raw binary (optional)</label>
+              <input
+                id="manual-upload-path"
+                type="text"
+                placeholder="/bin/&lt;filename&gt;"
+                autocomplete="off"
+                spellcheck="false"
+              >
+            </div>
+          </div>
+          <div class="manual-row">
+            <div class="field">
+              <label for="manual-cmd-input">Command &amp; Arguments (for .zip / ELF64 or tarball override)</label>
+              <input
+                id="manual-cmd-input"
+                type="text"
+                placeholder="/bin/sh"
+                autocomplete="off"
+                spellcheck="false"
+              >
+            </div>
+            <div class="actions">
+              <button id="manual-run-btn" type="button" class="btn btn-primary">Run Local Upload</button>
+              <button id="manual-clear-btn" type="button" class="btn btn-secondary">Clear Upload</button>
+            </div>
+          </div>
+          <div id="manual-vfs-summary" class="manual-vfs-summary">No local archive or binary staged.</div>
+          <pre id="manual-vfs-list" class="manual-vfs-list"></pre>
+        </div>
+      </details>
     </section>
   </div>
 
-  <script type="module">
-    import { extractTarGzToVfs, extractZipToVfs, runFromVfs } from "../js/elf2wasm_shim.mjs";
-
-    const COMPILER_WASM_URL = "../target/wasm32-unknown-unknown/release/elf2wasm_compiler_wasm.wasm";
-    const RUNTIME_WASM_URL = "../target/wasm32-unknown-unknown/release/elf2wasm_runtime_wasm.wasm";
-
-    const statusEl = document.getElementById("status");
-    const uploadEl = document.getElementById("vfs-upload");
-    const uploadPathEl = document.getElementById("upload-path");
-    const clearBtn = document.getElementById("clear-vfs-btn");
-    const vfsSummaryEl = document.getElementById("vfs-summary");
-    const vfsListEl = document.getElementById("vfs-list");
-    const commandEl = document.getElementById("command");
-    const argsEl = document.getElementById("args");
-    const runBtn = document.getElementById("run-btn");
-    const outputEl = document.getElementById("output");
-    const stderrEl = document.getElementById("stderr");
-
-    const textDecoder = new TextDecoder();
-
-    const vfs = {
-      files: new Map(),
-      symlinks: new Map(),
-    };
-
-    let compilerModule = null;
-    let runtimeModule = null;
-    let uploadPromise = Promise.resolve();
-    let isRunning = false;
-
-    function setStatus(text, kind = "") {
-      statusEl.textContent = text;
-      statusEl.className = "status-badge" + (kind ? ` ${kind}` : "");
-    }
-
-    async function loadWasmModules() {
-      const compileFromUrl = async (url) => {
-        const resp = await fetch(url);
-        if (!resp.ok) {
-          throw new Error(`Failed to fetch ${url}: HTTP ${resp.status}`);
-        }
-        if (typeof WebAssembly.compileStreaming === "function") {
-          try {
-            return await WebAssembly.compileStreaming(resp.clone());
-          } catch {
-            // Fall back to ArrayBuffer if Content-Type is not application/wasm
-          }
-        }
-        const buf = await resp.arrayBuffer();
-        return await WebAssembly.compile(buf);
-      };
-
-      const [cMod, rMod] = await Promise.all([
-        compileFromUrl(COMPILER_WASM_URL),
-        compileFromUrl(RUNTIME_WASM_URL),
-      ]);
-      compilerModule = cMod;
-      runtimeModule = rMod;
-      setStatus("Ready", "ok");
-    }
-
-    const wasmReadyPromise = loadWasmModules().catch((err) => {
-      setStatus("WASM load failed", "err");
-      stderrEl.textContent = String(err?.stack || err);
-    });
-
-    function renderVfsSummary() {
-      vfsSummaryEl.textContent = `VFS: ${vfs.files.size} files, ${vfs.symlinks.size} symlinks`;
-      const lines = [];
-      for (const [p, entry] of vfs.files.entries()) {
-        if (lines.length >= 60) {
-          lines.push(`... (${vfs.files.size + vfs.symlinks.size - 60} more)`);
-          break;
-        }
-        lines.push(`F ${p} (${entry.bytes.length} B, 0o${entry.mode.toString(8)})`);
-      }
-      if (lines.length < 60) {
-        for (const [p, target] of vfs.symlinks.entries()) {
-          if (lines.length >= 60) {
-            lines.push("...");
-            break;
-          }
-          lines.push(`L ${p} -> ${target}`);
-        }
-      }
-      vfsListEl.textContent = lines.join("\n");
-    }
-
-    function isElf64(bytes) {
-      return (
-        bytes.length >= 5 &&
-        bytes[0] === 0x7f &&
-        bytes[1] === 0x45 &&
-        bytes[2] === 0x4c &&
-        bytes[3] === 0x46 &&
-        bytes[4] === 2
-      );
-    }
-
-    function isGzip(bytes, name) {
-      return (
-        /\.tar\.gz$/i.test(name) ||
-        /\.tgz$/i.test(name) ||
-        (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b)
-      );
-    }
-
-    function isZip(bytes, name) {
-      return (
-        /\.zip$/i.test(name) ||
-        (bytes.length >= 4 &&
-          bytes[0] === 0x50 &&
-          bytes[1] === 0x4b &&
-          bytes[2] === 0x03 &&
-          bytes[3] === 0x04)
-      );
-    }
-
-    function normalizeGuestPath(p) {
-      const parts = [];
-      for (const seg of String(p || "").split("/")) {
-        if (!seg || seg === ".") continue;
-        if (seg === "..") parts.pop();
-        else parts.push(seg);
-      }
-      return "/" + parts.join("/");
-    }
-
-    async function handleFileUpload(fileList) {
-      if (!fileList || fileList.length === 0) return;
-      setStatus("Extracting VFS overlay...");
-      for (const file of fileList) {
-        const bytes = new Uint8Array(await file.arrayBuffer());
-        if (isGzip(bytes, file.name)) {
-          const extracted = await extractTarGzToVfs(bytes);
-          for (const [p, entry] of extracted.files.entries()) {
-            vfs.symlinks.delete(p);
-            vfs.files.set(p, entry);
-          }
-          for (const [p, target] of extracted.symlinks.entries()) {
-            vfs.files.delete(p);
-            vfs.symlinks.set(p, target);
-          }
-        } else if (isZip(bytes, file.name)) {
-          const extracted = await extractZipToVfs(bytes);
-          for (const [p, entry] of extracted.files.entries()) {
-            vfs.symlinks.delete(p);
-            vfs.files.set(p, entry);
-          }
-          for (const [p, target] of extracted.symlinks.entries()) {
-            vfs.files.delete(p);
-            vfs.symlinks.set(p, target);
-          }
-        } else {
-          const customPath = uploadPathEl.value.trim();
-          const guestPath = normalizeGuestPath(
-            customPath || `/bin/${file.name}`
-          );
-          const mode = isElf64(bytes) ? 0o755 : 0o644;
-          vfs.symlinks.delete(guestPath);
-          vfs.files.set(guestPath, { bytes, mode });
-          if (!commandEl.value.trim() && isElf64(bytes)) {
-            commandEl.value = guestPath;
-          }
-        }
-      }
-      renderVfsSummary();
-      setStatus(compilerModule && runtimeModule ? "Ready" : "Loading WASM...", compilerModule && runtimeModule ? "ok" : "");
-    }
-
-    uploadEl.addEventListener("change", () => {
-      const files = Array.from(uploadEl.files || []);
-      uploadPromise = uploadPromise
-        .then(() => handleFileUpload(files))
-        .catch((err) => {
-          setStatus("Upload error", "err");
-          stderrEl.textContent = String(err?.stack || err);
-        });
-    });
-
-    clearBtn.addEventListener("click", () => {
-      vfs.files.clear();
-      vfs.symlinks.clear();
-      uploadEl.value = "";
-      renderVfsSummary();
-      outputEl.textContent = "";
-      stderrEl.textContent = "";
-      setStatus(compilerModule && runtimeModule ? "Ready" : "Loading WASM...", compilerModule && runtimeModule ? "ok" : "");
-    });
-
-    function splitShellArgs(str) {
-      const args = [];
-      let current = "";
-      let inSingle = false;
-      let inDouble = false;
-      let hasToken = false;
-
-      for (let i = 0; i < str.length; i++) {
-        const ch = str[i];
-        if (inSingle) {
-          if (ch === "'") {
-            inSingle = false;
-          } else {
-            current += ch;
-          }
-          hasToken = true;
-        } else if (inDouble) {
-          if (ch === '"') {
-            inDouble = false;
-          } else if (ch === "\\" && i + 1 < str.length) {
-            i++;
-            current += str[i];
-          } else {
-            current += ch;
-          }
-          hasToken = true;
-        } else if (ch === "'") {
-          inSingle = true;
-          hasToken = true;
-        } else if (ch === '"') {
-          inDouble = true;
-          hasToken = true;
-        } else if (ch === "\\" && i + 1 < str.length) {
-          i++;
-          current += str[i];
-          hasToken = true;
-        } else if (/\s/.test(ch)) {
-          if (hasToken) {
-            args.push(current);
-            current = "";
-            hasToken = false;
-          }
-        } else {
-          current += ch;
-          hasToken = true;
-        }
-      }
-      if (hasToken) {
-        args.push(current);
-      }
-      return args;
-    }
-
-    runBtn.addEventListener("click", async () => {
-      if (isRunning) return;
-      isRunning = true;
-      try {
-        setStatus("Preparing...");
-        outputEl.textContent = "";
-        stderrEl.textContent = "";
-
-        await Promise.all([wasmReadyPromise, uploadPromise]);
-        if (!compilerModule || !runtimeModule) {
-          throw new Error("WASM modules failed to load");
-        }
-
-        const command = commandEl.value.trim();
-        if (!command) {
-          throw new Error("Please specify a command path (e.g. /usr/bin/python3)");
-        }
-        const args = splitShellArgs(argsEl.value || "");
-
-        setStatus("Running...");
-        await new Promise((r) => setTimeout(r, 0));
-
-        const res = await runFromVfs({
-          compilerWasm: compilerModule,
-          runtimeWasm: runtimeModule,
-          vfs,
-          command,
-          args,
-        });
-
-        outputEl.textContent = textDecoder.decode(res.stdout);
-        stderrEl.textContent = textDecoder.decode(res.stderr);
-        setStatus(`Exited with code ${res.exitCode}`, res.exitCode === 0 ? "ok" : "err");
-      } catch (err) {
-        setStatus("Execution error", "err");
-        stderrEl.textContent = String(err?.stack || err);
-      } finally {
-        isRunning = false;
-      }
-    });
-  </script>
+  <script type="module" src="/web/app.mjs"></script>
 </body>
 </html>
