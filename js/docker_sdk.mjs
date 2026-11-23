@@ -16,7 +16,7 @@ import {
 } from "./oci_client.mjs";
 import { fetchGitArchive } from "./git_client.mjs";
 
-export { parseImageRef, fetchGitArchive };
+export { parseImageRef, fetchGitArchive, getGoDefaultEnv, isGoContainer, mergeEnv };
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: false });
@@ -131,6 +131,66 @@ function isNodeContainer(imageEnv, entrypoint, cmd, fullArgv) {
     fullArgv.length > 1 &&
     execBasename(fullArgv[0]) === "env" &&
     isNodeExecutable(fullArgv[1])
+  ) {
+    return true;
+  }
+  return false;
+}
+
+const GO_DEFAULT_ENV = Object.freeze([
+  "GODEBUG=asyncpreemptoff=1",
+  "GOMEMLIMIT=256MiB",
+  "GOMAXPROCS=1",
+  "CGO_ENABLED=0",
+]);
+
+function getGoDefaultEnv() {
+  return [...GO_DEFAULT_ENV];
+}
+
+function isGoExecutable(arg) {
+  return execBasename(arg) === "go";
+}
+
+function isGoImageRef(imageRef) {
+  if (!imageRef) return false;
+  let repo = "";
+  if (typeof imageRef === "string") {
+    const withoutDigest = imageRef.split("@")[0];
+    const lastSlash = withoutDigest.lastIndexOf("/");
+    const lastColon = withoutDigest.lastIndexOf(":");
+    repo = lastColon > lastSlash ? withoutDigest.slice(0, lastColon) : withoutDigest;
+  } else if (typeof imageRef === "object") {
+    repo = String(imageRef.repository || imageRef.name || "");
+  }
+  const lastSegment = (repo.split("/").pop() || "").toLowerCase();
+  return lastSegment === "golang";
+}
+
+function isGoContainer(imageEnv, entrypoint = [], cmd = [], fullArgv = [], imageRef = null) {
+  if (isGoImageRef(imageRef)) {
+    return true;
+  }
+  if (Array.isArray(imageEnv)) {
+    for (const entry of imageEnv) {
+      if (
+        typeof entry === "string" &&
+        (entry.startsWith("GOLANG_VERSION=") || entry.startsWith("GOPATH="))
+      ) {
+        return true;
+      }
+    }
+  }
+  if (fullArgv.length > 0 && isGoExecutable(fullArgv[0])) {
+    return true;
+  }
+  if (entrypoint.length > 0 && cmd.length > 0 && isGoExecutable(cmd[0])) {
+    return true;
+  }
+  if (
+    fullArgv.length > 1 &&
+    execBasename(fullArgv[0]) === "env" &&
+    isGoExecutable(fullArgv[1])
   ) {
     return true;
   }
@@ -473,6 +533,9 @@ export class ContainerEngine {
     if (tty) baseEnv.push("TERM=xterm-256color");
     if (isNodeContainer(image.config.env, entrypoint, cmd, fullArgv)) {
       baseEnv.push(...getNodeDefaultEnv(image.config.env));
+    }
+    if (isGoContainer(image.config.env, entrypoint, cmd, fullArgv, image.ref)) {
+      baseEnv.push(...getGoDefaultEnv());
     }
     const postImageEnv = hasExplicitCwd || overlayDefaultCwd ? [`PWD=${cwd}`] : [];
     const env = mergeEnv(

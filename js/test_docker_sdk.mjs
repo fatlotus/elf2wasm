@@ -38,6 +38,9 @@ import {
   DockerContainer,
   runDockerImage,
   fetchGitArchive,
+  getGoDefaultEnv,
+  isGoContainer,
+  mergeEnv,
 } from "./docker_sdk.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1172,6 +1175,226 @@ test("F21: Node.js default --jitless env injection, user override, and non-Node 
     MALLOC_ARENA_MAX: "UNSET",
     UV_USE_IO_URING: "UNSET",
     UV_THREADPOOL_SIZE: "UNSET",
+  });
+});
+
+test("Go container default env helpers (getGoDefaultEnv, isGoContainer, override precedence)", () => {
+  const defaults = getGoDefaultEnv();
+  assert.deepEqual(defaults, [
+    "GODEBUG=asyncpreemptoff=1",
+    "GOMEMLIMIT=256MiB",
+    "GOMAXPROCS=1",
+    "CGO_ENABLED=0",
+  ]);
+
+  // Positive Go container detections
+  assert.equal(isGoContainer([], [], [], ["/bin/sh"], "golang:1.27"), true);
+  assert.equal(isGoContainer([], [], [], ["/bin/sh"], "library/golang:1.24"), true);
+  assert.equal(isGoContainer([], [], [], ["/bin/sh"], "localhost:5000/golang:1.27"), true);
+  assert.equal(
+    isGoContainer([], [], [], ["/bin/sh"], "registry.example.com:5000/library/golang:1.27-alpine"),
+    true
+  );
+  assert.equal(isGoContainer([], [], [], ["/bin/sh"], "localhost:5000/golang@sha256:deadbeef"), true);
+  assert.equal(isGoContainer([], [], [], ["/bin/sh"], "localhost:5000/golang"), true);
+  assert.equal(isGoContainer([], [], [], ["/bin/sh"], { repository: "library/golang" }), true);
+  assert.equal(isGoContainer(["GOLANG_VERSION=1.24.3"], [], [], ["/bin/sh"], "custom:latest"), true);
+  assert.equal(isGoContainer(["GOPATH=/go"], [], [], ["/bin/sh"], "custom:latest"), true);
+  assert.equal(isGoContainer(["PATH=/bin"], [], [], ["/usr/local/go/bin/go", "version"], "custom:latest"), true);
+  assert.equal(isGoContainer(["PATH=/bin"], [], [], ["env", "go", "build"], "custom:latest"), true);
+
+  // Negative non-Go container detections
+  assert.equal(isGoContainer(["PATH=/bin"], [], [], ["/bin/sh"], "alpine:latest"), false);
+  assert.equal(isGoContainer(["PATH=/bin"], [], [], ["/bin/sh"], "golang:5000/nginx:latest"), false);
+  assert.equal(isGoContainer(["NODE_VERSION=22.0.0"], [], [], ["node"], "node:22"), false);
+  assert.equal(isGoContainer(["PYTHON_VERSION=3.12"], [], [], ["python3"], "python:3.12"), false);
+
+  // Override precedence: baseEnv (with Go defaults) < image.config.env < options.env
+  const toMap = (list) => Object.fromEntries(list.map((e) => {
+    const idx = e.indexOf("=");
+    return [e.slice(0, idx), e.slice(idx + 1)];
+  }));
+
+  const defaultMerged = toMap(mergeEnv(["PATH=/bin", ...defaults], ["GOLANG_VERSION=1.27.0"], []));
+  assert.equal(defaultMerged.GODEBUG, "asyncpreemptoff=1");
+  assert.equal(defaultMerged.GOMEMLIMIT, "256MiB");
+  assert.equal(defaultMerged.GOMAXPROCS, "1");
+  assert.equal(defaultMerged.CGO_ENABLED, "0");
+
+  // Explicit image env overrides only that default without losing others
+  const imgOverride = toMap(mergeEnv(["PATH=/bin", ...defaults], ["GOMAXPROCS=4"], []));
+  assert.equal(imgOverride.GODEBUG, "asyncpreemptoff=1");
+  assert.equal(imgOverride.GOMEMLIMIT, "256MiB");
+  assert.equal(imgOverride.GOMAXPROCS, "4");
+  assert.equal(imgOverride.CGO_ENABLED, "0");
+
+  // User options.env overrides both defaults and image env (including empty-string clearing)
+  const userOverride = toMap(
+    mergeEnv(
+      ["PATH=/bin", ...defaults],
+      ["GOMAXPROCS=4"],
+      ["GOMEMLIMIT=512MiB", "CGO_ENABLED=1", "GODEBUG="]
+    )
+  );
+  assert.equal(userOverride.GODEBUG, "");
+  assert.equal(userOverride.GOMEMLIMIT, "512MiB");
+  assert.equal(userOverride.GOMAXPROCS, "4");
+  assert.equal(userOverride.CGO_ENABLED, "1");
+});
+
+test("Go container default env injection via mock registry", async (t) => {
+  if (!fs.existsSync(COMPILER_WASM_PATH) || !fs.existsSync(RUNTIME_WASM_PATH)) {
+    t.skip("wasm32 compiler/runtime artifacts not built");
+    return;
+  }
+
+  const envProbeElf = buildStaticTestElf(`
+    static long sys3(long n, long a, long b, long c) {
+      long r;
+      __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c) : "rcx", "r11", "memory");
+      return r;
+    }
+    static long slen(const char *s) { long n = 0; while (s[n]) n++; return n; }
+    static void w_str(const char *s) { sys3(1, 1, (long)s, slen(s)); }
+    static int starts_with(const char *s, const char *p) {
+      while (*p) { if (*s++ != *p++) return 0; }
+      return 1;
+    }
+    static void print_var(char **envp, const char *key_eq) {
+      long klen = slen(key_eq);
+      const char *val = "UNSET";
+      for (int i = 0; envp[i]; i++) {
+        if (starts_with(envp[i], key_eq)) {
+          val = envp[i] + klen;
+          break;
+        }
+      }
+      w_str(key_eq);
+      w_str(val);
+      w_str("\\n");
+    }
+    void entry_c(long *sp) {
+      long argc = sp[0];
+      char **argv = (char **)(sp + 1);
+      char **envp = argv + argc + 1;
+      print_var(envp, "GODEBUG=");
+      print_var(envp, "GOMEMLIMIT=");
+      print_var(envp, "GOMAXPROCS=");
+      print_var(envp, "CGO_ENABLED=");
+      sys3(60, 0, 0, 0);
+    }
+    __asm__(
+      ".global _start\\n"
+      "_start:\\n"
+      "  mov %rsp, %rdi\\n"
+      "  and $-16, %rsp\\n"
+      "  call entry_c\\n"
+    );
+  `);
+
+  const reg = createMockRegistry({ port: 0, host: "127.0.0.1" });
+  await reg.start();
+  const srv = createServer({ port: 0, host: "127.0.0.1", allowLocalRegistries: true });
+  await srv.start();
+  let docker = null;
+
+  t.after(async () => {
+    if (docker) await docker.dispose();
+    await srv.stop();
+    await reg.stop();
+  });
+
+  docker = await Elf2WasmDocker.create({
+    compilerWasmUrl: `${srv.url}/wasm/elf2wasm_compiler_wasm.wasm`,
+    runtimeWasmUrl: `${srv.url}/wasm/elf2wasm_runtime_wasm.wasm`,
+    registryProxyBase: `${srv.url}/api/v2`,
+    useWorker: false,
+  });
+
+  const probeFiles = [
+    { path: "bin/envprobe", type: "file", content: envProbeElf, mode: 0o755 },
+  ];
+
+  reg.addImage("library/golang", "1.27", {
+    mediaTypeMode: "oci",
+    multiArch: false,
+    config: {
+      cmd: ["/bin/envprobe"],
+      env: ["PATH=/usr/local/go/bin:/usr/bin:/bin", "GOLANG_VERSION=1.27.0", "GOPATH=/go"],
+    },
+    layers: [{ files: probeFiles }],
+  });
+
+  reg.addImage("library/golang", "custom-img-override", {
+    mediaTypeMode: "oci",
+    multiArch: false,
+    config: {
+      cmd: ["/bin/envprobe"],
+      env: ["PATH=/usr/local/go/bin:/usr/bin:/bin", "GOMAXPROCS=4"],
+    },
+    layers: [{ files: probeFiles }],
+  });
+
+  reg.addImage("library/alpine", "3.20", {
+    mediaTypeMode: "oci",
+    multiArch: false,
+    config: {
+      cmd: ["/bin/envprobe"],
+      env: ["PATH=/bin:/usr/bin"],
+    },
+    layers: [{ files: probeFiles }],
+  });
+
+  const parseVars = (stdout) => {
+    const out = {};
+    for (const line of stdout.trim().split(/\r?\n/)) {
+      const idx = line.indexOf("=");
+      if (idx > 0) out[line.slice(0, idx)] = line.slice(idx + 1);
+    }
+    return out;
+  };
+
+  // 1. Go image gets all 4 defaults
+  const goRes = await runDockerImage(`${reg.host}/library/golang:1.27`, { docker });
+  assert.equal(goRes.exitCode, 0);
+  assert.deepEqual(parseVars(goRes.stdout), {
+    GODEBUG: "asyncpreemptoff=1",
+    GOMEMLIMIT: "256MiB",
+    GOMAXPROCS: "1",
+    CGO_ENABLED: "0",
+  });
+
+  // 2. Explicit image env var overrides individual default without losing others
+  const imgOvRes = await runDockerImage(`${reg.host}/library/golang:custom-img-override`, { docker });
+  assert.equal(imgOvRes.exitCode, 0);
+  assert.deepEqual(parseVars(imgOvRes.stdout), {
+    GODEBUG: "asyncpreemptoff=1",
+    GOMEMLIMIT: "256MiB",
+    GOMAXPROCS: "4",
+    CGO_ENABLED: "0",
+  });
+
+  // 3. Explicit user options.env overrides individual defaults (including empty string clearing)
+  const userOvRes = await runDockerImage(`${reg.host}/library/golang:1.27`, {
+    docker,
+    env: ["GOMEMLIMIT=512MiB", "CGO_ENABLED=1", "GODEBUG="],
+  });
+  assert.equal(userOvRes.exitCode, 0);
+  assert.deepEqual(parseVars(userOvRes.stdout), {
+    GODEBUG: "",
+    GOMEMLIMIT: "512MiB",
+    GOMAXPROCS: "1",
+    CGO_ENABLED: "1",
+  });
+
+  // 4. Non-Go image (alpine) does NOT receive Go defaults
+  const alpineRes = await runDockerImage(`${reg.host}/library/alpine:3.20`, { docker });
+  assert.equal(alpineRes.exitCode, 0);
+  assert.deepEqual(parseVars(alpineRes.stdout), {
+    GODEBUG: "UNSET",
+    GOMEMLIMIT: "UNSET",
+    GOMAXPROCS: "UNSET",
+    CGO_ENABLED: "UNSET",
   });
 });
 
