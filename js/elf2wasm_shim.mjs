@@ -871,30 +871,45 @@ export class Elf2WasmSystem {
         const gMem = getGMem();
         return gMem ? gMem.length >>> 0 : 0;
       },
+      host_mem_grow(deltaPages) {
+        const g = syncGuest();
+        if (!g || !g.exports || !g.exports.memory) return -1;
+        try {
+          const prev = g.exports.memory.grow(deltaPages >>> 0);
+          cachedGMemBuf = null;
+          cachedGMem = null;
+          return prev | 0;
+        } catch (_) {
+          return -1;
+        }
+      },
       host_read_guest(guestAddr, rtPtr, len) {
         const gMem = getGMem();
         if (!gMem) return -1;
         const gAddr = guestAddr >>> 0;
-        if (gAddr + len > gMem.length) return -1;
-        getRMem().set(gMem.subarray(gAddr, gAddr + len), rtPtr >>> 0);
+        const n = len >>> 0;
+        if (gAddr + n > gMem.length) return -1;
+        getRMem().set(gMem.subarray(gAddr, gAddr + n), rtPtr >>> 0);
         return 0;
       },
       host_write_guest(guestAddr, rtPtr, len) {
         const gMem = getGMem();
         if (!gMem) return -1;
         const gAddr = guestAddr >>> 0;
-        if (gAddr + len > gMem.length) return -1;
+        const n = len >>> 0;
+        if (gAddr + n > gMem.length) return -1;
         const rMem = getRMem();
         const rPtr = rtPtr >>> 0;
-        gMem.set(rMem.subarray(rPtr, rPtr + len), gAddr);
+        gMem.set(rMem.subarray(rPtr, rPtr + n), gAddr);
         return 0;
       },
       host_zero_guest(guestAddr, len) {
         const gMem = getGMem();
         if (!gMem) return -1;
         const gAddr = guestAddr >>> 0;
-        if (gAddr + len > gMem.length) return -1;
-        gMem.fill(0, gAddr, gAddr + len);
+        const n = len >>> 0;
+        if (gAddr + n > gMem.length) return -1;
+        gMem.fill(0, gAddr, gAddr + n);
         return 0;
       },
       host_get_global(id) {

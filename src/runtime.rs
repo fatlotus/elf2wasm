@@ -92,6 +92,14 @@ impl<'a> GuestContext for StoreCtx<'a> {
         self.mem.data_size(&*self.store)
     }
 
+    fn mem_grow(&mut self, delta_pages: u32) -> Result<usize, i64> {
+        let prev = self
+            .mem
+            .grow(&mut *self.store, delta_pages as u64)
+            .map_err(|_| -ENOMEM)?;
+        Ok((prev as usize) * 65536)
+    }
+
     fn mem_read(&self, addr: u64, buf: &mut [u8]) -> Result<(), i64> {
         if buf.is_empty() {
             return Ok(());

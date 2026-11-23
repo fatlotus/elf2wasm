@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 /// Implemented by `WasmtimeGuestContext` on native hosts and `WasmGuestContext` in `elf2wasm-runtime-wasm`.
 pub trait GuestContext {
     fn mem_len(&self) -> usize;
+    fn mem_grow(&mut self, _delta_pages: u32) -> Result<usize, i64> {
+        Err(-crate::vfs::ENOMEM)
+    }
     fn mem_read(&self, addr: u64, buf: &mut [u8]) -> Result<(), i64>;
     fn mem_write(&mut self, addr: u64, data: &[u8]) -> Result<(), i64>;
     fn mem_zero(&mut self, addr: u64, len: usize) -> Result<(), i64>;

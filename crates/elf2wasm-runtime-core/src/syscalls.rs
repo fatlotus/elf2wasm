@@ -152,11 +152,14 @@ const SYS_RSEQ: i64 = 334;
 const SYS_CLONE3: i64 = 435;
 const SYS_FACCESSAT2: i64 = 439;
 
+const PROT_NONE: i32 = 0x0;
 const PROT_EXEC: i32 = 0x4;
 const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_FIXED_NOREPLACE: i32 = 0x100000;
 const MREMAP_MAYMOVE: i32 = 0x1;
+
+const HIGH_MMAP_LIMIT: u32 = 0x8000_0000; // 2 GiB (32768 Wasm pages)
 
 const ARCH_SET_GS: i64 = 0x1001;
 const ARCH_SET_FS: i64 = 0x1002;
@@ -184,6 +187,15 @@ pub struct MmapAllocator {
     pub mmap_start: u32,
     pub mmap_alloc_end: u32,
     pub free_regions: BTreeMap<u32, u32>,
+    /// Growable high-mmap region placed above initial Wasm linear memory (past dispatch table).
+    /// `high_start == 0` means lazily initialized from `ctx.mem_len()` on first high-region use.
+    pub high_start: u32,
+    pub high_cursor: u32,
+    pub high_limit: u32,
+    /// Highest byte offset ever allocated or reserved in the high region.
+    /// Any bump allocation starting at `>= high_clean_watermark` is guaranteed freshly zeroed by Wasm `memory.grow`.
+    pub high_clean_watermark: u32,
+    pub high_free_regions: BTreeMap<u32, u32>,
 }
 
 impl MmapAllocator {
@@ -197,6 +209,24 @@ impl MmapAllocator {
             mmap_start,
             mmap_alloc_end,
             free_regions: BTreeMap::new(),
+            high_start: 0,
+            high_cursor: 0,
+            high_limit: HIGH_MMAP_LIMIT,
+            high_clean_watermark: 0,
+            high_free_regions: BTreeMap::new(),
+        }
+    }
+
+    fn ensure_high_init(&mut self, mem_len: usize) {
+        if self.high_start == 0 {
+            let start = u32::try_from(mem_len)
+                .unwrap_or(self.high_limit)
+                .min(self.high_limit);
+            let aligned = start.saturating_add(65535) & !65535;
+            let aligned = aligned.min(self.high_limit);
+            self.high_start = aligned;
+            self.high_cursor = aligned;
+            self.high_clean_watermark = aligned;
         }
     }
 
@@ -204,25 +234,96 @@ impl MmapAllocator {
         if aligned_len == 0 {
             return None;
         }
+        Self::alloc_from_region(
+            &mut self.cursor,
+            self.mmap_alloc_end,
+            &mut self.free_regions,
+            aligned_len,
+        )
+    }
+
+    /// Allocate from the primary mmap region first (no `mem_grow`), falling back to the
+    /// growable high-mmap region above initial Wasm linear memory.
+    /// Returns `Some((addr, freshly_grown))`, where `freshly_grown` is `true` iff the returned
+    /// range comes from never-before-allocated Wasm linear memory pages (guaranteed zeroed).
+    pub fn alloc_with_grow(
+        &mut self,
+        ctx: &mut dyn GuestContext,
+        aligned_len: u32,
+    ) -> Option<(u32, bool)> {
+        if aligned_len == 0 {
+            return None;
+        }
+        if let Some(addr) = self.alloc(aligned_len) {
+            return Some((addr, false));
+        }
+
+        self.ensure_high_init(ctx.mem_len());
+
+        // Try reusing a freed slice in the high region first (not freshly grown -> must zero).
         let found = self
-            .free_regions
+            .high_free_regions
             .iter()
             .find(|(_, &len)| len >= aligned_len)
             .map(|(&start, &len)| (start, len));
         if let Some((start, len)) = found {
-            self.free_regions.remove(&start);
+            self.high_free_regions.remove(&start);
             if len > aligned_len {
-                self.free_regions
+                self.high_free_regions
                     .insert(start + aligned_len, len - aligned_len);
+            }
+            return Some((start, false));
+        }
+
+        let next = self.high_cursor.checked_add(aligned_len)?;
+        if next > self.high_limit {
+            return None;
+        }
+
+        let cur_len = ctx.mem_len();
+        if (next as usize) > cur_len {
+            let needed = (next as usize) - cur_len;
+            let delta_pages = u32::try_from((needed + 65535) / 65536).ok()?;
+            if ctx.mem_grow(delta_pages).is_err() {
+                return None;
+            }
+            if ctx.mem_len() < (next as usize) {
+                return None;
+            }
+        }
+
+        let addr = self.high_cursor;
+        let freshly_grown = addr >= self.high_clean_watermark;
+        self.high_cursor = next;
+        if next > self.high_clean_watermark {
+            self.high_clean_watermark = next;
+        }
+        Some((addr, freshly_grown))
+    }
+
+    fn alloc_from_region(
+        cursor: &mut u32,
+        region_end: u32,
+        free_regions: &mut BTreeMap<u32, u32>,
+        aligned_len: u32,
+    ) -> Option<u32> {
+        let found = free_regions
+            .iter()
+            .find(|(_, &len)| len >= aligned_len)
+            .map(|(&start, &len)| (start, len));
+        if let Some((start, len)) = found {
+            free_regions.remove(&start);
+            if len > aligned_len {
+                free_regions.insert(start + aligned_len, len - aligned_len);
             }
             return Some(start);
         }
-        let next = self.cursor.checked_add(aligned_len)?;
-        if next > self.mmap_alloc_end {
+        let next = cursor.checked_add(aligned_len)?;
+        if next > region_end {
             return None;
         }
-        let addr = self.cursor;
-        self.cursor = next;
+        let addr = *cursor;
+        *cursor = next;
         Some(addr)
     }
 
@@ -230,32 +331,56 @@ impl MmapAllocator {
         if aligned_len == 0 {
             return;
         }
-        let mut start = addr.max(self.mmap_start);
-        let mut end = addr.saturating_add(aligned_len).min(self.cursor);
+        Self::free_in_region(
+            self.mmap_start,
+            &mut self.cursor,
+            &mut self.free_regions,
+            addr,
+            aligned_len,
+        );
+        if self.high_start != 0 {
+            Self::free_in_region(
+                self.high_start,
+                &mut self.high_cursor,
+                &mut self.high_free_regions,
+                addr,
+                aligned_len,
+            );
+        }
+    }
+
+    fn free_in_region(
+        region_start: u32,
+        cursor: &mut u32,
+        free_regions: &mut BTreeMap<u32, u32>,
+        addr: u32,
+        aligned_len: u32,
+    ) {
+        let mut start = addr.max(region_start);
+        let mut end = addr.saturating_add(aligned_len).min(*cursor);
         if start >= end {
             return;
         }
-        if let Some((&pred_start, &pred_len)) = self.free_regions.range(..=start).next_back() {
+        if let Some((&pred_start, &pred_len)) = free_regions.range(..=start).next_back() {
             let pred_end = pred_start.saturating_add(pred_len);
             if pred_end >= start {
                 start = pred_start;
                 end = end.max(pred_end);
-                self.free_regions.remove(&pred_start);
+                free_regions.remove(&pred_start);
             }
         }
-        let succs: Vec<(u32, u32)> = self
-            .free_regions
+        let succs: Vec<(u32, u32)> = free_regions
             .range(start..=end)
             .map(|(&k, &v)| (k, v))
             .collect();
         for (k, v) in succs {
-            self.free_regions.remove(&k);
+            free_regions.remove(&k);
             end = end.max(k.saturating_add(v));
         }
-        if end == self.cursor {
-            self.cursor = start;
+        if end == *cursor {
+            *cursor = start;
         } else {
-            self.free_regions.insert(start, end - start);
+            free_regions.insert(start, end - start);
         }
     }
 
@@ -263,43 +388,81 @@ impl MmapAllocator {
         if aligned_len == 0 {
             return;
         }
-        let start = addr.max(self.mmap_start);
-        let end = addr.saturating_add(aligned_len).min(self.mmap_alloc_end);
+        Self::reserve_in_region(
+            self.mmap_start,
+            self.mmap_alloc_end,
+            &mut self.cursor,
+            &mut self.free_regions,
+            addr,
+            aligned_len,
+        );
+        if self.high_start != 0 {
+            let end = addr.saturating_add(aligned_len).min(self.high_limit);
+            if addr.max(self.high_start) < end {
+                Self::reserve_in_region(
+                    self.high_start,
+                    self.high_limit,
+                    &mut self.high_cursor,
+                    &mut self.high_free_regions,
+                    addr,
+                    aligned_len,
+                );
+                if end > self.high_clean_watermark {
+                    self.high_clean_watermark = end;
+                }
+            }
+        }
+    }
+
+    fn reserve_in_region(
+        region_start: u32,
+        region_end: u32,
+        cursor: &mut u32,
+        free_regions: &mut BTreeMap<u32, u32>,
+        addr: u32,
+        aligned_len: u32,
+    ) {
+        let start = addr.max(region_start);
+        let end = addr.saturating_add(aligned_len).min(region_end);
         if start >= end {
             return;
         }
-        if end > self.cursor {
-            if start > self.cursor {
-                let mut gap_start = self.cursor;
+        if end > *cursor {
+            if start > *cursor {
+                let mut gap_start = *cursor;
                 let gap_end = start;
-                if let Some((&pred_start, &pred_len)) =
-                    self.free_regions.range(..=gap_start).next_back()
+                if let Some((&pred_start, &pred_len)) = free_regions.range(..=gap_start).next_back()
                 {
                     if pred_start.saturating_add(pred_len) >= gap_start {
                         gap_start = pred_start;
-                        self.free_regions.remove(&pred_start);
+                        free_regions.remove(&pred_start);
                     }
                 }
-                self.free_regions.insert(gap_start, gap_end - gap_start);
+                free_regions.insert(gap_start, gap_end - gap_start);
             }
-            self.cursor = end;
+            *cursor = end;
         }
-        let overlapping: Vec<(u32, u32)> = self
-            .free_regions
+        let overlapping: Vec<(u32, u32)> = free_regions
             .iter()
             .filter(|(&k, &v)| k < end && k.saturating_add(v) > start)
             .map(|(&k, &v)| (k, v))
             .collect();
         for (k, v) in overlapping {
-            self.free_regions.remove(&k);
+            free_regions.remove(&k);
             let k_end = k.saturating_add(v);
             if k < start {
-                self.free_regions.insert(k, start - k);
+                free_regions.insert(k, start - k);
             }
             if k_end > end {
-                self.free_regions.insert(end, k_end - end);
+                free_regions.insert(end, k_end - end);
             }
         }
+    }
+
+    pub fn contains_range(&self, start: u32, end: u32) -> bool {
+        let in_primary = start >= self.mmap_start && end <= self.mmap_alloc_end;
+        let in_high = self.high_start != 0 && start >= self.high_start && end <= self.high_cursor;
+        in_primary || in_high
     }
 }
 
@@ -2675,21 +2838,22 @@ fn handle_syscall_inner(
             };
 
             if is_anon {
-                let (target, allocated) = if is_fixed {
+                let (target, allocated, freshly_grown) = if is_fixed {
                     match validate_fixed(addr) {
                         Ok(t) => {
                             state.mmap_alloc.reserve_fixed(t, aligned);
-                            (t, false)
+                            (t, false, false)
                         }
                         Err(e) => return e,
                     }
                 } else {
-                    match state.mmap_alloc.alloc(aligned) {
-                        Some(t) => (t, true),
+                    match state.mmap_alloc.alloc_with_grow(ctx, aligned) {
+                        Some((t, freshly_grown)) => (t, true, freshly_grown),
                         None => return -ENOMEM,
                     }
                 };
-                if ctx.mem_zero(target as u64, aligned as usize).is_err() {
+                let skip_zero = prot == PROT_NONE && !is_fixed && freshly_grown;
+                if !skip_zero && ctx.mem_zero(target as u64, aligned as usize).is_err() {
                     if allocated {
                         state.mmap_alloc.free(target, aligned);
                     }
@@ -2734,8 +2898,8 @@ fn handle_syscall_inner(
                 };
                 (t, false)
             } else {
-                match state.mmap_alloc.alloc(aligned) {
-                    Some(t) => (t, true),
+                match state.mmap_alloc.alloc_with_grow(ctx, aligned) {
+                    Some((t, _)) => (t, true),
                     None => return -ENOMEM,
                 }
             };
@@ -2822,7 +2986,7 @@ fn handle_syscall_inner(
                 Ok(b) => b,
                 Err(e) => return e,
             };
-            let Some(target) = state.mmap_alloc.alloc(new_aligned) else {
+            let Some((target, _)) = state.mmap_alloc.alloc_with_grow(ctx, new_aligned) else {
                 return -ENOMEM;
             };
             if ctx.mem_zero(target as u64, new_aligned as usize).is_err() {
@@ -2846,9 +3010,7 @@ fn handle_syscall_inner(
             if advice == MADV_DONTNEED && len > 0 {
                 if let (Ok(start), Ok(len_u32)) = (u32::try_from(addr), u32::try_from(len)) {
                     if let Some(end) = start.checked_add(len_u32) {
-                        if start >= state.mmap_alloc.mmap_start
-                            && end <= state.mmap_alloc.mmap_alloc_end
-                        {
+                        if state.mmap_alloc.contains_range(start, end) {
                             let _ = ctx.mem_zero(addr, len);
                         }
                     }
@@ -4822,3 +4984,423 @@ fn do_select(
     ctx.set_yield_flag(1);
     0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use elf2wasm_core::lifter::CTX_SIZE;
+    use std::collections::BTreeMap;
+
+    const PROT_READ: i32 = 0x1;
+    const PROT_WRITE: i32 = 0x2;
+    const MAP_PRIVATE: i32 = 0x02;
+    const MADV_DONTNEED: i32 = 4;
+
+    /// Sparse page-backed mock GuestContext modeling Wasm32 linear memory up to 2 GiB
+    /// without allocating gigabytes of host RAM during unit tests.
+    struct MockGuestContext {
+        mem_len: usize,
+        max_len: usize,
+        pages: BTreeMap<u64, Vec<u8>>,
+        grow_calls: Vec<u32>,
+        zero_calls: Vec<(u64, usize)>,
+    }
+
+    impl MockGuestContext {
+        fn new(initial_bytes: usize, max_bytes: usize) -> Self {
+            Self {
+                mem_len: initial_bytes,
+                max_len: max_bytes,
+                pages: BTreeMap::new(),
+                grow_calls: Vec::new(),
+                zero_calls: Vec::new(),
+            }
+        }
+    }
+
+    impl GuestContext for MockGuestContext {
+        fn mem_len(&self) -> usize {
+            self.mem_len
+        }
+
+        fn mem_grow(&mut self, delta_pages: u32) -> Result<usize, i64> {
+            let add_bytes = (delta_pages as usize)
+                .checked_mul(65536)
+                .ok_or(-ENOMEM)?;
+            let new_len = self.mem_len.checked_add(add_bytes).ok_or(-ENOMEM)?;
+            if new_len > self.max_len {
+                return Err(-ENOMEM);
+            }
+            let prev = self.mem_len;
+            self.mem_len = new_len;
+            self.grow_calls.push(delta_pages);
+            Ok(prev)
+        }
+
+        fn mem_read(&self, addr: u64, buf: &mut [u8]) -> Result<(), i64> {
+            if buf.is_empty() {
+                return Ok(());
+            }
+            let end = addr.checked_add(buf.len() as u64).ok_or(-EFAULT)?;
+            if end as usize > self.mem_len {
+                return Err(-EFAULT);
+            }
+            for (i, dst) in buf.iter_mut().enumerate() {
+                let a = addr + i as u64;
+                let page = a & !0xfff;
+                let off = (a & 0xfff) as usize;
+                *dst = self.pages.get(&page).map_or(0, |p| p[off]);
+            }
+            Ok(())
+        }
+
+        fn mem_write(&mut self, addr: u64, data: &[u8]) -> Result<(), i64> {
+            if data.is_empty() {
+                return Ok(());
+            }
+            let end = addr.checked_add(data.len() as u64).ok_or(-EFAULT)?;
+            if end as usize > self.mem_len {
+                return Err(-EFAULT);
+            }
+            for (i, &b) in data.iter().enumerate() {
+                let a = addr + i as u64;
+                let page = a & !0xfff;
+                let off = (a & 0xfff) as usize;
+                let entry = self.pages.entry(page).or_insert_with(|| vec![0u8; 4096]);
+                entry[off] = b;
+            }
+            Ok(())
+        }
+
+        fn mem_zero(&mut self, addr: u64, len: usize) -> Result<(), i64> {
+            if len == 0 {
+                return Ok(());
+            }
+            let end = addr.checked_add(len as u64).ok_or(-ENOMEM)?;
+            if end as usize > self.mem_len {
+                return Err(-ENOMEM);
+            }
+            self.zero_calls.push((addr, len));
+            // Zero only materialized pages overlapping [addr, end)
+            let start_page = addr & !0xfff;
+            let end_page = (end - 1) & !0xfff;
+            let keys: Vec<u64> = self
+                .pages
+                .range(start_page..=end_page)
+                .map(|(&k, _)| k)
+                .collect();
+            for page in keys {
+                let p_start = page.max(addr);
+                let p_end = (page + 4096).min(end);
+                if p_start == page && p_end == page + 4096 {
+                    self.pages.remove(&page);
+                } else if let Some(buf) = self.pages.get_mut(&page) {
+                    let s = (p_start - page) as usize;
+                    let e = (p_end - page) as usize;
+                    buf[s..e].fill(0);
+                }
+            }
+            Ok(())
+        }
+
+        fn mem_read_cstr(&self, _addr: u64, _max_len: usize) -> Result<String, i64> {
+            Err(-EFAULT)
+        }
+
+        fn get_fsbase(&self) -> i64 { 0 }
+        fn set_fsbase(&mut self, _val: i64) {}
+        fn get_gsbase(&self) -> i64 { 0 }
+        fn set_gsbase(&mut self, _val: i64) {}
+        fn get_rcx(&self) -> i64 { 0 }
+        fn set_rip(&mut self, _val: i64) {}
+        fn set_rsp(&mut self, _val: i64) {}
+        fn get_rax(&self) -> i64 { 0 }
+        fn set_rax(&mut self, _val: i64) {}
+        fn get_rdi(&self) -> i64 { 0 }
+        fn get_rsi(&self) -> i64 { 0 }
+        fn get_rdx(&self) -> i64 { 0 }
+        fn get_r10(&self) -> i64 { 0 }
+        fn get_r8(&self) -> i64 { 0 }
+        fn get_r9(&self) -> i64 { 0 }
+        fn set_exit(&mut self, _code: i32) {}
+        fn set_yield_flag(&mut self, _val: i32) {}
+        fn set_quantum(&mut self, _val: i32) {}
+        fn save_ctx(&mut self, _scratch_addr: u32) -> Result<[u8; CTX_SIZE], i64> {
+            Ok([0u8; CTX_SIZE])
+        }
+        fn load_ctx(&mut self, _scratch_addr: u32, _buf: &[u8; CTX_SIZE]) -> Result<(), i64> {
+            Ok(())
+        }
+    }
+
+    fn make_state() -> HostState {
+        HostState::new(VirtualFs::new_in_memory(&[]))
+    }
+
+    fn sys_mmap(
+        ctx: &mut MockGuestContext,
+        state: &mut HostState,
+        addr: u64,
+        len: u64,
+        prot: i32,
+        flags: i32,
+    ) -> i64 {
+        handle_syscall(
+            ctx,
+            state,
+            SYS_MMAP,
+            addr as i64,
+            len as i64,
+            prot as i64,
+            flags as i64,
+            -1,
+            0,
+        )
+    }
+
+    #[test]
+    fn test_small_mmap_stays_in_primary_without_grow() {
+        let mut ctx = MockGuestContext::new(256 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
+        let mut state = make_state();
+
+        let p1 = sys_mmap(
+            &mut ctx,
+            &mut state,
+            0,
+            64 * 1024,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+        );
+        assert!(p1 >= MMAP_START as i64 && p1 < MMAP_ALLOC_END as i64);
+        assert!(ctx.grow_calls.is_empty(), "small alloc must not call mem_grow");
+        assert_eq!(ctx.mem_len(), 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_go_pagealloc_prot_none_sequence_grows_without_zeroing_fresh_pages() {
+        let initial = 256 * 1024 * 1024;
+        let max_2gib = 2 * 1024 * 1024 * 1024;
+        let mut ctx = MockGuestContext::new(initial, max_2gib);
+        let mut state = make_state();
+
+        // Go's exact pageAlloc.sysInit sequence: 128 KiB, 1 MiB, 8 MiB, 64 MiB, 512 MiB
+        let sizes: [u64; 5] = [
+            128 * 1024,
+            1 * 1024 * 1024,
+            8 * 1024 * 1024,
+            64 * 1024 * 1024,
+            512 * 1024 * 1024,
+        ];
+        let mut addrs = [0u64; 5];
+        for (i, &sz) in sizes.iter().enumerate() {
+            let r = sys_mmap(
+                &mut ctx,
+                &mut state,
+                0,
+                sz,
+                PROT_NONE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+            );
+            assert!(r > 0, "mmap level {} ({} bytes) failed: {}", i, sz, r);
+            addrs[i] = r as u64;
+        }
+
+        // Levels 0..2 (9.125 MiB total) fit in primary [MMAP_START, MMAP_ALLOC_END)
+        for i in 0..3 {
+            assert!(addrs[i] >= MMAP_START as u64 && addrs[i] < MMAP_ALLOC_END as u64);
+        }
+        // Levels 3 (64 MiB) and 4 (512 MiB) grow into the high region >= 256 MiB
+        assert_eq!(addrs[3], initial as u64);
+        assert_eq!(addrs[4], (initial + 64 * 1024 * 1024) as u64);
+        assert!(!ctx.grow_calls.is_empty());
+        assert_eq!(ctx.mem_len(), initial + (64 + 512) * 1024 * 1024);
+
+        // Freshly grown PROT_NONE high-region allocations MUST NOT invoke mem_zero
+        assert!(
+            !ctx.zero_calls
+                .iter()
+                .any(|&(a, _)| a >= initial as u64),
+            "freshly grown PROT_NONE pages must skip mem_zero, got {:?}",
+            ctx.zero_calls
+        );
+
+        // Simulate Go's pageAlloc.sysGrow MAP_FIXED commit at +256 MiB inside summary[4]
+        let commit_addr = addrs[4] + 256 * 1024 * 1024;
+        let commit_len = 4096u64;
+        let r = sys_mmap(
+            &mut ctx,
+            &mut state,
+            commit_addr,
+            commit_len,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+        );
+        assert_eq!(r, commit_addr as i64);
+        assert!(
+            ctx.zero_calls.contains(&(commit_addr, commit_len as usize)),
+            "MAP_FIXED commit must zero the committed slice"
+        );
+
+        // Verify read/write at the committed +256 MiB address
+        let payload = [0xde, 0xad, 0xbe, 0xef, 0x42, 0x99, 0x11, 0x22];
+        ctx.mem_write(commit_addr + 16, &payload).unwrap();
+        let mut readback = [0u8; 8];
+        ctx.mem_read(commit_addr + 16, &mut readback).unwrap();
+        assert_eq!(readback, payload);
+    }
+
+    #[test]
+    fn test_high_region_munmap_trim_coalesce_and_reuse_zeroes_memory() {
+        let initial = 256 * 1024 * 1024;
+        let max_2gib = 2 * 1024 * 1024 * 1024;
+        let mut ctx = MockGuestContext::new(initial, max_2gib);
+        let mut state = make_state();
+
+        // Simulate Go's sysReserveAligned: reserve 128 MiB in high region, then trim head & tail
+        // to keep a 64 MiB aligned slice in the middle.
+        let size_128m = 128 * 1024 * 1024u64;
+        let size_32m = 32 * 1024 * 1024u64;
+        let size_64m = 64 * 1024 * 1024u64;
+
+        let base = sys_mmap(
+            &mut ctx,
+            &mut state,
+            0,
+            size_128m,
+            PROT_NONE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+        );
+        assert_eq!(base, initial as i64);
+        let base_u64 = base as u64;
+
+        // Dirty a byte in the head (which will be trimmed and later reused)
+        ctx.mem_write(base_u64 + 4096, &[0xaa, 0xbb]).unwrap();
+
+        // Trim 32 MiB head -> goes into high_free_regions
+        let rc_head = handle_syscall(
+            &mut ctx,
+            &mut state,
+            SYS_MUNMAP,
+            base_u64 as i64,
+            size_32m as i64,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(rc_head, 0);
+
+        // Trim 32 MiB tail -> rewinds high_cursor from +128M to +96M
+        let rc_tail = handle_syscall(
+            &mut ctx,
+            &mut state,
+            SYS_MUNMAP,
+            (base_u64 + size_32m + size_64m) as i64,
+            size_32m as i64,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(rc_tail, 0);
+        assert_eq!(state.mmap_alloc.high_cursor, initial as u32 + (96 * 1024 * 1024));
+
+        // Now free the middle 64 MiB too -> should coalesce with the 32 MiB head and rewind
+        // high_cursor all the way back to high_start!
+        let rc_mid = handle_syscall(
+            &mut ctx,
+            &mut state,
+            SYS_MUNMAP,
+            (base_u64 + size_32m) as i64,
+            size_64m as i64,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(rc_mid, 0);
+        assert_eq!(state.mmap_alloc.high_cursor, initial as u32);
+        assert!(state.mmap_alloc.high_free_regions.is_empty());
+
+        // Reallocate 64 MiB (even as PROT_NONE) -> must reuse base_u64 without growing,
+        // AND must zero it because it was previously allocated (< high_clean_watermark).
+        let grow_count_before = ctx.grow_calls.len();
+        ctx.zero_calls.clear();
+        let reused = sys_mmap(
+            &mut ctx,
+            &mut state,
+            0,
+            size_64m,
+            PROT_NONE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+        );
+        assert_eq!(reused, base_u64 as i64);
+        assert_eq!(ctx.grow_calls.len(), grow_count_before, "reused slice must not grow");
+        assert!(
+            ctx.zero_calls.contains(&(base_u64, size_64m as usize)),
+            "reused high-region memory must be zeroed"
+        );
+        let mut check = [0xffu8; 2];
+        ctx.mem_read(base_u64 + 4096, &mut check).unwrap();
+        assert_eq!(check, [0, 0]);
+    }
+
+    #[test]
+    fn test_madvise_dontneed_zeroes_high_region_mapping() {
+        let initial = 256 * 1024 * 1024;
+        let max_2gib = 2 * 1024 * 1024 * 1024;
+        let mut ctx = MockGuestContext::new(initial, max_2gib);
+        let mut state = make_state();
+
+        let size_64m = 64 * 1024 * 1024u64;
+        let base = sys_mmap(
+            &mut ctx,
+            &mut state,
+            0,
+            size_64m,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+        ) as u64;
+        assert_eq!(base, initial as u64);
+
+        let target = base + 8192;
+        ctx.mem_write(target, &[0x12, 0x34, 0x56, 0x78]).unwrap();
+
+        let rc = handle_syscall(
+            &mut ctx,
+            &mut state,
+            SYS_MADVISE,
+            target as i64,
+            4096,
+            MADV_DONTNEED as i64,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(rc, 0);
+
+        let mut buf = [0xffu8; 4];
+        ctx.mem_read(target, &mut buf).unwrap();
+        assert_eq!(buf, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_high_region_enomem_when_exceeding_limit() {
+        let initial = 256 * 1024 * 1024;
+        let max_512m = 512 * 1024 * 1024;
+        let mut ctx = MockGuestContext::new(initial, max_512m);
+        let mut state = make_state();
+
+        // Request 512 MiB when only 256 MiB of growth headroom exists -> -ENOMEM
+        let r = sys_mmap(
+            &mut ctx,
+            &mut state,
+            0,
+            512 * 1024 * 1024,
+            PROT_NONE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+        );
+        assert_eq!(r, -ENOMEM);
+    }
+}
+

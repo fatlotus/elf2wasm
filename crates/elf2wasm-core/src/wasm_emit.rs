@@ -873,7 +873,7 @@ pub fn emit_wasm_with_prefix(
         let mut memories = MemorySection::new();
         memories.memory(MemoryType {
             minimum: mem_pages as u64,
-            maximum: Some(mem_pages as u64),
+            maximum: Some(mem_pages.max(32768) as u64),
             memory64: false,
             shared: false,
             page_size_log2: None,

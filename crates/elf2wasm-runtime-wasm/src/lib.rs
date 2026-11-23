@@ -34,6 +34,7 @@ const GLOBAL_ID_R9: u32 = 15;
 #[link(wasm_import_module = "env")]
 extern "C" {
     fn host_mem_size() -> u32;
+    fn host_mem_grow(delta_pages: u32) -> i32;
     fn host_read_guest(guest_addr: u32, rt_ptr: u32, len: u32) -> i32;
     fn host_write_guest(guest_addr: u32, rt_ptr: u32, len: u32) -> i32;
     fn host_zero_guest(guest_addr: u32, len: u32) -> i32;
@@ -168,6 +169,15 @@ struct WasmGuestContext;
 impl GuestContext for WasmGuestContext {
     fn mem_len(&self) -> usize {
         unsafe { host_mem_size() as usize }
+    }
+
+    fn mem_grow(&mut self, delta_pages: u32) -> Result<usize, i64> {
+        let prev = unsafe { host_mem_grow(delta_pages) };
+        if prev >= 0 {
+            Ok((prev as usize) * 65536)
+        } else {
+            Err(-ENOMEM)
+        }
     }
 
     fn mem_read(&self, addr: u64, buf: &mut [u8]) -> Result<(), i64> {
