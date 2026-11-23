@@ -45,10 +45,20 @@ Node.js Web Server & Thin Streaming OCI Registry Proxy (server/server.mjs + serv
 │   ├── main.rs                        # Native CLI (translate, run)
 │   └── runtime.rs                     # Native wasmtime 27 host
 ├── server/                            # Node.js 22 ESM web server & thin OCI registry proxy
+│   ├── proxy_core.mjs                 # Pure ESM shared OCI proxy validation, SSRF, auth & cache core
 │   ├── server.mjs                     # HTTP server (static assets + /wasm/* + /api/v2/* proxy)
-│   ├── registry_proxy.mjs             # OCI v2 Bearer auth, manifest/blob streaming, SSRF guard
+│   ├── registry_proxy.mjs             # Node OCI v2 proxy (uses proxy_core.mjs + dns.lookup pinning)
 │   ├── mock_registry.mjs              # Local mock OCI v2 registry for deterministic testing
 │   └── test_server.mjs                # Unit/integration tests for server & proxy
+├── worker/                            # Cloudflare Workers full-app deployment (OCI proxy + Static Assets)
+│   ├── wrangler.jsonc                 # Wrangler config (name: elf2wasm, workers_dev: true, assets: ./dist)
+│   ├── package.json                   # Isolated manifest pinning wrangler + scripts
+│   ├── package-lock.json              # Reproducible lockfile for CI
+│   ├── scripts/build_assets.mjs       # Stages web/, js/, /wasm/*.wasm + _headers into worker/dist/
+│   ├── src/index.mjs                  # Web-standard Cloudflare Worker fetch() handler (/api/health, /api/v2/*)
+│   └── test/worker.test.mjs           # Automated Worker unit/integration tests
+├── .github/workflows/
+│   └── deploy-worker.yml              # GitHub Actions: Rust/WASM build + tests + cloudflare/wrangler-action@v4
 ├── js/                                # Browser & Node ESM client-side SDK and shim
 │   ├── elf2wasm_shim.mjs              # Core WASM compiler/runtime shim, VFS tar/OCI extraction, async CPS loop
 │   ├── oci_client.mjs                 # Image ref parser, multi-arch linux/amd64 index/manifest/blob client
@@ -83,6 +93,8 @@ Every Survey feature from Explorers 1, 2, and 3 is assigned a milestone below (z
 | F10 | Shim OCI VFS Extraction, Dynamic Linker Resolution, Async CPS Loop & Child Leak Fix | Upgrade `js/elf2wasm_shim.mjs`: preserve empty dirs (`typeFlag === "5"`), apply OCI whiteouts (`.wh.<name>`, `.wh..wh..opq`), preserve requested `PT_INTERP` alongside canonical path, support `DT_RPATH`/`DT_RUNPATH` + `/etc/ld-musl-x86_64.path` + `/etc/ld.so.conf*`, delete reaped child PIDs from `processes` Map (fixing 256 MiB/child leak), add async interactive CPS runner with `NeedStdin` (`5`), incremental stdout/stderr callbacks, periodic macrotask yield, `PATH` resolution, and clean `-ENOEXEC` handling. | M3 | Survey 1 (F1, F3), Survey 2 (RT1, RT5, RT6), Survey 3 (W2) |
 | F11 | Client-Side OCI Image Loader, Web Worker & JavaScript Docker-on-WASM SDK | Implement `js/oci_client.mjs`, `js/container_worker.mjs`, and `js/docker_sdk.mjs`: parse Docker image refs, resolve multi-arch `linux/amd64` manifests, parse OCI config (`Entrypoint`/`Cmd`/`Env`/`WorkingDir`/`User`), stream/decompress layers client-side with progress callbacks (plus offline `loadOciTarball`), run compilation & execution in a dedicated Web Worker (with Node.js direct fallback), and expose ergonomic `Elf2WasmDocker` / `runDockerImage` JS API. | M3 | Survey 1 (F3), Survey 2 (RT1), Survey 3 (W4) |
 | F12 | Interactive Web Shell Home Page (Default Alpine Linux) & VT100 Terminal UI | Build self-hosted (zero CDN) `web/index.html`, `web/app.mjs`, `web/terminal.mjs`, `web/styles.css`: image input defaulting to `alpine:latest` with presets, optional cmd/env/workdir overrides, live client-side fetch/unpack/compile/run progress indicator, interactive ANSI/VT100 terminal (Ctrl+C, Ctrl+D, Ctrl+L, backspace, resize, paste, scrolling), `window.Elf2WasmDocker` & `window.runDockerImage` global hooks, and optional manual file-upload drawer. | M4 | Survey 1 (F5), Survey 3 (W5) |
+| F13 | Cloudflare Workers Full-App Deployment (OCI Proxy + Static Assets + WASM) | Extract pure ESM `server/proxy_core.mjs` shared by Node (`server/registry_proxy.mjs`) and Cloudflare Workers (`worker/src/index.mjs`); implement streaming Web-standard `fetch()` proxy (`/api/health`, `/api/v2/*`), SSRF checks, Bearer token exchange/cache, cross-origin redirect `Authorization` stripping, same-origin / configurable `ALLOWED_ORIGINS` CORS, COOP/COEP/CORP/nosniff headers, `worker/scripts/build_assets.mjs` staging `web/`, `js/`, and `/wasm/*.wasm` + `_headers` into `worker/dist/` for Workers Static Assets (`name: elf2wasm`), optional runtime `registryProxyBase` override in `web/app.mjs`, and automated Worker tests. | M6 | Survey 1, Survey 2, Survey 3, User Update |
+| F14 | GitHub Actions Rust/WASM Build & Auto-Deploy Pipeline | Add `.github/workflows/deploy-worker.yml` building `wasm32-unknown-unknown` release WASM binaries, staging static assets, running Node & Worker tests + `wrangler deploy --dry-run` on PRs, and auto-deploying via `cloudflare/wrangler-action@v4` (`CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID`) on `push` to `main` (and `workflow_dispatch`), with concurrency guard and `.gitignore` updates. | M6 | Survey 2, Survey 3, User Update |
 
 ## Milestones
 
@@ -93,6 +105,7 @@ Every Survey feature from Explorers 1, 2, and 3 is assigned a milestone below (z
 | M3 | Client-Side OCI Loader, Shim Upgrades, Web Worker & JS Docker SDK | `js/elf2wasm_shim.mjs`, `js/oci_client.mjs`, `js/docker_sdk.mjs`, `js/container_worker.mjs`, `js/test_docker_sdk.mjs`; features F10–F11 | M1, M2 | DONE (`sub_orch_m3` gate passed; 16/16 SDK tests, Chrome Web Worker verified, Auditor CLEAN) |
 | M4 | Interactive Web Shell Home Page & VT100 Terminal UI | `web/index.html`, `web/app.mjs`, `web/terminal.mjs`, `web/styles.css`; feature F12 | M2, M3 | DONE (`sub_orch_m4` gate passed; 30/30 Chrome probes, T4.1–T4.4 pass, Auditor CLEAN) |
 | M5 | Final Milestone (E2E Pass Tiers 1–4 + Tier 5 Adversarial Hardening) | Pass 100% of `TEST_READY.md` E2E suite (Tiers 1–4) + Tier 5 adversarial hardening across all modules | M1, M2, M3, M4, TEST_READY.md | DONE (Phase 1 Tiers 1–4: 47/47 PASS; Phase 2 Tier 5: 10/10 PASS, 158/158 total tests, both Fresh Challengers `NO_GAPS`, Whole-Project Auditor `CLEAN`) |
+| M6 | Cloudflare Workers Full-App (Proxy + Static Assets + WASM) & GitHub Auto-Deploy | `server/proxy_core.mjs`, `server/registry_proxy.mjs`, `worker/**`, `.github/workflows/deploy-worker.yml`, `.gitignore`, `web/app.mjs`; features F13–F14 | M1, M2, M4 | DONE (Iteration 2 gate passed: 26/26 server tests, 25/25 worker tests, WASM 0.81+0.52 MiB staged, `wrangler deploy --dry-run` PASS, 2/2 Reviewers APPROVE, 2/2 Challengers APPROVE, Auditor CLEAN) |
 
 ## Interface Contracts
 
