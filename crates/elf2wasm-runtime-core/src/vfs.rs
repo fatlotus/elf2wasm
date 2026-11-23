@@ -23,6 +23,7 @@ pub const EFAULT: i64 = 14;
 pub const EBUSY: i64 = 16;
 pub const EEXIST: i64 = 17;
 pub const EXDEV: i64 = 18;
+pub const ENODEV: i64 = 19;
 pub const ENOTDIR: i64 = 20;
 pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
@@ -36,9 +37,21 @@ pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
 pub const ENOTSOCK: i64 = 88;
+pub const ENOPROTOOPT: i64 = 92;
+pub const EPROTONOSUPPORT: i64 = 93;
 pub const EOPNOTSUPP: i64 = 95;
 pub const EAFNOSUPPORT: i64 = 97;
+pub const EADDRINUSE: i64 = 98;
+pub const EADDRNOTAVAIL: i64 = 99;
+pub const ENETUNREACH: i64 = 101;
+pub const ECONNRESET: i64 = 104;
+pub const EISCONN: i64 = 106;
+pub const ENOTCONN: i64 = 107;
+pub const ESHUTDOWN: i64 = 108;
 pub const ETIMEDOUT: i64 = 110;
+pub const ECONNREFUSED: i64 = 111;
+pub const EALREADY: i64 = 114;
+pub const EINPROGRESS: i64 = 115;
 
 pub const MAX_FDS: i32 = 4096;
 pub const PIPE_CAPACITY: usize = 65536;
@@ -174,6 +187,64 @@ pub struct EpollInstance {
 }
 
 #[derive(Debug, Clone)]
+pub enum TcpSocketState {
+    Unbound,
+    Bound {
+        local_ip: u32,
+        local_port: u16,
+    },
+    Listening {
+        local_ip: u32,
+        local_port: u16,
+        backlog_limit: usize,
+        pending: VecDeque<u64>,
+    },
+    Connected {
+        local_ip: u32,
+        local_port: u16,
+        peer_ip: u32,
+        peer_port: u16,
+        read_pipe_id: u64,
+        write_pipe_id: u64,
+        shut_rd: bool,
+        shut_wr: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct TcpSocket {
+    pub state: TcpSocketState,
+    pub ref_count: usize,
+    pub reuse_addr: bool,
+    pub tcp_nodelay: bool,
+    pub keepalive: bool,
+    pub keepidle: i32,
+    pub keepintvl: i32,
+    pub keepcnt: i32,
+    pub sndbuf: i32,
+    pub rcvbuf: i32,
+    pub so_error: i32,
+}
+
+impl TcpSocket {
+    pub fn new(state: TcpSocketState) -> Self {
+        Self {
+            state,
+            ref_count: 1,
+            reuse_addr: false,
+            tcp_nodelay: false,
+            keepalive: false,
+            keepidle: 7200,
+            keepintvl: 75,
+            keepcnt: 9,
+            sndbuf: PIPE_CAPACITY as i32,
+            rcvbuf: PIPE_CAPACITY as i32,
+            so_error: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct OpenFile {
     pub data: Arc<Vec<u8>>,
     pub cursor: usize,
@@ -185,6 +256,7 @@ pub struct OpenFile {
     pub is_pipe: bool,
     pub pipe_id: Option<u64>,
     pub sock_write_pipe_id: Option<u64>,
+    pub tcp_socket_id: Option<u64>,
     pub dev: Option<VirtualDevice>,
     pub epoll_id: Option<u64>,
     pub eventfd_id: Option<u64>,
@@ -209,6 +281,7 @@ impl OpenFile {
             is_pipe: false,
             pipe_id: None,
             sock_write_pipe_id: None,
+            tcp_socket_id: None,
             dev: None,
             epoll_id: None,
             eventfd_id: None,
@@ -271,6 +344,11 @@ pub struct VirtualFs {
     pub next_epoll_id: u64,
     pub eventfds: BTreeMap<u64, EventFdState>,
     pub next_eventfd_id: u64,
+    pub tcp_sockets: BTreeMap<u64, TcpSocket>,
+    pub next_tcp_socket_id: u64,
+    pub tcp_bound_ports: BTreeMap<u16, u64>,
+    pub tcp_listeners: BTreeMap<u16, u64>,
+    pub next_ephemeral_port: u16,
     pub cwd: String,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -361,6 +439,11 @@ impl VirtualFs {
             next_epoll_id: 1,
             eventfds: BTreeMap::new(),
             next_eventfd_id: 1,
+            tcp_sockets: BTreeMap::new(),
+            next_tcp_socket_id: 1,
+            tcp_bound_ports: BTreeMap::new(),
+            tcp_listeners: BTreeMap::new(),
+            next_ephemeral_port: 32768,
             cwd: "/".to_string(),
             stdout: Vec::new(),
             stderr: Vec::new(),
@@ -1403,14 +1486,27 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
     }
 
     pub fn close(&mut self, fd: i32) -> i64 {
+        let (ret, _, _) = self.close_with_events(fd);
+        ret
+    }
+
+    pub fn close_with_events(&mut self, fd: i32) -> (i64, Vec<u64>, Vec<u64>) {
         let Some(file) = self.fds.remove(&fd) else {
-            return -EBADF;
+            return (-EBADF, Vec::new(), Vec::new());
         };
-        self.dec_pipe_ref(&file);
-        0
+        let mut affected_pipes = Vec::new();
+        let mut closed_listeners = Vec::new();
+        self.dec_pipe_ref_collect(&file, &mut affected_pipes, &mut closed_listeners);
+        (0, affected_pipes, closed_listeners)
     }
 
     fn inc_pipe_ref(&mut self, file: &OpenFile) {
+        if let Some(sid) = file.tcp_socket_id {
+            if let Some(sock) = self.tcp_sockets.get_mut(&sid) {
+                sock.ref_count += 1;
+            }
+            return;
+        }
         if let Some(wpid) = file.sock_write_pipe_id {
             // Bidirectional socketpair: pipe_id is read pipe, sock_write_pipe_id is write pipe.
             if let Some(rpid) = file.pipe_id {
@@ -1434,7 +1530,95 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
         }
     }
 
-    fn dec_pipe_ref(&mut self, file: &OpenFile) {
+    fn dec_tcp_socket_ref(
+        &mut self,
+        sid: u64,
+        affected_pipes: &mut Vec<u64>,
+        closed_listeners: &mut Vec<u64>,
+    ) {
+        let should_remove = match self.tcp_sockets.get_mut(&sid) {
+            Some(sock) => {
+                sock.ref_count = sock.ref_count.saturating_sub(1);
+                sock.ref_count == 0
+            }
+            None => false,
+        };
+        if !should_remove {
+            return;
+        }
+        let Some(sock) = self.tcp_sockets.remove(&sid) else {
+            return;
+        };
+        match sock.state {
+            TcpSocketState::Unbound => {}
+            TcpSocketState::Bound { local_port, .. } => {
+                if self.tcp_bound_ports.get(&local_port) == Some(&sid) {
+                    self.tcp_bound_ports.remove(&local_port);
+                }
+            }
+            TcpSocketState::Listening {
+                local_port,
+                pending,
+                ..
+            } => {
+                if self.tcp_bound_ports.get(&local_port) == Some(&sid) {
+                    self.tcp_bound_ports.remove(&local_port);
+                }
+                if self.tcp_listeners.get(&local_port) == Some(&sid) {
+                    self.tcp_listeners.remove(&local_port);
+                }
+                closed_listeners.push(sid);
+                for child_sid in pending {
+                    self.dec_tcp_socket_ref(child_sid, affected_pipes, closed_listeners);
+                }
+            }
+            TcpSocketState::Connected {
+                read_pipe_id,
+                write_pipe_id,
+                shut_rd,
+                shut_wr,
+                ..
+            } => {
+                if !shut_rd {
+                    let mut remove = false;
+                    if let Some(p) = self.pipes.get_mut(&read_pipe_id) {
+                        p.readers = p.readers.saturating_sub(1);
+                        if p.readers == 0 && p.writers == 0 {
+                            remove = true;
+                        }
+                    }
+                    if remove {
+                        self.pipes.remove(&read_pipe_id);
+                    }
+                    affected_pipes.push(read_pipe_id);
+                }
+                if !shut_wr {
+                    let mut remove = false;
+                    if let Some(p) = self.pipes.get_mut(&write_pipe_id) {
+                        p.writers = p.writers.saturating_sub(1);
+                        if p.readers == 0 && p.writers == 0 {
+                            remove = true;
+                        }
+                    }
+                    if remove {
+                        self.pipes.remove(&write_pipe_id);
+                    }
+                    affected_pipes.push(write_pipe_id);
+                }
+            }
+        }
+    }
+
+    fn dec_pipe_ref_collect(
+        &mut self,
+        file: &OpenFile,
+        affected_pipes: &mut Vec<u64>,
+        closed_listeners: &mut Vec<u64>,
+    ) {
+        if let Some(sid) = file.tcp_socket_id {
+            self.dec_tcp_socket_ref(sid, affected_pipes, closed_listeners);
+            return;
+        }
         if let Some(wpid) = file.sock_write_pipe_id {
             if let Some(rpid) = file.pipe_id {
                 let mut remove = false;
@@ -1447,6 +1631,7 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
                 if remove {
                     self.pipes.remove(&rpid);
                 }
+                affected_pipes.push(rpid);
             }
             let mut remove = false;
             if let Some(p) = self.pipes.get_mut(&wpid) {
@@ -1458,6 +1643,7 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
             if remove {
                 self.pipes.remove(&wpid);
             }
+            affected_pipes.push(wpid);
             return;
         }
         if let Some(pid) = file.pipe_id {
@@ -1475,6 +1661,7 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
             if remove_pipe {
                 self.pipes.remove(&pid);
             }
+            affected_pipes.push(pid);
         }
     }
 
@@ -1487,21 +1674,39 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
     }
 
     pub fn close_cloexec_fds(&mut self) {
+        let _ = self.close_cloexec_fds_with_events();
+    }
+
+    pub fn close_cloexec_fds_with_events(&mut self) -> (Vec<u64>, Vec<u64>) {
         let cloexec_fds: Vec<i32> = self
             .fds
             .iter()
             .filter_map(|(&fd, f)| if f.cloexec { Some(fd) } else { None })
             .collect();
+        let mut affected_pipes = Vec::new();
+        let mut closed_listeners = Vec::new();
         for fd in cloexec_fds {
-            self.close(fd);
+            let (_, pipes, listeners) = self.close_with_events(fd);
+            affected_pipes.extend(pipes);
+            closed_listeners.extend(listeners);
         }
+        (affected_pipes, closed_listeners)
     }
 
     pub fn close_all_fds(&mut self) {
+        let _ = self.close_all_fds_with_events();
+    }
+
+    pub fn close_all_fds_with_events(&mut self) -> (Vec<u64>, Vec<u64>) {
         let all_fds: Vec<i32> = self.fds.keys().copied().collect();
+        let mut affected_pipes = Vec::new();
+        let mut closed_listeners = Vec::new();
         for fd in all_fds {
-            self.close(fd);
+            let (_, pipes, listeners) = self.close_with_events(fd);
+            affected_pipes.extend(pipes);
+            closed_listeners.extend(listeners);
         }
+        (affected_pipes, closed_listeners)
     }
 
     pub fn get_fd(&self, fd: i32) -> Option<&OpenFile> {
@@ -1958,7 +2163,7 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
                 mtime_ns: 0,
             });
         }
-        if file.sock_write_pipe_id.is_some() {
+        if file.sock_write_pipe_id.is_some() || file.tcp_socket_id.is_some() {
             return Ok(FileStat {
                 st_ino: path_hash(&file.guest_path),
                 st_mode: S_IFSOCK | 0o777,
@@ -2236,37 +2441,58 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
         newfd as i64
     }
 
-    fn dup_into(&mut self, oldfd: i32, newfd: i32, cloexec: bool) -> i64 {
+    fn dup_into_with_events(
+        &mut self,
+        oldfd: i32,
+        newfd: i32,
+        cloexec: bool,
+    ) -> (i64, Vec<u64>, Vec<u64>) {
         if newfd < 0 || newfd >= MAX_FDS {
-            return -EBADF;
+            return (-EBADF, Vec::new(), Vec::new());
         }
         let Some(mut file) = self.fds.get(&oldfd).cloned() else {
-            return -EBADF;
+            return (-EBADF, Vec::new(), Vec::new());
         };
         if oldfd == newfd {
-            return newfd as i64;
+            return (newfd as i64, Vec::new(), Vec::new());
         }
-        if self.fds.contains_key(&newfd) {
-            self.close(newfd);
-        }
+        let (affected_pipes, closed_listeners) = if self.fds.contains_key(&newfd) {
+            let (_, pipes, listeners) = self.close_with_events(newfd);
+            (pipes, listeners)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         file.cloexec = cloexec;
         self.inc_pipe_ref(&file);
         self.fds.insert(newfd, file);
         if newfd >= self.next_fd {
             self.next_fd = newfd + 1;
         }
-        newfd as i64
+        (newfd as i64, affected_pipes, closed_listeners)
     }
 
     pub fn dup2(&mut self, oldfd: i32, newfd: i32) -> i64 {
-        self.dup_into(oldfd, newfd, false)
+        self.dup2_with_events(oldfd, newfd).0
+    }
+
+    pub fn dup2_with_events(&mut self, oldfd: i32, newfd: i32) -> (i64, Vec<u64>, Vec<u64>) {
+        self.dup_into_with_events(oldfd, newfd, false)
     }
 
     pub fn dup3(&mut self, oldfd: i32, newfd: i32, flags: i32) -> i64 {
+        self.dup3_with_events(oldfd, newfd, flags).0
+    }
+
+    pub fn dup3_with_events(
+        &mut self,
+        oldfd: i32,
+        newfd: i32,
+        flags: i32,
+    ) -> (i64, Vec<u64>, Vec<u64>) {
         if (flags & !O_CLOEXEC) != 0 || oldfd == newfd {
-            return -EINVAL;
+            return (-EINVAL, Vec::new(), Vec::new());
         }
-        self.dup_into(oldfd, newfd, (flags & O_CLOEXEC) != 0)
+        self.dup_into_with_events(oldfd, newfd, (flags & O_CLOEXEC) != 0)
     }
 
     pub fn dup_from(&mut self, oldfd: i32, min_fd: i32, cloexec: bool) -> i64 {
@@ -2366,6 +2592,56 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
         self.pipes.insert(pipe_a, PipeBuffer::new());
         self.pipes.insert(pipe_b, PipeBuffer::new());
         Ok((fd0, fd1))
+    }
+
+    pub fn alloc_ephemeral_port(&mut self) -> Result<u16, i64> {
+        const EPHEMERAL_MIN: u16 = 32768;
+        const EPHEMERAL_MAX: u16 = 60999;
+        let span = (EPHEMERAL_MAX - EPHEMERAL_MIN + 1) as u32;
+        for _ in 0..span {
+            let port = self.next_ephemeral_port;
+            self.next_ephemeral_port = if port >= EPHEMERAL_MAX {
+                EPHEMERAL_MIN
+            } else {
+                port + 1
+            };
+            if !self.tcp_bound_ports.contains_key(&port) && !self.tcp_listeners.contains_key(&port)
+            {
+                return Ok(port);
+            }
+        }
+        Err(-EADDRINUSE)
+    }
+
+    pub fn create_tcp_socket(&mut self, cloexec: bool, nonblock: bool) -> Result<i32, i64> {
+        let sid = self.next_tcp_socket_id;
+        self.next_tcp_socket_id += 1;
+        let fd = self.alloc_fd()?;
+        let mut f = OpenFile::base(format!("socket:[tcp:{}]", sid), Arc::new(Vec::new()));
+        f.tcp_socket_id = Some(sid);
+        f.writable = true;
+        f.cloexec = cloexec;
+        f.nonblock = nonblock;
+        self.fds.insert(fd, f);
+        self.tcp_sockets
+            .insert(sid, TcpSocket::new(TcpSocketState::Unbound));
+        Ok(fd)
+    }
+
+    pub fn alloc_fd_for_tcp_socket(
+        &mut self,
+        sid: u64,
+        cloexec: bool,
+        nonblock: bool,
+    ) -> Result<i32, i64> {
+        let fd = self.alloc_fd()?;
+        let mut f = OpenFile::base(format!("socket:[tcp:{}]", sid), Arc::new(Vec::new()));
+        f.tcp_socket_id = Some(sid);
+        f.writable = true;
+        f.cloexec = cloexec;
+        f.nonblock = nonblock;
+        self.fds.insert(fd, f);
+        Ok(fd)
     }
 
     pub fn create_epoll(&mut self, cloexec: bool) -> Result<i32, i64> {
@@ -2743,6 +3019,12 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
         if length < 0 {
             return -EINVAL;
         }
+        let Ok(length_u32) = u32::try_from(length) else {
+            return -EINVAL;
+        };
+        let Ok(length_usize) = usize::try_from(length_u32) else {
+            return -EINVAL;
+        };
         let Some((writable, is_dir, is_std, guest_path, unlinked)) = self
             .fds
             .get(&fd)
@@ -2755,7 +3037,7 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
         }
         if unlinked {
             if let Some(f) = self.fds.get_mut(&fd) {
-                Arc::make_mut(&mut f.data).resize(length as usize, 0);
+                Arc::make_mut(&mut f.data).resize(length_usize, 0);
             }
             return 0;
         }
@@ -2765,13 +3047,112 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
         else {
             return -EINVAL;
         };
-        Arc::make_mut(data).resize(length as usize, 0);
+        Arc::make_mut(data).resize(length_usize, 0);
         *mtime_ns = now_ns;
         let updated = Arc::clone(data);
         if let Some(f) = self.fds.get_mut(&fd) {
             f.data = updated;
         }
         0
+    }
+
+    pub fn fallocate(&mut self, fd: i32, mode: i32, offset: i64, len: i64, now_ns: u64) -> i64 {
+        if offset < 0 || len <= 0 {
+            return -EINVAL;
+        }
+        const FALLOC_FL_KEEP_SIZE: i32 = 1;
+        if mode != 0 && mode != FALLOC_FL_KEEP_SIZE {
+            return -EOPNOTSUPP;
+        }
+        let Some((is_pipe, is_non_regular, writable, cur_len)) = self.fds.get(&fd).map(|f| {
+            let cur_len = if !f.unlinked {
+                match self.overlay.get(&f.guest_path) {
+                    Some(OverlayNode::File { data, .. }) => data.len(),
+                    _ => f.data.len(),
+                }
+            } else {
+                f.data.len()
+            };
+            let is_non_regular = f.is_std.is_some()
+                || f.is_dir
+                || f.tcp_socket_id.is_some()
+                || f.sock_write_pipe_id.is_some()
+                || f.epoll_id.is_some()
+                || f.eventfd_id.is_some();
+            (f.is_pipe, is_non_regular, f.writable, cur_len)
+        }) else {
+            return -EBADF;
+        };
+        if is_pipe {
+            return -ESPIPE;
+        }
+        if is_non_regular {
+            return -ENODEV;
+        }
+        if !writable {
+            return -EBADF;
+        }
+        let Some(new_end) = offset.checked_add(len) else {
+            return -EINVAL;
+        };
+        let Ok(new_end_u32) = u32::try_from(new_end) else {
+            return -EINVAL;
+        };
+        let Ok(new_end_usize) = usize::try_from(new_end_u32) else {
+            return -EINVAL;
+        };
+        if mode == FALLOC_FL_KEEP_SIZE {
+            return 0;
+        }
+        if new_end_usize > cur_len {
+            self.ftruncate(fd, new_end, now_ns)
+        } else {
+            0
+        }
+    }
+
+    pub fn write_overlay_range(
+        &mut self,
+        guest_path: &str,
+        offset: usize,
+        bytes: &[u8],
+        now_ns: u64,
+    ) {
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(OverlayNode::File {
+            data, mtime_ns, ..
+        }) = self.overlay.get_mut(guest_path)
+        {
+            let file_len = data.len();
+            if offset >= file_len {
+                return;
+            }
+            let copy_len = (file_len - offset).min(bytes.len());
+            if copy_len == 0 {
+                return;
+            }
+            let vec = Arc::make_mut(data);
+            vec[offset..offset + copy_len].copy_from_slice(&bytes[..copy_len]);
+            *mtime_ns = now_ns;
+            let updated = Arc::clone(data);
+            for f in self.fds.values_mut() {
+                if !f.unlinked && f.guest_path == guest_path {
+                    f.data = Arc::clone(&updated);
+                }
+            }
+        }
+    }
+
+    pub fn read_latest_fd_data(&self, fd: i32) -> Option<Arc<Vec<u8>>> {
+        let f = self.fds.get(&fd)?;
+        if !f.unlinked {
+            if let Some(OverlayNode::File { data, .. }) = self.overlay.get(&f.guest_path) {
+                return Some(Arc::clone(data));
+            }
+        }
+        Some(Arc::clone(&f.data))
     }
 
     pub fn chmod_at(&mut self, dirfd: i32, raw_path: &str, mode: u32) -> i64 {

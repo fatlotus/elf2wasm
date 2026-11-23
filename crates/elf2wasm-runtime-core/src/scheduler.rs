@@ -75,6 +75,12 @@ pub enum PendingWakeup {
         addr: u64,
         tid: i32,
     },
+    Accept {
+        listener_socket_id: u64,
+        addr_ptr: u64,
+        addrlen_ptr: u64,
+        flags: i32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +121,12 @@ pub enum ThreadState {
     PollWait {
         kind: PollKind,
         wake_ns: Option<u64>,
+    },
+    AcceptWait {
+        listener_socket_id: u64,
+        addr_ptr: u64,
+        addrlen_ptr: u64,
+        flags: i32,
     },
     Exited,
 }

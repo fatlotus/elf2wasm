@@ -5,10 +5,11 @@ use crate::scheduler::{
 };
 use crate::stack::setup_guest_stack_ctx_with_ids;
 use crate::vfs::{
-    EpollEntry, FileStat, OpenFile, SoEntry, VirtualDevice, VirtualFs, AT_FDCWD, AT_REMOVEDIR,
-    AT_SYMLINK_NOFOLLOW, EACCES, EAFNOSUPPORT, EAGAIN, EBADF, ECHILD, EFAULT, EINTR, EINVAL,
-    ELOOP, ENOENT, ENOEXEC, ENOMEM, ENOSYS, ENOTTY, EPERM, EPIPE, ERANGE, ESRCH, ETIMEDOUT,
-    O_CLOEXEC, O_NONBLOCK, S_IFDIR,
+    EpollEntry, FileStat, OpenFile, PipeBuffer, SoEntry, TcpSocket, TcpSocketState, VirtualDevice,
+    VirtualFs, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, EACCES, EADDRINUSE, EADDRNOTAVAIL,
+    EAFNOSUPPORT, EAGAIN, EBADF, ECHILD, ECONNREFUSED, EFAULT, EINTR, EINVAL, EISCONN, ELOOP,
+    ENETUNREACH, ENOENT, ENOEXEC, ENOMEM, ENOPROTOOPT, ENOSYS, ENOTCONN, ENOTSOCK, ENOTTY,
+    EPERM, EPIPE, EPROTONOSUPPORT, ERANGE, ESRCH, ETIMEDOUT, O_CLOEXEC, O_NONBLOCK, S_IFDIR,
 };
 use elf2wasm_core::elf_loader::{BRK_START, MMAP_START};
 use elf2wasm_core::lifter::DEFAULT_QUANTUM;
@@ -45,15 +46,27 @@ const SYS_PIPE: i64 = 22;
 const SYS_SELECT: i64 = 23;
 const SYS_SCHED_YIELD: i64 = 24;
 const SYS_MREMAP: i64 = 25;
+const SYS_MSYNC: i64 = 26;
 const SYS_MADVISE: i64 = 28;
 const SYS_DUP: i64 = 32;
 const SYS_DUP2: i64 = 33;
 const SYS_NANOSLEEP: i64 = 35;
 const SYS_GETPID: i64 = 39;
 const SYS_SOCKET: i64 = 41;
+const SYS_CONNECT: i64 = 42;
+const SYS_ACCEPT: i64 = 43;
 const SYS_SENDTO: i64 = 44;
 const SYS_RECVFROM: i64 = 45;
+const SYS_SENDMSG: i64 = 46;
+const SYS_RECVMSG: i64 = 47;
+const SYS_SHUTDOWN: i64 = 48;
+const SYS_BIND: i64 = 49;
+const SYS_LISTEN: i64 = 50;
+const SYS_GETSOCKNAME: i64 = 51;
+const SYS_GETPEERNAME: i64 = 52;
 const SYS_SOCKETPAIR: i64 = 53;
+const SYS_SETSOCKOPT: i64 = 54;
+const SYS_GETSOCKOPT: i64 = 55;
 const SYS_CLONE: i64 = 56;
 const SYS_FORK: i64 = 57;
 const SYS_VFORK: i64 = 58;
@@ -140,6 +153,8 @@ const SYS_PPOLL: i64 = 271;
 const SYS_SET_ROBUST_LIST: i64 = 273;
 const SYS_UTIMENSAT: i64 = 280;
 const SYS_EPOLL_PWAIT: i64 = 281;
+const SYS_FALLOCATE: i64 = 285;
+const SYS_ACCEPT4: i64 = 288;
 const SYS_EVENTFD2: i64 = 290;
 const SYS_EPOLL_CREATE1: i64 = 291;
 const SYS_DUP3: i64 = 292;
@@ -155,7 +170,9 @@ const SYS_CLONE3: i64 = 435;
 const SYS_FACCESSAT2: i64 = 439;
 
 const PROT_NONE: i32 = 0x0;
+const PROT_WRITE: i32 = 0x2;
 const PROT_EXEC: i32 = 0x4;
+const MAP_SHARED: i32 = 0x1;
 const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_FIXED_NOREPLACE: i32 = 0x100000;
@@ -176,19 +193,56 @@ const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
 const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 
 const WNOHANG: i32 = 1;
+const WSTOPPED: i32 = 2;
+const WEXITED: i32 = 4;
+const WCONTINUED: i32 = 8;
+const WNOWAIT: i32 = 0x0100_0000;
 
 const POLLIN: i16 = 0x0001;
 const POLLOUT: i16 = 0x0004;
 const POLLERR: i16 = 0x0008;
 const POLLHUP: i16 = 0x0010;
 const POLLNVAL: i16 = 0x0020;
+const POLLRDHUP: i16 = 0x2000;
 const EPOLLET: u32 = 0x8000_0000;
+
+const AF_INET: i32 = 2;
+const SOCK_STREAM: i32 = 1;
+const SOCK_NONBLOCK: i32 = 0x800;
+const SOCK_CLOEXEC: i32 = 0x80000;
+const IPPROTO_TCP: i32 = 6;
+const SOL_SOCKET: i32 = 1;
+const SO_REUSEADDR: i32 = 2;
+const SO_TYPE: i32 = 3;
+const SO_ERROR: i32 = 4;
+const SO_BROADCAST: i32 = 6;
+const SO_SNDBUF: i32 = 7;
+const SO_RCVBUF: i32 = 8;
+const SO_KEEPALIVE: i32 = 9;
+const SO_LINGER: i32 = 13;
+const SO_REUSEPORT: i32 = 15;
+const SO_ACCEPTCONN: i32 = 30;
+const TCP_NODELAY: i32 = 1;
+const TCP_KEEPIDLE: i32 = 4;
+const TCP_KEEPINTVL: i32 = 5;
+const TCP_KEEPCNT: i32 = 6;
+const SHUT_RD: i32 = 0;
+const SHUT_WR: i32 = 1;
+const SHUT_RDWR: i32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PipeEvent {
     Write,
     Read { was_full: bool },
     Close,
+}
+
+#[derive(Debug, Clone)]
+pub struct SharedMmap {
+    pub addr: u32,
+    pub len: usize,
+    pub guest_path: String,
+    pub file_offset: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +263,8 @@ pub struct MmapAllocator {
     /// Sorted, disjoint, coalesced half-open `[start, end)` intervals of known-zero
     /// untouched `PROT_NONE` anonymous mappings that can be skipped on fork.
     pub prot_none_ranges: Vec<(u32, u32)>,
+    /// Active writable `MAP_SHARED` file mappings to flush back to the VFS on msync/munmap/exit.
+    pub shared_mmaps: Vec<SharedMmap>,
 }
 
 impl MmapAllocator {
@@ -228,6 +284,7 @@ impl MmapAllocator {
             high_clean_watermark: 0,
             high_free_regions: BTreeMap::new(),
             prot_none_ranges: Vec::new(),
+            shared_mmaps: Vec::new(),
         }
     }
 
@@ -1110,6 +1167,7 @@ impl HostState {
                         | ThreadState::PipeReadWait { .. }
                         | ThreadState::PipeWriteWait { .. }
                         | ThreadState::FutexWait { .. }
+                        | ThreadState::AcceptWait { .. }
                 )
             });
             if is_blocked {
@@ -1194,6 +1252,43 @@ impl HostState {
         Ok(child_pid as i64)
     }
 
+    fn finish_waitid(
+        &mut self,
+        ctx: &mut dyn GuestContext,
+        child_pid: i32,
+        options: i32,
+        infop: u64,
+        rusage_addr: u64,
+    ) -> Result<i64, i64> {
+        let exit_status = self
+            .processes
+            .get(&child_pid)
+            .map(|c| c.exit_status)
+            .unwrap_or(0);
+        if rusage_addr != 0 {
+            write_bytes(ctx, rusage_addr, &[0u8; 144])?;
+        }
+        if infop != 0 {
+            let mut si = [0u8; 128];
+            si[0..4].copy_from_slice(&17i32.to_le_bytes()); // si_signo = SIGCHLD
+            let sig = exit_status & 0x7f;
+            let (si_code, si_status) = if sig != 0 {
+                (2i32, sig) // CLD_KILLED
+            } else {
+                (1i32, (exit_status >> 8) & 0xff) // CLD_EXITED
+            };
+            si[8..12].copy_from_slice(&si_code.to_le_bytes());
+            si[16..20].copy_from_slice(&child_pid.to_le_bytes()); // si_pid
+            si[20..24].copy_from_slice(&self.uid.to_le_bytes()); // si_uid
+            si[24..28].copy_from_slice(&si_status.to_le_bytes()); // si_status
+            write_bytes(ctx, infop, &si)?;
+        }
+        if (options & WNOWAIT) == 0 {
+            self.processes.remove(&child_pid);
+        }
+        Ok(0)
+    }
+
     fn wake_vfork_parent_for(&mut self, child_pid: i32) {
         let parent_pid = self
             .processes
@@ -1240,12 +1335,12 @@ impl HostState {
                     None => (0, 0),
                 };
                 let rmask = if writers == 0 {
-                    (POLLHUP | POLLIN) as u16
+                    (POLLHUP | POLLIN | POLLRDHUP) as u16
                 } else {
                     0
                 };
                 let wmask = if readers == 0 {
-                    (POLLERR | POLLOUT) as u16
+                    (POLLERR | POLLOUT | POLLHUP) as u16
                 } else {
                     0
                 };
@@ -1256,14 +1351,27 @@ impl HostState {
             return;
         }
         let mut fd_masks: Vec<(i32, u16)> = Vec::new();
+        let tcp_sockets = &self.vfs.tcp_sockets;
         let mut collect_from = |fds: &BTreeMap<i32, OpenFile>| {
             for (&fd, f) in fds {
-                let is_read_end =
-                    f.pipe_id == Some(pipe_id) && (f.sock_write_pipe_id.is_some() || !f.writable);
-                let is_write_end = f.sock_write_pipe_id == Some(pipe_id)
-                    || (f.pipe_id == Some(pipe_id)
-                        && f.writable
-                        && f.sock_write_pipe_id.is_none());
+                let (is_read_end, is_write_end) = if let Some(sid) = f.tcp_socket_id {
+                    match tcp_sockets.get(&sid).map(|s| &s.state) {
+                        Some(TcpSocketState::Connected {
+                            read_pipe_id,
+                            write_pipe_id,
+                            ..
+                        }) => (*read_pipe_id == pipe_id, *write_pipe_id == pipe_id),
+                        _ => (false, false),
+                    }
+                } else {
+                    let is_r = f.pipe_id == Some(pipe_id)
+                        && (f.sock_write_pipe_id.is_some() || !f.writable);
+                    let is_w = f.sock_write_pipe_id == Some(pipe_id)
+                        || (f.pipe_id == Some(pipe_id)
+                            && f.writable
+                            && f.sock_write_pipe_id.is_none());
+                    (is_r, is_w)
+                };
                 let mut mask = 0u16;
                 if is_read_end {
                     mask |= read_clear_mask;
@@ -1286,6 +1394,34 @@ impl HostState {
             for &(fd, mask) in &fd_masks {
                 if let Some(entry) = inst.entries.get_mut(&fd) {
                     entry.last_reported_revents &= !mask;
+                }
+            }
+        }
+    }
+
+    fn rearm_epoll_for_listener(&mut self, listener_sid: u64) {
+        if self.vfs.epolls.is_empty() {
+            return;
+        }
+        let mut matched_fds: Vec<i32> = Vec::new();
+        let mut collect_from = |fds: &BTreeMap<i32, OpenFile>| {
+            for (&fd, f) in fds {
+                if f.tcp_socket_id == Some(listener_sid) {
+                    matched_fds.push(fd);
+                }
+            }
+        };
+        collect_from(&self.vfs.fds);
+        for (&pid, proc) in &self.processes {
+            if pid != self.active_pid {
+                collect_from(&proc.fds);
+            }
+        }
+        let clear_mask = (POLLIN | POLLHUP | POLLERR) as u16;
+        for inst in self.vfs.epolls.values_mut() {
+            for &fd in &matched_fds {
+                if let Some(entry) = inst.entries.get_mut(&fd) {
+                    entry.last_reported_revents &= !clear_mask;
                 }
             }
         }
@@ -1340,6 +1476,7 @@ impl HostState {
                 wake_in_sched(&mut p.scheduler);
             }
         }
+        self.wake_ready_waiters();
     }
 
     fn poll_fds_ref(&self, pid: i32) -> &BTreeMap<i32, OpenFile> {
@@ -1354,6 +1491,85 @@ impl HostState {
         let Some(f) = fds.get(&fd) else {
             return POLLNVAL;
         };
+        if let Some(sid) = f.tcp_socket_id {
+            let Some(sock) = self.vfs.tcp_sockets.get(&sid) else {
+                return POLLHUP;
+            };
+            return match &sock.state {
+                TcpSocketState::Listening { pending, .. } => {
+                    if !pending.is_empty() && (events & POLLIN) != 0 {
+                        POLLIN
+                    } else {
+                        0
+                    }
+                }
+                TcpSocketState::Connected {
+                    read_pipe_id,
+                    write_pipe_id,
+                    shut_rd,
+                    shut_wr,
+                    ..
+                } => {
+                    let mut revents = 0i16;
+                    let peer_wr_closed = if *shut_rd {
+                        true
+                    } else {
+                        match self.vfs.pipes.get(read_pipe_id) {
+                            Some(p) => {
+                                if !p.buf.is_empty() && (events & POLLIN) != 0 {
+                                    revents |= POLLIN;
+                                }
+                                p.writers == 0
+                            }
+                            None => true,
+                        }
+                    };
+                    if peer_wr_closed {
+                        if (events & POLLIN) != 0 {
+                            revents |= POLLIN;
+                        }
+                        if (events & POLLRDHUP) != 0 {
+                            revents |= POLLRDHUP;
+                        }
+                    }
+                    let peer_rd_closed = if *shut_wr {
+                        true
+                    } else {
+                        match self.vfs.pipes.get(write_pipe_id) {
+                            Some(p) => {
+                                if p.readers == 0 {
+                                    revents |= POLLERR;
+                                    if (events & POLLOUT) != 0 {
+                                        revents |= POLLOUT;
+                                    }
+                                    true
+                                } else {
+                                    if p.buf.len() < p.capacity && (events & POLLOUT) != 0 {
+                                        revents |= POLLOUT;
+                                    }
+                                    false
+                                }
+                            }
+                            None => {
+                                revents |= POLLERR;
+                                true
+                            }
+                        }
+                    };
+                    if peer_wr_closed && peer_rd_closed {
+                        revents |= POLLHUP;
+                    }
+                    revents
+                }
+                TcpSocketState::Unbound | TcpSocketState::Bound { .. } => {
+                    let mut revents = POLLHUP;
+                    if (events & POLLOUT) != 0 {
+                        revents |= POLLOUT;
+                    }
+                    revents
+                }
+            };
+        }
         if let Some(wpid) = f.sock_write_pipe_id {
             let mut revents = 0i16;
             if let Some(rpid) = f.pipe_id {
@@ -1652,7 +1868,12 @@ impl HostState {
                         waitid_infop,
                     } => {
                         let (has_child, zombie_pid) = self.find_wait_status(pid, target_pid);
-                        if !has_child || zombie_pid.is_some() {
+                        let matched_zombie = if waitid_infop.is_some() && (options & WEXITED) == 0 {
+                            None
+                        } else {
+                            zombie_pid
+                        };
+                        if !has_child || matched_zombie.is_some() {
                             Some(PendingWakeup::Wait4 {
                                 target_pid,
                                 wstatus_addr,
@@ -1669,6 +1890,30 @@ impl HostState {
                             Some(PendingWakeup::Poll {
                                 kind,
                                 timed_out: false,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    ThreadState::AcceptWait {
+                        listener_socket_id,
+                        addr_ptr,
+                        addrlen_ptr,
+                        flags,
+                    } => {
+                        let ready = match self.vfs.tcp_sockets.get(&listener_socket_id) {
+                            Some(s) => match &s.state {
+                                TcpSocketState::Listening { pending, .. } => !pending.is_empty(),
+                                _ => true,
+                            },
+                            None => true,
+                        };
+                        if ready {
+                            Some(PendingWakeup::Accept {
+                                listener_socket_id,
+                                addr_ptr,
+                                addrlen_ptr,
+                                flags,
                             })
                         } else {
                             None
@@ -1822,35 +2067,20 @@ impl HostState {
             PendingWakeup::Wait4 {
                 target_pid,
                 wstatus_addr,
-                options: _,
+                options,
                 rusage_addr,
                 waitid_infop,
             } => {
                 let (has_child, zombie_pid) = self.find_wait_status(self.active_pid, target_pid);
-                if let Some(zpid) = zombie_pid {
+                let matched_zombie = if waitid_infop.is_some() && (options & WEXITED) == 0 {
+                    None
+                } else {
+                    zombie_pid
+                };
+                if let Some(zpid) = matched_zombie {
                     let ret = if let Some(infop) = waitid_infop {
-                        let exit_status = self
-                            .processes
-                            .get(&zpid)
-                            .map(|c| c.exit_status)
-                            .unwrap_or(0);
-                        match self.reap_child(ctx, zpid, 0, rusage_addr) {
-                            Ok(_) => {
-                                if infop != 0 {
-                                    let mut si = [0u8; 128];
-                                    si[0..4].copy_from_slice(&17i32.to_le_bytes()); // si_signo = SIGCHLD
-                                    si[8..12].copy_from_slice(&1i32.to_le_bytes()); // si_code = CLD_EXITED
-                                    si[16..20].copy_from_slice(&zpid.to_le_bytes()); // si_pid
-                                    si[20..24].copy_from_slice(&self.uid.to_le_bytes()); // si_uid
-                                    si[24..28].copy_from_slice(&((exit_status >> 8) & 0xff).to_le_bytes());
-                                    match write_bytes(ctx, infop, &si) {
-                                        Ok(()) => 0,
-                                        Err(e) => e,
-                                    }
-                                } else {
-                                    0
-                                }
-                            }
+                        match self.finish_waitid(ctx, zpid, options, infop, rusage_addr) {
+                            Ok(r) => r,
                             Err(e) => e,
                         }
                     } else {
@@ -1873,7 +2103,7 @@ impl HostState {
                         t.state = ThreadState::Wait4Wait {
                             target_pid,
                             wstatus_addr,
-                            options: 0,
+                            options,
                             rusage_addr,
                             waitid_infop,
                         };
@@ -1887,6 +2117,86 @@ impl HostState {
                     t.set_rax(ret);
                 }
                 Ok(true)
+            }
+            PendingWakeup::Accept {
+                listener_socket_id,
+                addr_ptr,
+                addrlen_ptr,
+                flags,
+            } => {
+                let popped = match self.vfs.tcp_sockets.get_mut(&listener_socket_id) {
+                    Some(sock) => match &mut sock.state {
+                        TcpSocketState::Listening { pending, .. } => Ok(pending.pop_front()),
+                        _ => Err(-EINVAL),
+                    },
+                    None => Err(-EBADF),
+                };
+                match popped {
+                    Err(e) => {
+                        if let Some(t) = self.scheduler.threads.get_mut(&cur_tid) {
+                            t.set_rax(e);
+                        }
+                        Ok(true)
+                    }
+                    Ok(None) => {
+                        if let Some(t) = self.scheduler.threads.get_mut(&cur_tid) {
+                            t.state = ThreadState::AcceptWait {
+                                listener_socket_id,
+                                addr_ptr,
+                                addrlen_ptr,
+                                flags,
+                            };
+                        }
+                        Ok(false)
+                    }
+                    Ok(Some(child_sid)) => {
+                        let peer = self.vfs.tcp_sockets.get(&child_sid).and_then(|s| match s.state {
+                            TcpSocketState::Connected {
+                                peer_ip, peer_port, ..
+                            } => Some((peer_ip, peer_port)),
+                            _ => None,
+                        });
+                        if let Some((peer_ip, peer_port)) = peer {
+                            if let Err(e) =
+                                write_sockaddr_in(ctx, addr_ptr, addrlen_ptr, peer_ip, peer_port)
+                            {
+                                if let Some(sock) = self.vfs.tcp_sockets.get_mut(&listener_socket_id)
+                                {
+                                    if let TcpSocketState::Listening { pending, .. } =
+                                        &mut sock.state
+                                    {
+                                        pending.push_front(child_sid);
+                                    }
+                                }
+                                if let Some(t) = self.scheduler.threads.get_mut(&cur_tid) {
+                                    t.set_rax(e);
+                                }
+                                return Ok(true);
+                            }
+                        }
+                        let cloexec = (flags & SOCK_CLOEXEC) != 0;
+                        let nonblock = (flags & SOCK_NONBLOCK) != 0;
+                        let ret = match self.vfs.alloc_fd_for_tcp_socket(child_sid, cloexec, nonblock)
+                        {
+                            Ok(fd) => fd as i64,
+                            Err(e) => {
+                                if let Some(sock) = self.vfs.tcp_sockets.get_mut(&listener_socket_id)
+                                {
+                                    if let TcpSocketState::Listening { pending, .. } =
+                                        &mut sock.state
+                                    {
+                                        pending.push_front(child_sid);
+                                    }
+                                }
+                                e
+                            }
+                        };
+                        if let Some(t) = self.scheduler.threads.get_mut(&cur_tid) {
+                            t.set_rax(ret);
+                        }
+                        Ok(true)
+                    }
+                }
             }
         }
     }
@@ -2513,8 +2823,25 @@ fn read_into_guest(
         }
     }
     if let Some(f) = state.vfs.get_fd(fd).cloned() {
-        if let Some(pipe_id) = f.pipe_id {
-            if f.writable && f.sock_write_pipe_id.is_none() {
+        let tcp_read_pipe = if let Some(sid) = f.tcp_socket_id {
+            match state.vfs.tcp_sockets.get(&sid).map(|s| &s.state) {
+                Some(TcpSocketState::Connected {
+                    read_pipe_id,
+                    shut_rd,
+                    ..
+                }) => {
+                    if *shut_rd {
+                        return 0;
+                    }
+                    Some(*read_pipe_id)
+                }
+                _ => return -ENOTCONN,
+            }
+        } else {
+            None
+        };
+        if let Some(pipe_id) = tcp_read_pipe.or(f.pipe_id) {
+            if tcp_read_pipe.is_none() && f.writable && f.sock_write_pipe_id.is_none() {
                 return -EBADF;
             }
             if count == 0 {
@@ -2596,6 +2923,139 @@ fn read_into_guest(
     }
 }
 
+fn notify_fd_close_events(
+    state: &mut HostState,
+    affected_pipes: Vec<u64>,
+    closed_listeners: Vec<u64>,
+) {
+    for pid in affected_pipes {
+        state.wake_pipe_waiters(pid, PipeEvent::Close);
+    }
+    for lsid in closed_listeners {
+        state.rearm_epoll_for_listener(lsid);
+        state.wake_ready_waiters();
+    }
+}
+
+fn readv_into_guest(
+    ctx: &mut dyn GuestContext,
+    state: &mut HostState,
+    fd: i32,
+    iovs: &[(u64, usize)],
+) -> i64 {
+    if iovs.is_empty() {
+        return 0;
+    }
+    // If only a single non-empty iovec, delegate directly so blocking pipes/stdin work seamlessly
+    if iovs.len() == 1 {
+        return read_into_guest(ctx, state, fd, iovs[0].0, iovs[0].1);
+    }
+    let first = iovs[0];
+    let mut total_read = 0usize;
+    for &(base, len) in iovs {
+        if let Some(f) = state.vfs.get_fd(fd).cloned() {
+            let tcp_read_pipe = if let Some(sid) = f.tcp_socket_id {
+                match state.vfs.tcp_sockets.get(&sid).map(|s| &s.state) {
+                    Some(TcpSocketState::Connected {
+                        read_pipe_id,
+                        shut_rd,
+                        ..
+                    }) => {
+                        if *shut_rd {
+                            break;
+                        }
+                        Some(*read_pipe_id)
+                    }
+                    _ => return if total_read > 0 { total_read as i64 } else { -ENOTCONN },
+                }
+            } else {
+                None
+            };
+            if let Some(pipe_id) = tcp_read_pipe.or(f.pipe_id) {
+                if tcp_read_pipe.is_none() && f.writable && f.sock_write_pipe_id.is_none() {
+                    return -EBADF;
+                }
+                let (drained, writers, was_full) = match state.vfs.pipes.get_mut(&pipe_id) {
+                    Some(p) => {
+                        let was_full = p.buf.len() >= p.capacity;
+                        let n = len.min(p.buf.len());
+                        let mut d = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            if let Some(b) = p.buf.pop_front() {
+                                d.push(b);
+                            }
+                        }
+                        (d, p.writers, was_full)
+                    }
+                    None => (Vec::new(), 0, false),
+                };
+                if !drained.is_empty() {
+                    if let Err(e) = write_bytes(ctx, base, &drained) {
+                        return if total_read > 0 { total_read as i64 } else { e };
+                    }
+                    state.wake_pipe_waiters(pipe_id, PipeEvent::Read { was_full });
+                    total_read += drained.len();
+                    if drained.len() < len {
+                        break;
+                    }
+                    continue;
+                }
+                if total_read > 0 || writers == 0 {
+                    break;
+                }
+                if f.nonblock {
+                    return -EAGAIN;
+                }
+                state.scheduler.current_thread_mut().state = ThreadState::PipeReadWait {
+                    pipe_id,
+                    buf_addr: first.0,
+                    count: first.1,
+                };
+                ctx.set_yield_flag(1);
+                return 0;
+            }
+            if (f.is_std == Some(0) || f.dev == Some(VirtualDevice::Tty))
+                && !state.vfs.inherit_stdin
+                && state.vfs.stdin_available() == 0
+            {
+                if total_read > 0 || state.vfs.stdin_eof {
+                    break;
+                }
+                if f.nonblock {
+                    return -EAGAIN;
+                }
+                state.scheduler.current_thread_mut().state = ThreadState::StdinReadWait {
+                    buf_addr: first.0,
+                    count: first.1,
+                };
+                ctx.set_yield_flag(1);
+                return 0;
+            }
+        }
+        match state.vfs.read_no_advance(fd, len) {
+            Ok((bytes, host_consumed)) => {
+                if bytes.is_empty() {
+                    break;
+                }
+                if let Err(e) = write_bytes(ctx, base, &bytes) {
+                    return if total_read > 0 { total_read as i64 } else { e };
+                }
+                if !host_consumed {
+                    state.vfs.advance_read_cursor(fd, bytes.len());
+                }
+                total_read += bytes.len();
+                if bytes.len() < len {
+                    break;
+                }
+            }
+            Err(e) => {
+                return if total_read > 0 { total_read as i64 } else { e };
+            }
+        }
+    }
+    total_read as i64
+}
+
 fn handle_syscall_inner(
     ctx: &mut dyn GuestContext,
     state: &mut HostState,
@@ -2652,97 +3112,7 @@ fn handle_syscall_inner(
             if total_req == 0 {
                 return 0;
             }
-            // If only a single non-empty iovec, delegate directly so blocking pipes/stdin work seamlessly
-            if iovs.len() == 1 {
-                return read_into_guest(ctx, state, fd, iovs[0].0, iovs[0].1);
-            }
-            let first = iovs[0];
-            let mut total_read = 0usize;
-            for (base, len) in iovs {
-                if let Some(f) = state.vfs.get_fd(fd).cloned() {
-                    if let Some(pipe_id) = f.pipe_id {
-                        if f.writable && f.sock_write_pipe_id.is_none() {
-                            return -EBADF;
-                        }
-                        let (drained, writers, was_full) = match state.vfs.pipes.get_mut(&pipe_id) {
-                            Some(p) => {
-                                let was_full = p.buf.len() >= p.capacity;
-                                let n = len.min(p.buf.len());
-                                let mut d = Vec::with_capacity(n);
-                                for _ in 0..n {
-                                    if let Some(b) = p.buf.pop_front() {
-                                        d.push(b);
-                                    }
-                                }
-                                (d, p.writers, was_full)
-                            }
-                            None => (Vec::new(), 0, false),
-                        };
-                        if !drained.is_empty() {
-                            if let Err(e) = write_bytes(ctx, base, &drained) {
-                                return if total_read > 0 { total_read as i64 } else { e };
-                            }
-                            state.wake_pipe_waiters(pipe_id, PipeEvent::Read { was_full });
-                            total_read += drained.len();
-                            if drained.len() < len {
-                                break;
-                            }
-                            continue;
-                        }
-                        if total_read > 0 || writers == 0 {
-                            break;
-                        }
-                        if f.nonblock {
-                            return -EAGAIN;
-                        }
-                        state.scheduler.current_thread_mut().state = ThreadState::PipeReadWait {
-                            pipe_id,
-                            buf_addr: first.0,
-                            count: first.1,
-                        };
-                        ctx.set_yield_flag(1);
-                        return 0;
-                    }
-                    if (f.is_std == Some(0) || f.dev == Some(VirtualDevice::Tty))
-                        && !state.vfs.inherit_stdin
-                        && state.vfs.stdin_available() == 0
-                    {
-                        if total_read > 0 || state.vfs.stdin_eof {
-                            break;
-                        }
-                        if f.nonblock {
-                            return -EAGAIN;
-                        }
-                        state.scheduler.current_thread_mut().state = ThreadState::StdinReadWait {
-                            buf_addr: first.0,
-                            count: first.1,
-                        };
-                        ctx.set_yield_flag(1);
-                        return 0;
-                    }
-                }
-                match state.vfs.read_no_advance(fd, len) {
-                    Ok((bytes, host_consumed)) => {
-                        if bytes.is_empty() {
-                            break;
-                        }
-                        if let Err(e) = write_bytes(ctx, base, &bytes) {
-                            return if total_read > 0 { total_read as i64 } else { e };
-                        }
-                        if !host_consumed {
-                            state.vfs.advance_read_cursor(fd, bytes.len());
-                        }
-                        total_read += bytes.len();
-                        if bytes.len() < len {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        return if total_read > 0 { total_read as i64 } else { e };
-                    }
-                }
-            }
-            total_read as i64
+            readv_into_guest(ctx, state, fd, &iovs)
         }
         SYS_PREAD64 => {
             let fd = a0 as i32;
@@ -2791,10 +3161,11 @@ fn handle_syscall_inner(
             if iovcnt < 0 || iovcnt > 1024 {
                 return -EINVAL;
             }
-            let is_pipe = state
-                .vfs
-                .get_fd(fd)
-                .map_or(false, |f| f.pipe_id.is_some());
+            let is_pipe = state.vfs.get_fd(fd).map_or(false, |f| {
+                f.pipe_id.is_some()
+                    || f.sock_write_pipe_id.is_some()
+                    || f.tcp_socket_id.is_some()
+            });
             if is_pipe {
                 let mut combined = Vec::new();
                 for i in 0..(iovcnt as u64) {
@@ -2881,18 +3252,9 @@ fn handle_syscall_inner(
         }
         SYS_CLOSE => {
             let fd = a0 as i32;
-            let (pipe_id, sock_wpid) = state
-                .vfs
-                .get_fd(fd)
-                .map_or((None, None), |f| (f.pipe_id, f.sock_write_pipe_id));
-            let ret = state.vfs.close(fd);
+            let (ret, affected_pipes, closed_listeners) = state.vfs.close_with_events(fd);
             if ret == 0 {
-                if let Some(pid) = pipe_id {
-                    state.wake_pipe_waiters(pid, PipeEvent::Close);
-                }
-                if let Some(wpid) = sock_wpid {
-                    state.wake_pipe_waiters(wpid, PipeEvent::Close);
-                }
+                notify_fd_close_events(state, affected_pipes, closed_listeners);
             }
             ret
         }
@@ -3107,19 +3469,36 @@ fn handle_syscall_inner(
                 return target as i64;
             }
 
-            let (file_data, so_base, is_dir, is_std_or_pipe) = match state.vfs.get_fd(fd) {
-                Some(f) => (
-                    f.data.clone(),
-                    f.so_base_addr,
-                    f.is_dir,
-                    f.is_std.is_some() || f.is_pipe || f.sock_write_pipe_id.is_some(),
-                ),
-                None => return -EBADF,
-            };
+            let (file_data, so_base, is_dir, is_std_or_pipe, writable, guest_path, unlinked) =
+                match state.vfs.get_fd(fd) {
+                    Some(f) => {
+                        let data = state
+                            .vfs
+                            .read_latest_fd_data(fd)
+                            .unwrap_or_else(|| f.data.clone());
+                        (
+                            data,
+                            f.so_base_addr,
+                            f.is_dir,
+                            f.is_std.is_some()
+                                || f.is_pipe
+                                || f.sock_write_pipe_id.is_some()
+                                || f.tcp_socket_id.is_some(),
+                            f.writable,
+                            f.guest_path.clone(),
+                            f.unlinked,
+                        )
+                    }
+                    None => return -EBADF,
+                };
             if is_dir || is_std_or_pipe {
                 return -EACCES;
             }
             if (prot & PROT_EXEC) != 0 && so_base.is_none() {
+                return -EACCES;
+            }
+            let is_shared_write = (flags & MAP_SHARED) != 0 && (prot & PROT_WRITE) != 0;
+            if is_shared_write && !writable {
                 return -EACCES;
             }
             let Ok(offset) = usize::try_from(offset_u64) else {
@@ -3169,10 +3548,54 @@ fn handle_syscall_inner(
                     return e;
                 }
             }
+            if is_shared_write && !unlinked && so_base.is_none() {
+                state.mmap_alloc.shared_mmaps.push(SharedMmap {
+                    addr: target,
+                    len,
+                    guest_path,
+                    file_offset: offset,
+                });
+            }
             state
                 .mmap_alloc
                 .remove_prot_none_range(target, target.saturating_add(aligned));
             target as i64
+        }
+        SYS_MSYNC => {
+            let addr_u64 = a0 as u64;
+            let len_u64 = a1 as u64;
+            if (addr_u64 & 0xfff) != 0 {
+                return -EINVAL;
+            }
+            let Ok(addr) = u32::try_from(addr_u64) else {
+                return -ENOMEM;
+            };
+            let end = addr.saturating_add(u32::try_from(len_u64).unwrap_or(u32::MAX));
+            let to_flush: Vec<SharedMmap> = state
+                .mmap_alloc
+                .shared_mmaps
+                .iter()
+                .filter(|sm| {
+                    let sm_end = sm.addr.saturating_add(sm.len as u32);
+                    sm.addr < end && sm_end > addr
+                })
+                .cloned()
+                .collect();
+            for sm in &to_flush {
+                if let Ok(bytes) = read_bytes(ctx, sm.addr as u64, sm.len) {
+                    state
+                        .vfs
+                        .write_overlay_range(&sm.guest_path, sm.file_offset, &bytes, now_ns);
+                }
+            }
+            0
+        }
+        SYS_FALLOCATE => {
+            let fd = a0 as i32;
+            let mode = a1 as i32;
+            let offset = a2;
+            let len = a3;
+            state.vfs.fallocate(fd, mode, offset, len, now_ns)
         }
         SYS_MPROTECT => {
             let addr_u64 = a0 as u64;
@@ -3207,6 +3630,54 @@ fn handle_syscall_inner(
             let Some(aligned) = align_up_4k(len_u32).filter(|&v| v > 0) else {
                 return -EINVAL;
             };
+            let unmap_end = addr.saturating_add(aligned);
+            let mut remaining = Vec::with_capacity(state.mmap_alloc.shared_mmaps.len());
+            let mut to_flush = Vec::new();
+            for sm in state.mmap_alloc.shared_mmaps.drain(..) {
+                let sm_end = sm.addr.saturating_add(sm.len as u32);
+                if sm.addr < unmap_end && sm_end > addr {
+                    let ov_start = sm.addr.max(addr);
+                    let ov_end = sm_end.min(unmap_end);
+                    let ov_len = (ov_end - ov_start) as usize;
+                    let ov_file_offset = sm
+                        .file_offset
+                        .saturating_add((ov_start - sm.addr) as usize);
+                    to_flush.push(SharedMmap {
+                        addr: ov_start,
+                        len: ov_len,
+                        guest_path: sm.guest_path.clone(),
+                        file_offset: ov_file_offset,
+                    });
+                    if ov_start > sm.addr {
+                        remaining.push(SharedMmap {
+                            addr: sm.addr,
+                            len: (ov_start - sm.addr) as usize,
+                            guest_path: sm.guest_path.clone(),
+                            file_offset: sm.file_offset,
+                        });
+                    }
+                    if ov_end < sm_end {
+                        remaining.push(SharedMmap {
+                            addr: ov_end,
+                            len: (sm_end - ov_end) as usize,
+                            guest_path: sm.guest_path,
+                            file_offset: sm
+                                .file_offset
+                                .saturating_add((ov_end - sm.addr) as usize),
+                        });
+                    }
+                } else {
+                    remaining.push(sm);
+                }
+            }
+            state.mmap_alloc.shared_mmaps = remaining;
+            for sm in &to_flush {
+                if let Ok(bytes) = read_bytes(ctx, sm.addr as u64, sm.len) {
+                    state
+                        .vfs
+                        .write_overlay_range(&sm.guest_path, sm.file_offset, &bytes, now_ns);
+                }
+            }
             state.mmap_alloc.free(addr, aligned);
             0
         }
@@ -3534,39 +4005,50 @@ fn handle_syscall_inner(
             let infop = a2 as u64;
             let options = a3 as i32;
             let rusage_addr = a4 as u64;
+            if (options & (WEXITED | WSTOPPED | WCONTINUED)) == 0 {
+                return -EINVAL;
+            }
             let target_pid = match idtype {
-                0 => -1,           // P_ALL
-                1 => id.max(1),    // P_PID
-                2 => -id.max(1),   // P_PGID
+                0 => -1, // P_ALL
+                1 => {
+                    // P_PID
+                    if id <= 0 {
+                        return -EINVAL;
+                    }
+                    id
+                }
+                2 => {
+                    // P_PGID
+                    if id < 0 {
+                        return -EINVAL;
+                    } else if id == 0 {
+                        0
+                    } else {
+                        -id
+                    }
+                }
                 _ => return -EINVAL,
             };
             let (has_child, zombie_pid) = state.find_wait_status(state.active_pid, target_pid);
             if !has_child {
                 return -ECHILD;
             }
-            if let Some(zpid) = zombie_pid {
-                let exit_status = state
-                    .processes
-                    .get(&zpid)
-                    .map(|c| c.exit_status)
-                    .unwrap_or(0);
-                let _ = state.reap_child(ctx, zpid, 0, rusage_addr);
-                if infop != 0 {
-                    let mut si = [0u8; 128];
-                    si[0..4].copy_from_slice(&17i32.to_le_bytes()); // si_signo = SIGCHLD
-                    si[8..12].copy_from_slice(&1i32.to_le_bytes()); // si_code = CLD_EXITED
-                    si[16..20].copy_from_slice(&zpid.to_le_bytes()); // si_pid
-                    si[20..24].copy_from_slice(&state.uid.to_le_bytes()); // si_uid
-                    si[24..28].copy_from_slice(&((exit_status >> 8) & 0xff).to_le_bytes());
-                    if let Err(e) = write_bytes(ctx, infop, &si) {
-                        return e;
-                    }
-                }
-                return 0;
+            let matched_zombie = if (options & WEXITED) != 0 {
+                zombie_pid
+            } else {
+                None
+            };
+            if let Some(zpid) = matched_zombie {
+                return match state.finish_waitid(ctx, zpid, options, infop, rusage_addr) {
+                    Ok(r) => r,
+                    Err(e) => e,
+                };
             }
             if (options & WNOHANG) != 0 {
                 if infop != 0 {
-                    let _ = write_bytes(ctx, infop, &[0u8; 128]);
+                    if let Err(e) = write_bytes(ctx, infop, &[0u8; 128]) {
+                        return e;
+                    }
                 }
                 return 0;
             }
@@ -3897,7 +4379,557 @@ fn handle_syscall_inner(
                 Err(e) => e,
             }
         }
-        SYS_SOCKET => -EAFNOSUPPORT,
+        SYS_SOCKET => {
+            let domain = a0 as i32;
+            let sock_type = a1 as i32;
+            let protocol = a2 as i32;
+            if domain != AF_INET {
+                return -EAFNOSUPPORT;
+            }
+            let base_type = sock_type & 0xff;
+            if base_type != SOCK_STREAM {
+                return -EPROTONOSUPPORT;
+            }
+            if protocol != 0 && protocol != IPPROTO_TCP {
+                return -EPROTONOSUPPORT;
+            }
+            let cloexec = (sock_type & SOCK_CLOEXEC) != 0;
+            let nonblock = (sock_type & SOCK_NONBLOCK) != 0;
+            match state.vfs.create_tcp_socket(cloexec, nonblock) {
+                Ok(fd) => fd as i64,
+                Err(e) => e,
+            }
+        }
+        SYS_BIND => {
+            let fd = a0 as i32;
+            let addr = a1 as u64;
+            let addrlen = a2 as u32;
+            let Some(f) = state.vfs.get_fd(fd) else {
+                return -EBADF;
+            };
+            let Some(sid) = f.tcp_socket_id else {
+                return -ENOTSOCK;
+            };
+            let (ip, req_port) = match read_sockaddr_in(ctx, addr, addrlen) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            if ip != 0 && ip != 0x7f00_0001 {
+                return -EADDRNOTAVAIL;
+            }
+            let is_unbound = matches!(
+                state.vfs.tcp_sockets.get(&sid).map(|s| &s.state),
+                Some(TcpSocketState::Unbound)
+            );
+            if !is_unbound {
+                return -EINVAL;
+            }
+            let port = if req_port == 0 {
+                match state.vfs.alloc_ephemeral_port() {
+                    Ok(p) => p,
+                    Err(e) => return e,
+                }
+            } else {
+                if state.vfs.tcp_bound_ports.contains_key(&req_port)
+                    || state.vfs.tcp_listeners.contains_key(&req_port)
+                {
+                    return -EADDRINUSE;
+                }
+                req_port
+            };
+            state.vfs.tcp_bound_ports.insert(port, sid);
+            if let Some(sock) = state.vfs.tcp_sockets.get_mut(&sid) {
+                sock.state = TcpSocketState::Bound {
+                    local_ip: ip,
+                    local_port: port,
+                };
+            }
+            0
+        }
+        SYS_LISTEN => {
+            let fd = a0 as i32;
+            let backlog = a1 as i32;
+            let Some(f) = state.vfs.get_fd(fd) else {
+                return -EBADF;
+            };
+            let Some(sid) = f.tcp_socket_id else {
+                return -ENOTSOCK;
+            };
+            let backlog_limit = backlog.clamp(1, 1024) as usize;
+            let cur_state = match state.vfs.tcp_sockets.get(&sid) {
+                Some(s) => s.state.clone(),
+                None => return -EBADF,
+            };
+            match cur_state {
+                TcpSocketState::Unbound => {
+                    let port = match state.vfs.alloc_ephemeral_port() {
+                        Ok(p) => p,
+                        Err(e) => return e,
+                    };
+                    state.vfs.tcp_bound_ports.insert(port, sid);
+                    state.vfs.tcp_listeners.insert(port, sid);
+                    if let Some(sock) = state.vfs.tcp_sockets.get_mut(&sid) {
+                        sock.state = TcpSocketState::Listening {
+                            local_ip: 0,
+                            local_port: port,
+                            backlog_limit,
+                            pending: std::collections::VecDeque::new(),
+                        };
+                    }
+                    0
+                }
+                TcpSocketState::Bound {
+                    local_ip,
+                    local_port,
+                } => {
+                    state.vfs.tcp_listeners.insert(local_port, sid);
+                    if let Some(sock) = state.vfs.tcp_sockets.get_mut(&sid) {
+                        sock.state = TcpSocketState::Listening {
+                            local_ip,
+                            local_port,
+                            backlog_limit,
+                            pending: std::collections::VecDeque::new(),
+                        };
+                    }
+                    0
+                }
+                TcpSocketState::Listening { .. } => {
+                    if let Some(sock) = state.vfs.tcp_sockets.get_mut(&sid) {
+                        if let TcpSocketState::Listening {
+                            backlog_limit: ref mut lim,
+                            ..
+                        } = sock.state
+                        {
+                            *lim = backlog_limit;
+                        }
+                    }
+                    0
+                }
+                TcpSocketState::Connected { .. } => -EINVAL,
+            }
+        }
+        SYS_ACCEPT => do_accept(ctx, state, a0 as i32, a1 as u64, a2 as u64, 0),
+        SYS_ACCEPT4 => do_accept(ctx, state, a0 as i32, a1 as u64, a2 as u64, a3 as i32),
+        SYS_CONNECT => {
+            let fd = a0 as i32;
+            let addr = a1 as u64;
+            let addrlen = a2 as u32;
+            let Some(f) = state.vfs.get_fd(fd) else {
+                return -EBADF;
+            };
+            let Some(sid) = f.tcp_socket_id else {
+                return -ENOTSOCK;
+            };
+            let (raw_peer_ip, peer_port) = match read_sockaddr_in(ctx, addr, addrlen) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            if raw_peer_ip != 0 && raw_peer_ip != 0x7f00_0001 {
+                return -ENETUNREACH;
+            }
+            let peer_ip = 0x7f00_0001u32;
+            if peer_port == 0 {
+                return -ECONNREFUSED;
+            }
+            let (client_ip, client_port, bound_port_to_release) = match state
+                .vfs
+                .tcp_sockets
+                .get(&sid)
+                .map(|s| &s.state)
+            {
+                Some(TcpSocketState::Unbound) => {
+                    let p = match state.vfs.alloc_ephemeral_port() {
+                        Ok(p) => p,
+                        Err(e) => return e,
+                    };
+                    (0x7f00_0001u32, p, None)
+                }
+                Some(TcpSocketState::Bound {
+                    local_ip,
+                    local_port,
+                }) => {
+                    let ip = if *local_ip == 0 {
+                        0x7f00_0001u32
+                    } else {
+                        *local_ip
+                    };
+                    (ip, *local_port, Some(*local_port))
+                }
+                Some(TcpSocketState::Connected { .. }) => return -EISCONN,
+                Some(TcpSocketState::Listening { .. }) => return -EINVAL,
+                None => return -EBADF,
+            };
+            let Some(&listener_sid) = state.vfs.tcp_listeners.get(&peer_port) else {
+                return -ECONNREFUSED;
+            };
+            let has_backlog_room = match state.vfs.tcp_sockets.get(&listener_sid).map(|s| &s.state)
+            {
+                Some(TcpSocketState::Listening {
+                    backlog_limit,
+                    pending,
+                    ..
+                }) => pending.len() < *backlog_limit,
+                _ => false,
+            };
+            if !has_backlog_room {
+                return -ECONNREFUSED;
+            }
+            let c2s_pipe = state.vfs.next_pipe_id;
+            state.vfs.next_pipe_id += 1;
+            let s2c_pipe = state.vfs.next_pipe_id;
+            state.vfs.next_pipe_id += 1;
+            state.vfs.pipes.insert(c2s_pipe, PipeBuffer::new());
+            state.vfs.pipes.insert(s2c_pipe, PipeBuffer::new());
+
+            let server_sid = state.vfs.next_tcp_socket_id;
+            state.vfs.next_tcp_socket_id += 1;
+            state.vfs.tcp_sockets.insert(
+                server_sid,
+                TcpSocket::new(TcpSocketState::Connected {
+                    local_ip: peer_ip,
+                    local_port: peer_port,
+                    peer_ip: client_ip,
+                    peer_port: client_port,
+                    read_pipe_id: c2s_pipe,
+                    write_pipe_id: s2c_pipe,
+                    shut_rd: false,
+                    shut_wr: false,
+                }),
+            );
+            if let Some(p) = bound_port_to_release {
+                if state.vfs.tcp_bound_ports.get(&p) == Some(&sid) {
+                    state.vfs.tcp_bound_ports.remove(&p);
+                }
+            }
+            if let Some(sock) = state.vfs.tcp_sockets.get_mut(&sid) {
+                sock.so_error = 0;
+                sock.state = TcpSocketState::Connected {
+                    local_ip: client_ip,
+                    local_port: client_port,
+                    peer_ip,
+                    peer_port,
+                    read_pipe_id: s2c_pipe,
+                    write_pipe_id: c2s_pipe,
+                    shut_rd: false,
+                    shut_wr: false,
+                };
+            }
+            if let Some(listener) = state.vfs.tcp_sockets.get_mut(&listener_sid) {
+                if let TcpSocketState::Listening { pending, .. } = &mut listener.state {
+                    pending.push_back(server_sid);
+                }
+            }
+            state.rearm_epoll_for_listener(listener_sid);
+            state.wake_ready_waiters();
+            0
+        }
+        SYS_GETSOCKNAME => {
+            let fd = a0 as i32;
+            let addr_ptr = a1 as u64;
+            let addrlen_ptr = a2 as u64;
+            let Some(f) = state.vfs.get_fd(fd) else {
+                return -EBADF;
+            };
+            let Some(sid) = f.tcp_socket_id else {
+                return -ENOTSOCK;
+            };
+            let (ip, port) = match state.vfs.tcp_sockets.get(&sid).map(|s| &s.state) {
+                Some(TcpSocketState::Unbound) => (0u32, 0u16),
+                Some(TcpSocketState::Bound {
+                    local_ip,
+                    local_port,
+                }) => (*local_ip, *local_port),
+                Some(TcpSocketState::Listening {
+                    local_ip,
+                    local_port,
+                    ..
+                }) => (*local_ip, *local_port),
+                Some(TcpSocketState::Connected {
+                    local_ip,
+                    local_port,
+                    ..
+                }) => (*local_ip, *local_port),
+                None => return -EBADF,
+            };
+            match write_sockaddr_in(ctx, addr_ptr, addrlen_ptr, ip, port) {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
+        }
+        SYS_GETPEERNAME => {
+            let fd = a0 as i32;
+            let addr_ptr = a1 as u64;
+            let addrlen_ptr = a2 as u64;
+            let Some(f) = state.vfs.get_fd(fd) else {
+                return -EBADF;
+            };
+            let Some(sid) = f.tcp_socket_id else {
+                return -ENOTSOCK;
+            };
+            let (ip, port) = match state.vfs.tcp_sockets.get(&sid).map(|s| &s.state) {
+                Some(TcpSocketState::Connected {
+                    peer_ip, peer_port, ..
+                }) => (*peer_ip, *peer_port),
+                Some(_) => return -ENOTCONN,
+                None => return -EBADF,
+            };
+            match write_sockaddr_in(ctx, addr_ptr, addrlen_ptr, ip, port) {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
+        }
+        SYS_SETSOCKOPT => {
+            let fd = a0 as i32;
+            let level = a1 as i32;
+            let optname = a2 as i32;
+            let optval_ptr = a3 as u64;
+            let optlen = a4 as u32;
+            let Some(f) = state.vfs.get_fd(fd) else {
+                return -EBADF;
+            };
+            let Some(sid) = f.tcp_socket_id else {
+                return -ENOTSOCK;
+            };
+            let read_i32_opt = |ctx: &dyn GuestContext| -> Result<i32, i64> {
+                if optlen < 4 {
+                    return Err(-EINVAL);
+                }
+                let raw = read_bytes(ctx, optval_ptr, 4)?;
+                Ok(i32::from_le_bytes(raw[0..4].try_into().unwrap()))
+            };
+            match (level, optname) {
+                (SOL_SOCKET, SO_REUSEADDR) => {
+                    let val = match read_i32_opt(ctx) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    if let Some(s) = state.vfs.tcp_sockets.get_mut(&sid) {
+                        s.reuse_addr = val != 0;
+                    }
+                    0
+                }
+                (SOL_SOCKET, SO_KEEPALIVE) => {
+                    let val = match read_i32_opt(ctx) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    if let Some(s) = state.vfs.tcp_sockets.get_mut(&sid) {
+                        s.keepalive = val != 0;
+                    }
+                    0
+                }
+                (SOL_SOCKET, SO_SNDBUF) => {
+                    let val = match read_i32_opt(ctx) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    if let Some(s) = state.vfs.tcp_sockets.get_mut(&sid) {
+                        s.sndbuf = val.max(4096);
+                    }
+                    0
+                }
+                (SOL_SOCKET, SO_RCVBUF) => {
+                    let val = match read_i32_opt(ctx) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    if let Some(s) = state.vfs.tcp_sockets.get_mut(&sid) {
+                        s.rcvbuf = val.max(4096);
+                    }
+                    0
+                }
+                (SOL_SOCKET, SO_BROADCAST | SO_REUSEPORT | SO_LINGER) => 0,
+                (IPPROTO_TCP, TCP_NODELAY) => {
+                    let val = match read_i32_opt(ctx) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    if let Some(s) = state.vfs.tcp_sockets.get_mut(&sid) {
+                        s.tcp_nodelay = val != 0;
+                    }
+                    0
+                }
+                (IPPROTO_TCP, TCP_KEEPIDLE) => {
+                    let val = match read_i32_opt(ctx) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    if let Some(s) = state.vfs.tcp_sockets.get_mut(&sid) {
+                        s.keepidle = val;
+                    }
+                    0
+                }
+                (IPPROTO_TCP, TCP_KEEPINTVL) => {
+                    let val = match read_i32_opt(ctx) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    if let Some(s) = state.vfs.tcp_sockets.get_mut(&sid) {
+                        s.keepintvl = val;
+                    }
+                    0
+                }
+                (IPPROTO_TCP, TCP_KEEPCNT) => {
+                    let val = match read_i32_opt(ctx) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
+                    if let Some(s) = state.vfs.tcp_sockets.get_mut(&sid) {
+                        s.keepcnt = val;
+                    }
+                    0
+                }
+                _ => -ENOPROTOOPT,
+            }
+        }
+        SYS_GETSOCKOPT => {
+            let fd = a0 as i32;
+            let level = a1 as i32;
+            let optname = a2 as i32;
+            let optval_ptr = a3 as u64;
+            let optlen_ptr = a4 as u64;
+            let Some(f) = state.vfs.get_fd(fd) else {
+                return -EBADF;
+            };
+            let Some(sid) = f.tcp_socket_id else {
+                return -ENOTSOCK;
+            };
+            let cap = match read_u32(ctx, optlen_ptr) {
+                Ok(v) => v as usize,
+                Err(e) => return e,
+            };
+            let val: i32 = match (level, optname) {
+                (SOL_SOCKET, SO_ERROR) => match state.vfs.tcp_sockets.get_mut(&sid) {
+                    Some(s) => {
+                        let err = s.so_error;
+                        s.so_error = 0;
+                        err
+                    }
+                    None => return -EBADF,
+                },
+                (SOL_SOCKET, SO_TYPE) => SOCK_STREAM,
+                (SOL_SOCKET, SO_REUSEADDR) => state
+                    .vfs
+                    .tcp_sockets
+                    .get(&sid)
+                    .map_or(0, |s| i32::from(s.reuse_addr)),
+                (SOL_SOCKET, SO_KEEPALIVE) => state
+                    .vfs
+                    .tcp_sockets
+                    .get(&sid)
+                    .map_or(0, |s| i32::from(s.keepalive)),
+                (SOL_SOCKET, SO_SNDBUF) => state
+                    .vfs
+                    .tcp_sockets
+                    .get(&sid)
+                    .map_or(65536, |s| s.sndbuf),
+                (SOL_SOCKET, SO_RCVBUF) => state
+                    .vfs
+                    .tcp_sockets
+                    .get(&sid)
+                    .map_or(65536, |s| s.rcvbuf),
+                (SOL_SOCKET, SO_ACCEPTCONN) => state
+                    .vfs
+                    .tcp_sockets
+                    .get(&sid)
+                    .map_or(0, |s| i32::from(matches!(s.state, TcpSocketState::Listening { .. }))),
+                (IPPROTO_TCP, TCP_NODELAY) => state
+                    .vfs
+                    .tcp_sockets
+                    .get(&sid)
+                    .map_or(0, |s| i32::from(s.tcp_nodelay)),
+                (IPPROTO_TCP, TCP_KEEPIDLE) => state
+                    .vfs
+                    .tcp_sockets
+                    .get(&sid)
+                    .map_or(7200, |s| s.keepidle),
+                (IPPROTO_TCP, TCP_KEEPINTVL) => state
+                    .vfs
+                    .tcp_sockets
+                    .get(&sid)
+                    .map_or(75, |s| s.keepintvl),
+                (IPPROTO_TCP, TCP_KEEPCNT) => state
+                    .vfs
+                    .tcp_sockets
+                    .get(&sid)
+                    .map_or(9, |s| s.keepcnt),
+                _ => return -ENOPROTOOPT,
+            };
+            let bytes = val.to_le_bytes();
+            let to_write = cap.min(bytes.len());
+            if to_write > 0 {
+                if let Err(e) = write_bytes(ctx, optval_ptr, &bytes[..to_write]) {
+                    return e;
+                }
+            }
+            if let Err(e) = write_bytes(ctx, optlen_ptr, &(to_write as u32).to_le_bytes()) {
+                return e;
+            }
+            0
+        }
+        SYS_SHUTDOWN => {
+            let fd = a0 as i32;
+            let how = a1 as i32;
+            if how != SHUT_RD && how != SHUT_WR && how != SHUT_RDWR {
+                return -EINVAL;
+            }
+            let Some(f) = state.vfs.get_fd(fd) else {
+                return -EBADF;
+            };
+            let Some(sid) = f.tcp_socket_id else {
+                return -ENOTSOCK;
+            };
+            let mut wake_pipes = Vec::new();
+            let res = match state.vfs.tcp_sockets.get_mut(&sid) {
+                Some(sock) => match &mut sock.state {
+                    TcpSocketState::Connected {
+                        read_pipe_id,
+                        write_pipe_id,
+                        shut_rd,
+                        shut_wr,
+                        ..
+                    } => {
+                        if (how == SHUT_RD || how == SHUT_RDWR) && !*shut_rd {
+                            *shut_rd = true;
+                            let rpid = *read_pipe_id;
+                            let mut remove = false;
+                            if let Some(p) = state.vfs.pipes.get_mut(&rpid) {
+                                p.readers = p.readers.saturating_sub(1);
+                                if p.readers == 0 && p.writers == 0 {
+                                    remove = true;
+                                }
+                            }
+                            if remove {
+                                state.vfs.pipes.remove(&rpid);
+                            }
+                            wake_pipes.push(rpid);
+                        }
+                        if (how == SHUT_WR || how == SHUT_RDWR) && !*shut_wr {
+                            *shut_wr = true;
+                            let wpid = *write_pipe_id;
+                            let mut remove = false;
+                            if let Some(p) = state.vfs.pipes.get_mut(&wpid) {
+                                p.writers = p.writers.saturating_sub(1);
+                                if p.readers == 0 && p.writers == 0 {
+                                    remove = true;
+                                }
+                            }
+                            if remove {
+                                state.vfs.pipes.remove(&wpid);
+                            }
+                            wake_pipes.push(wpid);
+                        }
+                        0
+                    }
+                    _ => -ENOTCONN,
+                },
+                None => -EBADF,
+            };
+            for pid in wake_pipes {
+                state.wake_pipe_waiters(pid, PipeEvent::Close);
+            }
+            res
+        }
         SYS_SOCKETPAIR => {
             let domain = a0 as i32;
             let sock_type = a1 as i32;
@@ -3935,7 +4967,11 @@ fn handle_syscall_inner(
             let buf_addr = a1 as u64;
             let count = a2 as usize;
             let dest_addr = a4 as u64;
-            if dest_addr != 0 {
+            let is_tcp = state
+                .vfs
+                .get_fd(fd)
+                .map_or(false, |f| f.tcp_socket_id.is_some());
+            if dest_addr != 0 && !is_tcp {
                 return -EAFNOSUPPORT;
             }
             let bytes = match read_bytes(ctx, buf_addr, count) {
@@ -3948,7 +4984,102 @@ fn handle_syscall_inner(
             let fd = a0 as i32;
             let buf_addr = a1 as u64;
             let count = a2 as usize;
-            read_into_guest(ctx, state, fd, buf_addr, count)
+            let src_addr = a4 as u64;
+            let addrlen_ptr = a5 as u64;
+            let ret = read_into_guest(ctx, state, fd, buf_addr, count);
+            if ret >= 0 && src_addr != 0 && addrlen_ptr != 0 {
+                if let Some(sid) = state.vfs.get_fd(fd).and_then(|f| f.tcp_socket_id) {
+                    if let Some(TcpSocketState::Connected {
+                        peer_ip, peer_port, ..
+                    }) = state.vfs.tcp_sockets.get(&sid).map(|s| &s.state)
+                    {
+                        let _ = write_sockaddr_in(ctx, src_addr, addrlen_ptr, *peer_ip, *peer_port);
+                    }
+                }
+            }
+            ret
+        }
+        SYS_SENDMSG => {
+            let fd = a0 as i32;
+            let msg_addr = a1 as u64;
+            if state.vfs.get_fd(fd).is_none() {
+                return -EBADF;
+            }
+            let msg = match read_bytes(ctx, msg_addr, 56) {
+                Ok(b) => b,
+                Err(e) => return e,
+            };
+            let iov_addr = u64::from_le_bytes(msg[16..24].try_into().unwrap());
+            let iovcnt = u64::from_le_bytes(msg[24..32].try_into().unwrap());
+            if iovcnt > 1024 {
+                return -EINVAL;
+            }
+            let mut combined = Vec::new();
+            for i in 0..iovcnt {
+                let entry_addr = match i.checked_mul(16).and_then(|off| iov_addr.checked_add(off)) {
+                    Some(a) => a,
+                    None => return -EFAULT,
+                };
+                let base = match read_u64(ctx, entry_addr) {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
+                let len = match read_u64(ctx, entry_addr + 8).and_then(|l| usize::try_from(l).map_err(|_| -EINVAL)) {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
+                if len > 0 {
+                    match read_bytes(ctx, base, len) {
+                        Ok(b) => combined.extend_from_slice(&b),
+                        Err(e) => return e,
+                    }
+                }
+            }
+            write_fd_data(ctx, state, fd, combined, now_ns)
+        }
+        SYS_RECVMSG => {
+            let fd = a0 as i32;
+            let msg_addr = a1 as u64;
+            if state.vfs.get_fd(fd).is_none() {
+                return -EBADF;
+            }
+            let msg = match read_bytes(ctx, msg_addr, 56) {
+                Ok(b) => b,
+                Err(e) => return e,
+            };
+            let iov_addr = u64::from_le_bytes(msg[16..24].try_into().unwrap());
+            let iovcnt = u64::from_le_bytes(msg[24..32].try_into().unwrap());
+            if iovcnt > 1024 {
+                return -EINVAL;
+            }
+            let mut iovs = Vec::new();
+            for i in 0..iovcnt {
+                let entry_addr = match i.checked_mul(16).and_then(|off| iov_addr.checked_add(off)) {
+                    Some(a) => a,
+                    None => return -EFAULT,
+                };
+                let base = match read_u64(ctx, entry_addr) {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
+                let len = match read_u64(ctx, entry_addr + 8).and_then(|l| usize::try_from(l).map_err(|_| -EINVAL)) {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
+                if len > 0 {
+                    iovs.push((base, len));
+                }
+            }
+            let ret = readv_into_guest(ctx, state, fd, &iovs);
+            if ret >= 0 {
+                if let Err(e) = write_bytes(ctx, msg_addr + 40, &0u64.to_le_bytes()) {
+                    return e;
+                }
+                if let Err(e) = write_bytes(ctx, msg_addr + 48, &0i32.to_le_bytes()) {
+                    return e;
+                }
+            }
+            ret
         }
         SYS_EVENTFD2 => {
             let initval = a0 as u32 as u64;
@@ -4001,6 +5132,7 @@ fn handle_syscall_inner(
             let supports_epoll = target_f.is_pipe
                 || target_f.pipe_id.is_some()
                 || target_f.sock_write_pipe_id.is_some()
+                || target_f.tcp_socket_id.is_some()
                 || target_f.eventfd_id.is_some()
                 || target_f.epoll_id.is_some()
                 || target_f.is_std.is_some()
@@ -4550,20 +5682,13 @@ fn handle_syscall_inner(
         SYS_DUP2 | SYS_DUP3 => {
             let oldfd = a0 as i32;
             let newfd = a1 as i32;
-            let displaced_pipe = if oldfd != newfd {
-                state.vfs.get_fd(newfd).and_then(|f| f.pipe_id)
+            let (ret, affected_pipes, closed_listeners) = if nr == SYS_DUP3 {
+                state.vfs.dup3_with_events(oldfd, newfd, a2 as i32)
             } else {
-                None
-            };
-            let ret = if nr == SYS_DUP3 {
-                state.vfs.dup3(oldfd, newfd, a2 as i32)
-            } else {
-                state.vfs.dup2(oldfd, newfd)
+                state.vfs.dup2_with_events(oldfd, newfd)
             };
             if ret >= 0 {
-                if let Some(pid) = displaced_pipe {
-                    state.wake_pipe_waiters(pid, PipeEvent::Close);
-                }
+                notify_fd_close_events(state, affected_pipes, closed_listeners);
             }
             ret
         }
@@ -4800,16 +5925,17 @@ fn handle_syscall_inner(
 
 fn exit_process(ctx: &mut dyn GuestContext, state: &mut HostState, code: i32) {
     let pid = state.active_pid;
-    let pipe_ids: Vec<u64> = state
-        .vfs
-        .fds
-        .values()
-        .flat_map(|f| f.pipe_id.into_iter().chain(f.sock_write_pipe_id))
-        .collect();
-    state.vfs.close_all_fds();
-    for pipe_id in pipe_ids {
-        state.wake_pipe_waiters(pipe_id, PipeEvent::Close);
+    let now_ns = state.scheduler.realtime_ns();
+    let shared_mmaps: Vec<SharedMmap> = state.mmap_alloc.shared_mmaps.drain(..).collect();
+    for sm in &shared_mmaps {
+        if let Ok(bytes) = read_bytes(ctx, sm.addr as u64, sm.len) {
+            state
+                .vfs
+                .write_overlay_range(&sm.guest_path, sm.file_offset, &bytes, now_ns);
+        }
     }
+    let (affected_pipes, closed_listeners) = state.vfs.close_all_fds_with_events();
+    notify_fd_close_events(state, affected_pipes, closed_listeners);
     state.wake_vfork_parent_for(pid);
     if let Some(p) = state.processes.get_mut(&pid) {
         if !p.exited {
@@ -4836,7 +5962,24 @@ fn write_fd_data(
     now_ns: u64,
 ) -> i64 {
     if let Some(f) = state.vfs.get_fd(fd).cloned() {
-        let write_pipe_id = f.sock_write_pipe_id.or(f.pipe_id);
+        let tcp_write_pipe = if let Some(sid) = f.tcp_socket_id {
+            match state.vfs.tcp_sockets.get(&sid).map(|s| &s.state) {
+                Some(TcpSocketState::Connected {
+                    write_pipe_id,
+                    shut_wr,
+                    ..
+                }) => {
+                    if *shut_wr {
+                        return -EPIPE;
+                    }
+                    Some(*write_pipe_id)
+                }
+                _ => return -EPIPE,
+            }
+        } else {
+            None
+        };
+        let write_pipe_id = tcp_write_pipe.or(f.sock_write_pipe_id).or(f.pipe_id);
         if let Some(pipe_id) = write_pipe_id {
             if !f.writable {
                 return -EBADF;
@@ -4888,6 +6031,119 @@ fn write_fd_data(
         state.wake_ready_waiters();
     }
     ret
+}
+
+fn read_sockaddr_in(ctx: &dyn GuestContext, addr: u64, addrlen: u32) -> Result<(u32, u16), i64> {
+    if addrlen < 16 {
+        return Err(-EINVAL);
+    }
+    let raw = read_bytes(ctx, addr, 16)?;
+    let family = u16::from_le_bytes([raw[0], raw[1]]);
+    if family != AF_INET as u16 {
+        return Err(-EAFNOSUPPORT);
+    }
+    let port = u16::from_be_bytes([raw[2], raw[3]]);
+    let ip = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    Ok((ip, port))
+}
+
+fn write_sockaddr_in(
+    ctx: &mut dyn GuestContext,
+    addr_ptr: u64,
+    addrlen_ptr: u64,
+    ip: u32,
+    port: u16,
+) -> Result<(), i64> {
+    if addr_ptr == 0 {
+        return Ok(());
+    }
+    if addrlen_ptr == 0 {
+        return Err(-EFAULT);
+    }
+    let cap = read_u32(ctx, addrlen_ptr)? as usize;
+    let mut sa = [0u8; 16];
+    sa[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+    sa[2..4].copy_from_slice(&port.to_be_bytes());
+    sa[4..8].copy_from_slice(&ip.to_be_bytes());
+    let to_write = cap.min(16);
+    if to_write > 0 {
+        write_bytes(ctx, addr_ptr, &sa[..to_write])?;
+    }
+    write_bytes(ctx, addrlen_ptr, &16u32.to_le_bytes())?;
+    Ok(())
+}
+
+fn do_accept(
+    ctx: &mut dyn GuestContext,
+    state: &mut HostState,
+    fd: i32,
+    addr_ptr: u64,
+    addrlen_ptr: u64,
+    flags: i32,
+) -> i64 {
+    if (flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC)) != 0 {
+        return -EINVAL;
+    }
+    let Some(f) = state.vfs.get_fd(fd).cloned() else {
+        return -EBADF;
+    };
+    let Some(sid) = f.tcp_socket_id else {
+        return -ENOTSOCK;
+    };
+    let popped = match state.vfs.tcp_sockets.get_mut(&sid) {
+        Some(sock) => match &mut sock.state {
+            TcpSocketState::Listening { pending, .. } => Ok(pending.pop_front()),
+            _ => Err(-EINVAL),
+        },
+        None => Err(-EBADF),
+    };
+    match popped {
+        Err(e) => e,
+        Ok(Some(child_sid)) => {
+            let peer = state.vfs.tcp_sockets.get(&child_sid).and_then(|s| match s.state {
+                TcpSocketState::Connected {
+                    peer_ip, peer_port, ..
+                } => Some((peer_ip, peer_port)),
+                _ => None,
+            });
+            if let Some((peer_ip, peer_port)) = peer {
+                if let Err(e) = write_sockaddr_in(ctx, addr_ptr, addrlen_ptr, peer_ip, peer_port) {
+                    if let Some(sock) = state.vfs.tcp_sockets.get_mut(&sid) {
+                        if let TcpSocketState::Listening { pending, .. } = &mut sock.state {
+                            pending.push_front(child_sid);
+                        }
+                    }
+                    return e;
+                }
+            }
+            let cloexec = (flags & SOCK_CLOEXEC) != 0;
+            let nonblock = (flags & SOCK_NONBLOCK) != 0;
+            match state.vfs.alloc_fd_for_tcp_socket(child_sid, cloexec, nonblock) {
+                Ok(new_fd) => new_fd as i64,
+                Err(e) => {
+                    if let Some(sock) = state.vfs.tcp_sockets.get_mut(&sid) {
+                        if let TcpSocketState::Listening { pending, .. } = &mut sock.state {
+                            pending.push_front(child_sid);
+                        }
+                    }
+                    e
+                }
+            }
+        }
+        Ok(None) => {
+            if f.nonblock {
+                return -EAGAIN;
+            }
+            state.scheduler.current_thread_mut().state = ThreadState::AcceptWait {
+                listener_socket_id: sid,
+                addr_ptr,
+                addrlen_ptr,
+                flags,
+            };
+            ctx.set_yield_flag(1);
+            0
+        }
+    }
 }
 
 fn do_fork(
@@ -5186,17 +6442,8 @@ fn do_execve(
         return -ENOEXEC;
     }
 
-    let closed_pipes: Vec<u64> = state
-        .vfs
-        .fds
-        .values()
-        .filter(|f| f.cloexec)
-        .flat_map(|f| f.pipe_id.into_iter().chain(f.sock_write_pipe_id))
-        .collect();
-    state.vfs.close_cloexec_fds();
-    for pipe_id in closed_pipes {
-        state.wake_pipe_waiters(pipe_id, PipeEvent::Close);
-    }
+    let (affected_pipes, closed_listeners) = state.vfs.close_cloexec_fds_with_events();
+    notify_fd_close_events(state, affected_pipes, closed_listeners);
 
     let pid = state.active_pid;
     state.wake_vfork_parent_for(pid);
