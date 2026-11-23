@@ -74,6 +74,29 @@ export async function waitFor(fn, opts = {}) {
   }
 }
 
+/**
+ * Race `promise` against a timeout of `ms` milliseconds and clear the timer in `.finally(...)`.
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {number} ms
+ * @param {string} [label]
+ * @returns {Promise<T>}
+ */
+export function waitWithTimeout(promise, ms, label = "operation") {
+  let timer = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`Timed out after ${ms}ms waiting for ${label}`));
+    }, ms);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  });
+}
+
 export class SkipError extends Error {
   constructor(reason) {
     super(reason || "skipped");

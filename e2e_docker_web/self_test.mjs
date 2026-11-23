@@ -4,6 +4,8 @@
 
 import http from "node:http";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import zlib from "node:zlib";
 import crypto from "node:crypto";
 import {
@@ -14,7 +16,7 @@ import {
   Suite,
 } from "./helpers/test_runner.mjs";
 import { createTar, createTarGz, parseTarEntries } from "./helpers/tar_builder.mjs";
-import { startMockOciRegistry } from "./helpers/mock_oci_registry.mjs";
+import { buildOciImage, startMockOciRegistry } from "./helpers/mock_oci_registry.mjs";
 import { launchCdpBrowser } from "./helpers/cdp_browser.mjs";
 
 function sha256Digest(bytes) {
@@ -190,6 +192,63 @@ export async function runSelfTest(opts = {}) {
       const r500Headers = await getAuthHeaders("repository:error/upstream500:pull");
       const r500 = await fetch(`${registry.url}/v2/error/upstream500/manifests/latest`, { headers: r500Headers });
       assert.equal(r500.status, 500);
+
+      // 13. Synthetic multi-layer + disk-backed filePath blob streaming + HEAD + getOciTarball
+      const tmpDiskDir = fs.mkdtempSync(path.join(os.tmpdir(), "elf2wasm-st4-disk-"));
+      try {
+        const synLayer0 = createTarGz([{ path: "base/a.txt", type: "file", content: "disk-layer-0\n" }]);
+        const synLayer1 = createTarGz([{ path: "app/b.txt", type: "file", content: "disk-layer-1\n" }]);
+        const diskPath0 = path.join(tmpDiskDir, "layer0.tar.gz");
+        const diskPath1 = path.join(tmpDiskDir, "layer1.tar.gz");
+        fs.writeFileSync(diskPath0, synLayer0.gzBytes);
+        fs.writeFileSync(diskPath1, synLayer1.gzBytes);
+
+        const diskImg = buildOciImage({
+          config: {
+            Entrypoint: ["docker-entrypoint.sh"],
+            Cmd: ["synthetic"],
+            Env: ["SYN_ENV=1"],
+            WorkingDir: "/app",
+          },
+          layers: [
+            { filePath: diskPath0, digest: synLayer0.digest, diffId: synLayer0.diffId, size: synLayer0.gzBytes.length },
+            { filePath: diskPath1, digest: synLayer1.digest, diffId: synLayer1.diffId, size: synLayer1.gzBytes.length },
+          ],
+          multiArch: true,
+        });
+        registry.registerImage("synthetic/diskmulti", "v1", diskImg);
+
+        const diskHeaders = await getAuthHeaders("repository:synthetic/diskmulti:pull");
+        const dIdx = await (await fetch(`${registry.url}/v2/synthetic/diskmulti/manifests/v1`, { headers: diskHeaders })).json();
+        const dAmd64 = dIdx.manifests.find((m) => m.platform.architecture === "amd64");
+        const dMan = await (await fetch(`${registry.url}/v2/synthetic/diskmulti/manifests/${dAmd64.digest}`, { headers: diskHeaders })).json();
+        assert.equal(dMan.layers.length, 2, "Synthetic disk-backed image must have 2 layers");
+
+        for (const [idx, expected] of [synLayer0, synLayer1].entries()) {
+          const redir = await fetch(`${registry.url}/v2/synthetic/diskmulti/blobs/${dMan.layers[idx].digest}`, {
+            headers: diskHeaders,
+            redirect: "manual",
+          });
+          assert.equal(redir.status, 302);
+          const loc = redir.headers.get("location");
+          const headResp = await fetch(loc, { method: "HEAD" });
+          assert.equal(headResp.status, 200);
+          assert.equal(Number(headResp.headers.get("content-length")), expected.gzBytes.length);
+
+          const getResp = await fetch(loc);
+          assert.equal(getResp.status, 200);
+          assert.equal(Number(getResp.headers.get("content-length")), expected.gzBytes.length);
+          const gotBytes = new Uint8Array(await getResp.arrayBuffer());
+          assert.equal(sha256Digest(gotBytes), expected.digest);
+        }
+
+        const diskTar = registry.getOciTarball("synthetic/diskmulti", "v1");
+        const diskTarNames = parseTarEntries(diskTar).map((e) => e.name);
+        assert.ok(diskTarNames.includes(`blobs/sha256/${synLayer0.digest.slice(7)}`));
+        assert.ok(diskTarNames.includes(`blobs/sha256/${synLayer1.digest.slice(7)}`));
+      } finally {
+        fs.rmSync(tmpDiskDir, { recursive: true, force: true });
+      }
     } finally {
       await registry.close();
     }

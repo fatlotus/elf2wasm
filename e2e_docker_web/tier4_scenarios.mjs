@@ -1,6 +1,7 @@
 // Tier 4: Full Headless Google Chrome Browser Scenarios (Opaque-Box E2E)
 // Drives real /usr/bin/google-chrome over CDP against server/server.mjs.
 
+import crypto from "node:crypto";
 import {
   assert,
   assertIncludes,
@@ -16,6 +17,8 @@ import { startServer } from "./helpers/server_harness.mjs";
 import { launchCdpBrowser } from "./helpers/cdp_browser.mjs";
 
 const COLD_BOOT_TIMEOUT_MS = 90000;
+const PYTHON_COLD_BOOT_TIMEOUT_MS = 120000;
+const NODE_COLD_BOOT_TIMEOUT_MS = 180000;
 const CMD_TIMEOUT_MS = 25000;
 
 /**
@@ -62,6 +65,76 @@ async function waitForShellReady(browser, timeoutMs = COLD_BOOT_TIMEOUT_MS) {
   const finalTerm = stripAnsi(await browser.getText("#terminal"));
   throw new Error(
     `Timed out after ${timeoutMs}ms waiting for interactive shell ready.\n` +
+    `#status-text: ${JSON.stringify(finalStatus)}\n` +
+    `#terminal tail:\n${finalTerm.slice(-600)}`
+  );
+}
+
+/**
+ * Poll #progress-bar[data-stage] and #status-pill[data-state] until container reaches "run"/"running".
+ * Fails fast if #status-pill[data-state="error"].
+ */
+async function waitForRunStage(browser, timeoutMs = PYTHON_COLD_BOOT_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const info = await browser.evaluate(
+      `(() => ({
+        stage: document.querySelector("#progress-bar")?.dataset?.stage || "",
+        state: document.querySelector("#status-pill")?.dataset?.state || "",
+        statusText: document.querySelector("#status-text")?.textContent || "",
+      }))()`,
+      { awaitPromise: false }
+    );
+    if (info.state === "error") {
+      const termTail = stripAnsi(await browser.getText("#terminal")).slice(-600);
+      throw new Error(
+        `Container boot entered error state while waiting for run stage.\n` +
+        `#status-text: ${JSON.stringify(info.statusText)}\n` +
+        `#terminal tail:\n${termTail}`
+      );
+    }
+    if (info.stage === "run" || info.state === "running") {
+      return Date.now();
+    }
+    await sleep(100);
+  }
+  const finalStatus = await browser.getText("#status-text");
+  const finalTerm = stripAnsi(await browser.getText("#terminal"));
+  throw new Error(
+    `Timed out after ${timeoutMs}ms waiting for container run stage.\n` +
+    `#status-text: ${JSON.stringify(finalStatus)}\n` +
+    `#terminal tail:\n${finalTerm.slice(-600)}`
+  );
+}
+
+/**
+ * Poll #terminal until `promptRegex` matches, failing fast on #status-pill[data-state="error"].
+ */
+async function waitForReplPrompt(browser, promptRegex, timeoutMs, label = "REPL prompt") {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const state = await browser.evaluate(
+      'document.querySelector("#status-pill")?.dataset?.state || ""',
+      { awaitPromise: false }
+    );
+    const term = stripAnsi(await browser.getText("#terminal"));
+    if (promptRegex.test(term)) {
+      return { term, promptTimeMs: Date.now() };
+    }
+    if (state === "error") {
+      const statusText = await browser.getText("#status-text");
+      throw new Error(
+        `Container entered error state while waiting for ${label}.\n` +
+        `#status-text: ${JSON.stringify(statusText)}\n` +
+        `#terminal tail:\n${term.slice(-600)}`
+      );
+    }
+    await sleep(150);
+  }
+  const finalStatus = await browser.getText("#status-text");
+  const finalTerm = stripAnsi(await browser.getText("#terminal"));
+  throw new Error(
+    `Timed out after ${timeoutMs}ms waiting for ${label}.\n` +
     `#status-text: ${JSON.stringify(finalStatus)}\n` +
     `#terminal tail:\n${finalTerm.slice(-600)}`
   );
@@ -338,6 +411,240 @@ export async function runTier4(opts = {}) {
       const finalTerm = stripAnsi(await browser.getText("#terminal"));
       assertMatch(finalTerm, /\b\d+\.\d+/);
       assertIncludes(finalTerm, "123");
+
+      await browser.click("#stop-btn");
+      assert.deepEqual(browser.exceptions, [], `Uncaught exceptions: ${JSON.stringify(browser.exceptions)}`);
+    } finally {
+      if (browser) await browser.close();
+      if (hardenedServer) await hardenedServer.close();
+    }
+  });
+
+  suite.add("T4.6", "python:3.12-slim preset chip, <15s REPL startup latency, canonical echo & data-processing workload in Chrome", async () => {
+    const pyRef = registry.ensureBuiltinFixture("python");
+    const expectedSha12 = crypto.createHash("sha256").update("elf2wasm").digest("hex").slice(0, 12);
+    const browser = await launchCdpBrowser();
+    try {
+      await browser.navigate(`${localServer.url}/`);
+      await browser.waitForSelector(".presets-row", 15000);
+      await browser.waitForSelector("#image-input", 15000);
+      await browser.waitForSelector("#start-btn", 15000);
+      await browser.waitForSelector("#terminal", 15000);
+
+      const defaultImage = await browser.evaluate('document.querySelector("#image-input").value', { awaitPromise: false });
+      assert.equal(defaultImage, "alpine:latest", "#image-input must default to alpine:latest");
+
+      // Click python:3.12-slim preset chip and verify focus + value
+      const chipVal = await browser.clickPresetChip("python:3.12-slim");
+      assert.equal(chipVal, "python:3.12-slim", "Clicking python:3.12-slim preset chip must populate #image-input");
+      const activeId = await browser.evaluate("document.activeElement?.id || ''", { awaitPromise: false });
+      assert.equal(activeId, "image-input", "Clicking preset chip must focus #image-input");
+
+      // Point at local mock registry for deterministic offline pull; keep #cmd-input empty for default python3 REPL
+      await browser.setInputValue("#image-input", pyRef);
+      await browser.click("#start-btn");
+
+      const tRunStart = await waitForRunStage(browser, PYTHON_COLD_BOOT_TIMEOUT_MS);
+      const { term: promptTerm, promptTimeMs } = await waitForReplPrompt(
+        browser,
+        />>>\s*$/,
+        15000,
+        "Python >>> prompt"
+      );
+      const replLatencyMs = promptTimeMs - tRunStart;
+      assert.ok(
+        replLatencyMs < 15000,
+        `Post-compile Python REPL startup latency must be < 15000ms (took ${replLatencyMs}ms)`
+      );
+      assertMatch(promptTerm, /Python 3\.12/, "Python REPL banner must report Python 3.12");
+
+      // Interactive math + json + visible canonical TTY echo (F17 + F20)
+      await browser.typeIntoTerminal("import math, json");
+      await browser.waitForTerminalText("import math, json", {
+        timeoutMs: CMD_TIMEOUT_MS,
+        intervalMs: 150,
+        label: "canonical TTY echo of import math, json",
+      });
+
+      await browser.typeIntoTerminal('print(json.dumps({"fact": math.factorial(10), "sum": 20 + 22}))');
+      const { text: mathTerm } = await browser.waitForTerminalText(
+        (t) => t.includes("3628800") && /"sum":\s*42/.test(t),
+        { timeoutMs: CMD_TIMEOUT_MS, intervalMs: 150, label: "Python factorial(10)=3628800 and sum=42" }
+      );
+      assertIncludes(mathTerm, "math.factorial(10)", "Canonical TTY echo must display typed Python expression");
+
+      // Realistic Python data-processing workload (json / csv / hashlib / zlib)
+      await browser.typeIntoTerminal("import csv, io, hashlib, zlib");
+      await browser.typeIntoTerminal('rows = list(csv.DictReader(io.StringIO("k,v\\na,10\\nb,25\\nc,7\\n")))');
+      await browser.typeIntoTerminal('total = sum(int(r["v"]) for r in rows); blob = zlib.compress(json.dumps(rows).encode())');
+      await browser.typeIntoTerminal('print("PY_WORK", total, len(zlib.decompress(blob)), hashlib.sha256(b"elf2wasm").hexdigest()[:12])');
+
+      await browser.waitForTerminalText(
+        (t) => t.includes("PY_WORK 42 ") && t.includes(expectedSha12),
+        { timeoutMs: CMD_TIMEOUT_MS, intervalMs: 150, label: `PY_WORK 42 and SHA ${expectedSha12}` }
+      );
+
+      await browser.click("#stop-btn");
+      await sleep(300);
+      assert.deepEqual(browser.exceptions, [], `Uncaught exceptions: ${JSON.stringify(browser.exceptions)}`);
+      assert.deepEqual(browser.consoleErrors, [], `Console errors: ${JSON.stringify(browser.consoleErrors)}`);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  suite.add("T4.7", "node:22-slim preset chip, interactive > REPL & realistic workload (JSON/crypto/fs/Buffer) in Chrome", async () => {
+    const nodeRef = registry.ensureBuiltinFixture("node");
+    const expectedPayload = JSON.stringify({ items: [10, 20, 12] });
+    const expectedSha12 = crypto.createHash("sha256").update(expectedPayload).digest("hex").slice(0, 12);
+    const browser = await launchCdpBrowser();
+    try {
+      await browser.navigate(`${localServer.url}/`);
+      await browser.waitForSelector(".presets-row", 15000);
+      await browser.waitForSelector("#image-input", 15000);
+      await browser.waitForSelector("#start-btn", 15000);
+      await browser.waitForSelector("#terminal", 15000);
+
+      // Click node:22-slim preset chip and verify focus + value
+      const chipVal = await browser.clickPresetChip("node:22-slim");
+      assert.equal(chipVal, "node:22-slim", "Clicking node:22-slim preset chip must populate #image-input");
+      const activeId = await browser.evaluate("document.activeElement?.id || ''", { awaitPromise: false });
+      assert.equal(activeId, "image-input", "Clicking preset chip must focus #image-input");
+
+      // Point at local mock registry; leave #cmd-input empty for default Node REPL + F21 --jitless env injection
+      await browser.setInputValue("#image-input", nodeRef);
+      await browser.click("#start-btn");
+
+      await waitForRunStage(browser, NODE_COLD_BOOT_TIMEOUT_MS);
+      const { term: promptTerm } = await waitForReplPrompt(
+        browser,
+        /(?:^|\n)>\s*$/,
+        30000,
+        "Node > prompt"
+      );
+      assertMatch(promptTerm, /Welcome to Node\.js v22\./, "Node REPL banner must report Node.js v22");
+
+      // Interactive Node.js evaluation (computed output avoids TTY echo false positive)
+      await browser.typeIntoTerminal("JSON.stringify({ v: process.versions.node.split('.')[0], ans: 20 + 22 })");
+      await browser.waitForTerminalText('{"v":"22","ans":42}', {
+        timeoutMs: CMD_TIMEOUT_MS,
+        intervalMs: 150,
+        label: 'Node REPL JSON.stringify {"v":"22","ans":42}',
+      });
+
+      // Realistic Node.js data-processing workload (JSON / crypto / fs / Buffer)
+      await browser.typeIntoTerminal("const fs = require('fs'), crypto = require('crypto');");
+      await browser.typeIntoTerminal("const buf = Buffer.from(JSON.stringify({ items: [10, 20, 12] })); fs.writeFileSync('/tmp/n.json', buf);");
+      await browser.typeIntoTerminal("const d = JSON.parse(fs.readFileSync('/tmp/n.json', 'utf8')); console.log('NODE_WORK', d.items.reduce((a,b)=>a+b,0), crypto.createHash('sha256').update(buf).digest('hex').slice(0,12));");
+
+      await browser.waitForTerminalText(
+        (t) => t.includes("NODE_WORK 42 ") && t.includes(expectedSha12),
+        { timeoutMs: CMD_TIMEOUT_MS, intervalMs: 150, label: `NODE_WORK 42 and SHA ${expectedSha12}` }
+      );
+
+      await browser.click("#stop-btn");
+      await sleep(300);
+      assert.deepEqual(browser.exceptions, [], `Uncaught exceptions: ${JSON.stringify(browser.exceptions)}`);
+      assert.deepEqual(browser.consoleErrors, [], `Console errors: ${JSON.stringify(browser.consoleErrors)}`);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  suite.add("T4.8", "Web UI preset switching (alpine:latest -> python:3.12-slim -> node:22-slim) in one Chrome tab", async () => {
+    const alpineRef = registry.imageRef("library/alpine", "latest");
+    const pyRef = registry.ensureBuiltinFixture("python");
+    const nodeRef = registry.ensureBuiltinFixture("node");
+
+    const browser = await launchCdpBrowser();
+    try {
+      await browser.navigate(`${localServer.url}/`);
+      await browser.waitForSelector(".presets-row", 15000);
+      await browser.waitForSelector("#image-input", 15000);
+
+      // Verify chip clicking sequence updates #image-input cleanly
+      assert.equal(await browser.clickPresetChip("python:3.12-slim"), "python:3.12-slim");
+      assert.equal(await browser.clickPresetChip("node:22-slim"), "node:22-slim");
+      assert.equal(await browser.clickPresetChip("alpine:latest"), "alpine:latest");
+
+      // 1. Boot alpine:latest
+      await browser.setInputValue("#image-input", alpineRef);
+      await browser.click("#start-btn");
+      await waitForShellReady(browser, COLD_BOOT_TIMEOUT_MS);
+      await browser.typeIntoTerminal("echo $((10+5))");
+      await browser.waitForTerminalText("15", { timeoutMs: CMD_TIMEOUT_MS, intervalMs: 150, label: "Alpine 10+5=15" });
+      await browser.click("#stop-btn");
+      await sleep(300);
+
+      // 2. Switch to python:3.12-slim
+      assert.equal(await browser.clickPresetChip("python:3.12-slim"), "python:3.12-slim");
+      await browser.click("#clear-btn");
+      await browser.setInputValue("#image-input", pyRef);
+      await browser.click("#start-btn");
+      await waitForRunStage(browser, PYTHON_COLD_BOOT_TIMEOUT_MS);
+      await waitForReplPrompt(browser, />>>\s*$/, 15000, "T4.8 Python >>> prompt");
+      await browser.typeIntoTerminal("7 * 6");
+      await browser.waitForTerminalText(/(?:^|\n)42(?:\n|$)/, {
+        timeoutMs: CMD_TIMEOUT_MS,
+        intervalMs: 150,
+        label: "T4.8 Python 7*6=42",
+      });
+      await browser.click("#stop-btn");
+      await sleep(300);
+
+      // 3. Switch to node:22-slim
+      assert.equal(await browser.clickPresetChip("node:22-slim"), "node:22-slim");
+      await browser.click("#clear-btn");
+      await browser.setInputValue("#image-input", nodeRef);
+      await browser.click("#start-btn");
+      await waitForRunStage(browser, NODE_COLD_BOOT_TIMEOUT_MS);
+      await waitForReplPrompt(browser, /(?:^|\n)>\s*$/, 30000, "T4.8 Node > prompt");
+      await browser.typeIntoTerminal("8 * 9");
+      await browser.waitForTerminalText(/(?:^|\n)72(?:\n|$)/, {
+        timeoutMs: CMD_TIMEOUT_MS,
+        intervalMs: 150,
+        label: "T4.8 Node 8*9=72",
+      });
+      await browser.click("#stop-btn");
+      await sleep(300);
+
+      assert.deepEqual(browser.exceptions, [], `Uncaught exceptions: ${JSON.stringify(browser.exceptions)}`);
+      assert.deepEqual(browser.consoleErrors, [], `Console errors: ${JSON.stringify(browser.consoleErrors)}`);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  suite.add("T4.9", "Live Docker Hub python:3.12-slim preset chip click & REPL boot on hardened server", async () => {
+    if (skipLive) {
+      skip("skipped via --skip-live");
+    }
+
+    let hardenedServer = null;
+    let browser = null;
+    try {
+      hardenedServer = await startServer({ allowLocalRegistries: false });
+      browser = await launchCdpBrowser();
+      await browser.navigate(`${hardenedServer.url}/`);
+      await browser.waitForSelector(".presets-row", 15000);
+      await browser.waitForSelector("#image-input", 15000);
+
+      // Click python:3.12-slim preset chip and leave #image-input untouched at "python:3.12-slim"
+      const chipVal = await browser.clickPresetChip("python:3.12-slim");
+      assert.equal(chipVal, "python:3.12-slim", "#image-input must be python:3.12-slim after clicking preset chip");
+
+      await browser.click("#start-btn");
+      const tRunStart = await waitForRunStage(browser, 180000);
+      const { promptTimeMs } = await waitForReplPrompt(browser, />>>\s*$/, 15000, "Live Python >>> prompt");
+      const replLatencyMs = promptTimeMs - tRunStart;
+      assert.ok(replLatencyMs < 15000, `Live Python REPL startup latency must be < 15000ms (took ${replLatencyMs}ms)`);
+
+      await browser.typeIntoTerminal('import math; print("LIVE_PY", math.factorial(6))');
+      await browser.waitForTerminalText("LIVE_PY 720", {
+        timeoutMs: CMD_TIMEOUT_MS,
+        intervalMs: 150,
+        label: "LIVE_PY 720",
+      });
 
       await browser.click("#stop-btn");
       assert.deepEqual(browser.exceptions, [], `Uncaught exceptions: ${JSON.stringify(browser.exceptions)}`);

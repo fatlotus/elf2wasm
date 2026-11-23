@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // Tier 5: Adversarial Hardening E2E Suite
-// Covers all 10 confirmed Round 1 white-box adversarial gaps end-to-end.
+// Covers Round 1 (T5.1-T5.10) and Round 2 M7/M8 (T5.11-T5.14) adversarial gaps end-to-end.
 // Standalone executable: `node e2e_docker_web/tier5_adversarial.mjs` (exits 0 on pass, 1 on fail).
 
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
@@ -619,6 +621,296 @@ export async function runTier5(opts = {}) {
         );
       } finally {
         await browser.close();
+      }
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // T5.11 (R2-C2-Gap1): stopContainer() during startContainer() precompileFromVfs() prevents zombie boot
+  // -------------------------------------------------------------------------
+  suite.add(
+    "T5.11",
+    "R2-C2-Gap1: stopContainer() during precompileFromVfs() prevents unstoppable zombie container boot",
+    async () => {
+      const img = await getAlpine();
+      const engine = docker._backend.engine;
+      assert.ok(engine, "DirectBackend engine must be available");
+
+      const stdoutChunks = [];
+      const exitCodes = [];
+      const { containerId } = await engine.createContainer(
+        img._imageId,
+        {
+          cmd: ["/usr/local/bin/docker-entrypoint.sh", "/bin/sh", "-c", "echo ZOMBIE_BOOTED; /bin/cat"],
+          tty: false,
+        },
+        {
+          onStdout: (c) => stdoutChunks.push(new TextDecoder().decode(c)),
+          onExit: (code) => exitCodes.push(code),
+        }
+      );
+      engine.writeFile(
+        containerId,
+        "/usr/local/bin/docker-entrypoint.sh",
+        "#!/bin/sh\nexec \"$@\"\n",
+        0o755
+      );
+
+      const rec = engine.containers.get(containerId);
+      assert.ok(rec, "Container record should exist before start");
+
+      let precompileEntered;
+      const precompileEnteredPromise = new Promise((r) => {
+        precompileEntered = r;
+      });
+      let releasePrecompile;
+      const precompileGate = new Promise((r) => {
+        releasePrecompile = r;
+      });
+
+      const origPrecompile = rec.sys.precompileFromVfs.bind(rec.sys);
+      rec.sys.precompileFromVfs = async (...args) => {
+        precompileEntered();
+        await precompileGate;
+        return await origPrecompile(...args);
+      };
+
+      const startPromise = engine.startContainer(containerId);
+      await precompileEnteredPromise;
+
+      await engine.stopContainer(containerId);
+      assert.equal(engine.containers.has(containerId), false);
+      assert.deepEqual(exitCodes, [137]);
+
+      releasePrecompile();
+      await startPromise;
+      await sleep(50);
+
+      assert.equal(stdoutChunks.join(""), "", "Stopped container must emit zero stdout");
+      assert.equal(rec.sys.getActiveProcessCount(), 0, "Stopped container must have 0 active processes");
+      assert.deepEqual(exitCodes, [137], "onExit must fire exactly once with 137");
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // T5.12 (R2-C2-Gap2): _compileCached() drops bloated/failed compilerInst on error and re-instantiates
+  // -------------------------------------------------------------------------
+  suite.add(
+    "T5.12",
+    "R2-C2-Gap2: _compileCached() drops bloated/failed compilerInst on compile error and re-instantiates cleanly",
+    async () => {
+      const shim = await import(pathToFileURL(path.join(REPO_ROOT, "js", "elf2wasm_shim.mjs")).href);
+      const { Elf2WasmSystem } = shim;
+
+      const img = await getAlpine();
+      const probe = await img.createContainer({ cmd: ["/bin/sh", "-c", "true"], tty: false });
+      const busyboxBytes = await probe.readFile("/bin/busybox");
+      const muslBytes = await probe.readFile("/lib/ld-musl-x86_64.so.1");
+      await probe.stop();
+      assert.ok(busyboxBytes && busyboxBytes.length > 0, "Expected /bin/busybox bytes from alpine");
+      assert.ok(muslBytes && muslBytes.length > 0, "Expected /lib/ld-musl-x86_64.so.1 from alpine");
+
+      const compilerMod = await WebAssembly.compile(fs.readFileSync(REQUIRED_ARTIFACTS.compilerWasm));
+      const compilerInst = await WebAssembly.instantiate(compilerMod, {});
+      const changes = [];
+      const sys = await Elf2WasmSystem.create({
+        compilerInst,
+        compilerMod,
+        onCompilerInstChange: (inst) => changes.push(inst === null ? "null" : "inst"),
+        runtimeWasm: fs.readFileSync(REQUIRED_ARTIFACTS.runtimeWasm),
+      });
+
+      const mem = sys.compilerInst.exports.memory;
+      const curPages = mem.buffer.byteLength >>> 16;
+      if (curPages < 2050) {
+        mem.grow(2050 - curPages);
+      }
+      assert.ok(mem.buffer.byteLength > 128 * 1024 * 1024);
+
+      let threw = false;
+      try {
+        await sys._compileCached(makeElfHeader({ len: 8 }), [], "/corrupt_t5");
+      } catch {
+        threw = true;
+      }
+      assert.equal(threw, true, "Corrupt ELF compilation must throw");
+      assert.equal(sys.compilerInst, null, "Bloated/failed compilerInst must be dropped on error");
+      assert.deepEqual(changes, ["null"]);
+
+      const compiled = await sys._compileCached(
+        busyboxBytes,
+        [{ path: "/lib/ld-musl-x86_64.so.1", name: "ld-musl-x86_64.so.1", bytes: muslBytes }],
+        "/bin/busybox"
+      );
+      assert.ok(compiled.mod instanceof WebAssembly.Module);
+      assert.ok(sys.compilerInst !== null, "compilerInst must re-instantiate cleanly on next compile");
+      assert.deepEqual(changes, ["null", "inst"]);
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // T5.13 (R2-C2-Gap3): web/app.mjs disposes DockerImage on cancel right after pullImage & recovers from error via preset chip
+  // -------------------------------------------------------------------------
+  suite.add(
+    "T5.13",
+    "R2-C2-Gap3: web/app.mjs disposes DockerImage on cancel after pullImage and recovers from error state via preset chip",
+    async () => {
+      const browser = await launchCdpBrowser();
+      try {
+        await browser.navigate(`${localServer.url}/`);
+
+        // Part A: Intercept pullImage to click Stop right as pullImage resolves (line 410 cancel path)
+        await browser.evaluate(`(async () => {
+          const { Elf2WasmDocker } = await import("/js/docker_sdk.mjs");
+          window.__t5_state = { docker: null, pullResolved: false, origPull: Elf2WasmDocker.prototype.pullImage };
+          const origCreate = Elf2WasmDocker.create;
+          Elf2WasmDocker.create = async (opts) => {
+            const d = await origCreate.call(Elf2WasmDocker, { ...opts, useWorker: false });
+            window.__t5_state.docker = d;
+            return d;
+          };
+          Elf2WasmDocker.prototype.pullImage = async function (...args) {
+            const img = await window.__t5_state.origPull.apply(this, args);
+            document.getElementById("stop-btn").click();
+            window.__t5_state.pullResolved = true;
+            return img;
+          };
+        })()`);
+
+        await browser.setInputValue("#image-input", registry.imageRef("library/alpine", "latest"));
+        await browser.click("#start-btn");
+
+        await waitFor(
+          async () =>
+            Boolean(await browser.evaluate(`Boolean(window.__t5_state && window.__t5_state.pullResolved)`)),
+          { timeoutMs: 30000, intervalMs: 100, label: "pullImage resolve before stop" }
+        );
+
+        await waitFor(
+          async () =>
+            (await browser.evaluate(
+              `window.__t5_state.docker ? window.__t5_state.docker._backend.engine.images.size : -1`
+            )) === 0,
+          { timeoutMs: 5000, intervalMs: 50, label: "engine.images disposal after cancel" }
+        );
+
+        const leakedImages = await browser.evaluate(
+          `window.__t5_state.docker._backend.engine.images.size`
+        );
+        assert.equal(leakedImages, 0, `Expected 0 leaked images in engine.images, got ${leakedImages}`);
+
+        // Restore pullImage for Part B
+        await browser.evaluate(`(async () => {
+          const { Elf2WasmDocker } = await import("/js/docker_sdk.mjs");
+          Elf2WasmDocker.prototype.pullImage = window.__t5_state.origPull;
+        })()`);
+
+        // Part B: Trigger error state, recover via preset chip click, then run valid local image
+        await browser.setInputValue("#image-input", "INVALID_UPPER/repo");
+        await browser.click("#start-btn");
+        await waitFor(
+          async () =>
+            (await browser.evaluate(`document.getElementById("status-pill")?.dataset?.state`)) ===
+            "error",
+          { timeoutMs: 10000, intervalMs: 100, label: "error state on invalid image ref" }
+        );
+
+        // Click a preset chip and verify it updates #image-input
+        await browser.click('.preset-chip[data-image="python:3.12-slim"]');
+        const chipVal = await browser.evaluate(`document.getElementById("image-input").value`);
+        assert.equal(chipVal, "python:3.12-slim", "Preset chip click must populate #image-input");
+
+        // Now run valid local alpine image and verify clean recovery from error state
+        await browser.setInputValue("#image-input", registry.imageRef("library/alpine", "latest"));
+        await browser.setInputValue("#cmd-input", "/bin/sh -c 'echo ERROR_RECOVERED_OK'");
+        await browser.click("#start-btn");
+
+        await waitFor(
+          async () => {
+            const state = await browser.evaluate(
+              `document.getElementById("status-pill")?.dataset?.state`
+            );
+            const status = await browser.getText("#status-text");
+            const term = stripAnsi(await browser.getText("#terminal"));
+            return (
+              state === "idle" &&
+              status.includes("Exited (code 0)") &&
+              term.includes("ERROR_RECOVERED_OK")
+            );
+          },
+          { timeoutMs: 60000, intervalMs: 250, label: "recovery from error state" }
+        );
+      } finally {
+        await browser.close();
+      }
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // T5.14 (R2-C2-Gap4): MessageChannel yield fallback & clean Node.js process exit
+  // -------------------------------------------------------------------------
+  suite.add(
+    "T5.14",
+    "R2-C2-Gap4: MessageChannel yield exits cleanly in Node.js and falls back to setTimeout(0) when unavailable",
+    async () => {
+      const img = await getAlpine();
+      const probe = await img.createContainer({ cmd: ["/bin/sh", "-c", "true"], tty: false });
+      const busyboxBytes = await probe.readFile("/bin/busybox");
+      const muslBytes = await probe.readFile("/lib/ld-musl-x86_64.so.1");
+      await probe.stop();
+
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "elf2wasm-t5-mc-"));
+      const elfFile = path.join(tmpDir, "busybox");
+      const muslFile = path.join(tmpDir, "ld-musl-x86_64.so.1");
+      fs.writeFileSync(elfFile, busyboxBytes);
+      fs.writeFileSync(muslFile, muslBytes);
+
+      try {
+        const runChild = (disableMessageChannel) => {
+          const script = `
+            ${disableMessageChannel ? "globalThis.MessageChannel = undefined;" : ""}
+            import fs from "node:fs";
+            import { Elf2WasmSystem } from "./js/elf2wasm_shim.mjs";
+            const elf = fs.readFileSync(${JSON.stringify(elfFile)});
+            const musl = fs.readFileSync(${JSON.stringify(muslFile)});
+            const sys = await Elf2WasmSystem.create({
+              compilerWasm: fs.readFileSync(${JSON.stringify(REQUIRED_ARTIFACTS.compilerWasm)}),
+              runtimeWasm: fs.readFileSync(${JSON.stringify(REQUIRED_ARTIFACTS.runtimeWasm)}),
+            });
+            const res = await sys.runElf(
+              elf,
+              [{ path: "/lib/ld-musl-x86_64.so.1", name: "ld-musl-x86_64.so.1", bytes: musl }],
+              ["echo", "YIELD_E2E_OK"],
+              {
+                elfPath: "/bin/busybox",
+                preserveArgv0: true,
+                yieldEvery: 1,
+              }
+            );
+            const out = new TextDecoder().decode(res.stdout).trim();
+            if (res.exitCode !== 0 || out !== "YIELD_E2E_OK") {
+              console.error("Unexpected result:", res.exitCode, out);
+              process.exit(2);
+            }
+            console.log("CHILD_OK:" + out);
+            // Do NOT call process.exit() — verify unref'd MessagePorts allow natural exit
+          `;
+          return spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+            cwd: REPO_ROOT,
+            encoding: "utf8",
+            timeout: 30000,
+          });
+        };
+
+        const withMc = runChild(false);
+        assert.equal(withMc.status, 0, `MessageChannel child failed: ${withMc.stderr}`);
+        assertIncludes(withMc.stdout, "CHILD_OK:YIELD_E2E_OK");
+
+        const withoutMc = runChild(true);
+        assert.equal(withoutMc.status, 0, `Fallback setTimeout(0) child failed: ${withoutMc.stderr}`);
+        assertIncludes(withoutMc.stdout, "CHILD_OK:YIELD_E2E_OK");
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
       }
     }
   );

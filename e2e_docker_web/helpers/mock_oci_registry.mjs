@@ -44,37 +44,113 @@ function atomicWriteFile(filePath, data) {
   fs.renameSync(tmpPath, filePath);
 }
 
+function isGzipFileSync(filePath) {
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const buf = Buffer.allocUnsafe(2);
+    const n = fs.readSync(fd, buf, 0, 2, 0);
+    return n === 2 && buf[0] === 0x1f && buf[1] === 0x8b;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function sha256FileSync(filePath) {
+  const hash = crypto.createHash("sha256");
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const chunk = Buffer.allocUnsafe(1024 * 1024);
+    let bytesRead;
+    while ((bytesRead = fs.readSync(fd, chunk, 0, chunk.length, null)) > 0) {
+      hash.update(chunk.subarray(0, bytesRead));
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return `sha256:${hash.digest("hex")}`;
+}
+
+function gzipFileLevel1Sync(srcPath, dstPath) {
+  const tmpPath = `${dstPath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    const outFd = fs.openSync(tmpPath, "w");
+    try {
+      execFileSync("gzip", ["-1", "-c", srcPath], {
+        stdio: ["ignore", outFd, "pipe"],
+        timeout: 120000,
+      });
+    } finally {
+      fs.closeSync(outFd);
+    }
+    fs.renameSync(tmpPath, dstPath);
+  } catch {
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch {
+      // ignore
+    }
+    const raw = fs.readFileSync(srcPath);
+    const gzipped = zlib.gzipSync(raw, { level: 1 });
+    atomicWriteFile(dstPath, gzipped);
+  }
+}
+
+function copyFileAtomicSync(srcPath, dstPath) {
+  const tmpPath = `${dstPath}.${process.pid}.${Date.now()}.tmp`;
+  fs.copyFileSync(srcPath, tmpPath);
+  fs.renameSync(tmpPath, dstPath);
+}
+
 /**
- * Lazily extract a real linux/amd64 Docker image (e.g. "alpine:latest", "busybox:musl")
- * from local Docker into `/tmp/elf2wasm-e2e-cache/` so repeat runs take <5ms.
+ * Lazily extract all layers of a real linux/amd64 Docker image
+ * (e.g. "alpine:latest", "busybox:musl", "python:3.12-slim", "node:22-slim")
+ * from local Docker into `/tmp/elf2wasm-e2e-cache/<sanitized>/` (v2 cache)
+ * using external `tar -xf` and disk-backed layer files to avoid Node V8 heap spikes.
  */
 export function loadDockerBaseImage(imageName, cacheDir = DEFAULT_CACHE_DIR) {
   const dir = path.join(cacheDir, sanitizeName(imageName));
   const metaPath = path.join(dir, "meta.json");
   const configPath = path.join(dir, "config.json");
-  const layerPath = path.join(dir, "layer0.tar.gz");
 
-  if (fs.existsSync(metaPath) && fs.existsSync(configPath) && fs.existsSync(layerPath)) {
+  if (fs.existsSync(metaPath) && fs.existsSync(configPath)) {
     try {
       const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
       const configBytes = new Uint8Array(fs.readFileSync(configPath));
-      const gzBytes = new Uint8Array(fs.readFileSync(layerPath));
       if (
         meta &&
-        meta.layerDigest === sha256Digest(gzBytes) &&
+        meta.version === 2 &&
         meta.configDigest === sha256Digest(configBytes) &&
-        isGzip(gzBytes)
+        Array.isArray(meta.layers) &&
+        meta.layers.length > 0
       ) {
-        return {
-          configJson: JSON.parse(Buffer.from(configBytes).toString("utf8")),
-          configBytes,
-          layer: {
-            gzBytes,
-            digest: meta.layerDigest,
-            diffId: meta.layerDiffId,
-            size: gzBytes.length,
-          },
-        };
+        const layers = [];
+        let allValid = true;
+        for (const item of meta.layers) {
+          const filePath = path.join(dir, item.file);
+          if (!fs.existsSync(filePath)) {
+            allValid = false;
+            break;
+          }
+          const stat = fs.statSync(filePath);
+          if (stat.size !== item.size || !isGzipFileSync(filePath)) {
+            allValid = false;
+            break;
+          }
+          layers.push({
+            filePath,
+            digest: item.digest,
+            diffId: item.diffId,
+            size: item.size,
+          });
+        }
+        if (allValid) {
+          return {
+            configJson: JSON.parse(Buffer.from(configBytes).toString("utf8")),
+            configBytes,
+            layers,
+            layer: layers[0],
+          };
+        }
       }
     } catch {
       // Fall through and rebuild cache
@@ -82,86 +158,113 @@ export function loadDockerBaseImage(imageName, cacheDir = DEFAULT_CACHE_DIR) {
   }
 
   fs.mkdirSync(dir, { recursive: true });
-  const tmpTar = path.join(os.tmpdir(), `elf2wasm-save-${sanitizeName(imageName)}-${process.pid}-${Date.now()}.tar`);
+  const stamp = `${process.pid}-${Date.now()}`;
+  const tmpTar = path.join(os.tmpdir(), `elf2wasm-save-${sanitizeName(imageName)}-${stamp}.tar`);
+  const extractDir = fs.mkdtempSync(path.join(os.tmpdir(), `elf2wasm-extract-${sanitizeName(imageName)}-`));
 
   try {
     try {
       execFileSync("docker", ["save", "-o", tmpTar, imageName], {
         stdio: ["ignore", "pipe", "pipe"],
-        timeout: 60000,
+        timeout: 120000,
       });
     } catch {
       execFileSync("docker", ["pull", "--platform", "linux/amd64", imageName], {
         stdio: ["ignore", "pipe", "pipe"],
-        timeout: 120000,
+        timeout: 240000,
       });
       execFileSync("docker", ["save", "-o", tmpTar, imageName], {
         stdio: ["ignore", "pipe", "pipe"],
-        timeout: 60000,
+        timeout: 120000,
       });
     }
 
-    const tarBuf = fs.readFileSync(tmpTar);
-    const entries = parseTarEntries(tarBuf);
-    const byName = new Map();
-    for (const e of entries) {
-      byName.set(e.name.replace(/^\.\//, ""), e);
-    }
+    execFileSync("tar", ["-xf", tmpTar, "-C", extractDir], {
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 120000,
+    });
 
-    const manifestEntry = byName.get("manifest.json");
-    if (!manifestEntry) {
+    const manifestPath = path.join(extractDir, "manifest.json");
+    if (!fs.existsSync(manifestPath)) {
       throw new Error(`docker save ${imageName} did not contain manifest.json`);
     }
-    const manifestList = JSON.parse(Buffer.from(manifestEntry.data).toString("utf8"));
+    const manifestList = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
     const first = manifestList[0];
     if (!first || !first.Config || !first.Layers || first.Layers.length === 0) {
       throw new Error(`Unexpected manifest.json structure for ${imageName}`);
     }
 
-    const cfgEntry = byName.get(first.Config.replace(/^\.\//, ""));
-    const layerEntry = byName.get(first.Layers[0].replace(/^\.\//, ""));
-    if (!cfgEntry || !layerEntry) {
-      throw new Error(`Missing config or layer blob in docker save archive for ${imageName}`);
+    const cfgSrcPath = path.join(extractDir, first.Config.replace(/^\.\//, ""));
+    if (!fs.existsSync(cfgSrcPath)) {
+      throw new Error(`Missing config blob in docker save archive for ${imageName}`);
     }
-
-    const configBytes = cfgEntry.data;
-    const rawLayer = layerEntry.data;
-    let gzBytes;
-    let tarBytes;
-    if (isGzip(rawLayer)) {
-      gzBytes = rawLayer;
-      const gunzipped = zlib.gunzipSync(rawLayer);
-      tarBytes = new Uint8Array(gunzipped.buffer, gunzipped.byteOffset, gunzipped.byteLength);
-    } else {
-      tarBytes = rawLayer;
-      const gzipped = zlib.gzipSync(rawLayer, { level: 6 });
-      gzBytes = new Uint8Array(gzipped.buffer, gzipped.byteOffset, gzipped.byteLength);
-    }
-
+    const configBytes = new Uint8Array(fs.readFileSync(cfgSrcPath));
+    const configJson = JSON.parse(Buffer.from(configBytes).toString("utf8"));
     const configDigest = sha256Digest(configBytes);
-    const layerDigest = sha256Digest(gzBytes);
-    const layerDiffId = sha256Digest(tarBytes);
+    const configDiffIds = Array.isArray(configJson?.rootfs?.diff_ids) ? configJson.rootfs.diff_ids : [];
+
+    const layers = [];
+    const metaLayers = [];
+
+    for (let i = 0; i < first.Layers.length; i++) {
+      const srcLayerPath = path.join(extractDir, first.Layers[i].replace(/^\.\//, ""));
+      if (!fs.existsSync(srcLayerPath)) {
+        throw new Error(`Missing layer ${i} (${first.Layers[i]}) in docker save archive for ${imageName}`);
+      }
+      const dstFile = `layer${i}.tar.gz`;
+      const dstLayerPath = path.join(dir, dstFile);
+
+      let diffId;
+      if (isGzipFileSync(srcLayerPath)) {
+        copyFileAtomicSync(srcLayerPath, dstLayerPath);
+        if (configDiffIds[i]) {
+          diffId = configDiffIds[i];
+        } else {
+          const gunzipped = zlib.gunzipSync(fs.readFileSync(dstLayerPath));
+          diffId = sha256Digest(gunzipped);
+        }
+      } else {
+        diffId = sha256FileSync(srcLayerPath);
+        gzipFileLevel1Sync(srcLayerPath, dstLayerPath);
+      }
+
+      const digest = sha256FileSync(dstLayerPath);
+      const size = fs.statSync(dstLayerPath).size;
+
+      layers.push({
+        filePath: dstLayerPath,
+        digest,
+        diffId,
+        size,
+      });
+      metaLayers.push({
+        file: dstFile,
+        digest,
+        diffId,
+        size,
+      });
+    }
 
     atomicWriteFile(configPath, configBytes);
-    atomicWriteFile(layerPath, gzBytes);
     atomicWriteFile(
       metaPath,
-      JSON.stringify({ imageName, configDigest, layerDigest, layerDiffId }, null, 2)
+      JSON.stringify({ version: 2, imageName, configDigest, layers: metaLayers }, null, 2)
     );
 
     return {
-      configJson: JSON.parse(Buffer.from(configBytes).toString("utf8")),
+      configJson,
       configBytes,
-      layer: {
-        gzBytes,
-        digest: layerDigest,
-        diffId: layerDiffId,
-        size: gzBytes.length,
-      },
+      layers,
+      layer: layers[0],
     };
   } finally {
     try {
       fs.rmSync(tmpTar, { force: true });
+    } catch {
+      // ignore
+    }
+    try {
+      fs.rmSync(extractDir, { recursive: true, force: true });
     } catch {
       // ignore
     }
@@ -187,10 +290,10 @@ export function buildOciImage({
     os: "linux",
     config: {
       Env: config.Env || ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
-      ...(config.Entrypoint !== undefined ? { Entrypoint: config.Entrypoint } : {}),
-      ...(config.Cmd !== undefined ? { Cmd: config.Cmd } : {}),
-      ...(config.WorkingDir !== undefined ? { WorkingDir: config.WorkingDir } : {}),
-      ...(config.User !== undefined ? { User: config.User } : {}),
+      ...(config.Entrypoint != null ? { Entrypoint: config.Entrypoint } : {}),
+      ...(config.Cmd != null ? { Cmd: config.Cmd } : {}),
+      ...(config.WorkingDir ? { WorkingDir: config.WorkingDir } : {}),
+      ...(config.User ? { User: config.User } : {}),
     },
     rootfs: {
       type: "layers",
@@ -212,7 +315,7 @@ export function buildOciImage({
     layers: layers.map((l) => ({
       mediaType: layerMediaType,
       digest: l.digest,
-      size: l.gzBytes.length,
+      size: l.size ?? l.gzBytes.length,
     })),
   };
   const amd64ManifestBytes = new Uint8Array(Buffer.from(JSON.stringify(amd64ManifestObj), "utf8"));
@@ -228,15 +331,27 @@ export function buildOciImage({
   const blobsByDigest = new Map();
   blobsByDigest.set(configDigest, {
     bytes: configBytes,
+    size: configBytes.length,
     mediaType: configMediaType,
     digest: configDigest,
   });
   for (const l of layers) {
-    blobsByDigest.set(l.digest, {
-      bytes: l.gzBytes,
-      mediaType: layerMediaType,
-      digest: l.digest,
-    });
+    const size = l.size ?? l.gzBytes.length;
+    if (l.filePath) {
+      blobsByDigest.set(l.digest, {
+        filePath: l.filePath,
+        size,
+        mediaType: layerMediaType,
+        digest: l.digest,
+      });
+    } else {
+      blobsByDigest.set(l.digest, {
+        bytes: l.gzBytes,
+        size,
+        mediaType: layerMediaType,
+        digest: l.digest,
+      });
+    }
   }
 
   let rootManifest;
@@ -324,6 +439,22 @@ export function buildOciImage({
   };
 }
 
+function buildDockerBaseOciImage(dockerImageName, cacheDir, fallbackCmd) {
+  const base = loadDockerBaseImage(dockerImageName, cacheDir);
+  const cfg = base.configJson.config || {};
+  return buildOciImage({
+    config: {
+      Env: cfg.Env || ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+      ...(cfg.Entrypoint != null ? { Entrypoint: cfg.Entrypoint } : {}),
+      ...(cfg.Cmd != null ? { Cmd: cfg.Cmd } : fallbackCmd ? { Cmd: fallbackCmd } : {}),
+      ...(cfg.WorkingDir ? { WorkingDir: cfg.WorkingDir } : {}),
+      ...(cfg.User ? { User: cfg.User } : {}),
+    },
+    layers: base.layers,
+    multiArch: true,
+  });
+}
+
 function buildBuiltinFixtures(cacheDir, selectedFixtures) {
   const want = new Set(selectedFixtures || ["alpine", "layered", "combo", "busybox", "app_v2"]);
   const images = new Map();
@@ -338,10 +469,12 @@ function buildBuiltinFixtures(cacheDir, selectedFixtures) {
     const baseOpts = {
       config: {
         Env: alpineCfg.Env || ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+        ...(alpineCfg.Entrypoint != null ? { Entrypoint: alpineCfg.Entrypoint } : {}),
         Cmd: alpineCfg.Cmd || ["/bin/sh"],
         WorkingDir: alpineCfg.WorkingDir || "/",
+        ...(alpineCfg.User ? { User: alpineCfg.User } : {}),
       },
-      layers: [alpineBase.layer],
+      layers: alpineBase.layers,
     };
     images.set("library/alpine:latest", buildOciImage({ ...baseOpts, multiArch: true, dockerV2: false }));
     images.set("direct/alpine:latest", buildOciImage({ ...baseOpts, multiArch: false, dockerV2: false }));
@@ -384,7 +517,7 @@ function buildBuiltinFixtures(cacheDir, selectedFixtures) {
         Cmd: ["pwd && echo $APP_MODE:$CUSTOM_VAR"],
         User: "0:0",
       },
-      layers: [alpineBase.layer, layer1, layer2],
+      layers: [...alpineBase.layers, layer1, layer2],
       multiArch: true,
     }));
   }
@@ -417,22 +550,13 @@ function buildBuiltinFixtures(cacheDir, selectedFixtures) {
         Cmd: ["/bin/sh"],
         User: "0:0",
       },
-      layers: [alpineBase.layer, layer1, layer2],
+      layers: [...alpineBase.layers, layer1, layer2],
       multiArch: true,
     }));
   }
 
   if (want.has("busybox")) {
-    const busyboxBase = loadDockerBaseImage("busybox:musl", cacheDir);
-    const bbCfg = busyboxBase.configJson.config || {};
-    images.set("library/busybox:musl", buildOciImage({
-      config: {
-        Env: bbCfg.Env || ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
-        Cmd: bbCfg.Cmd || ["sh"],
-      },
-      layers: [busyboxBase.layer],
-      multiArch: true,
-    }));
+    images.set("library/busybox:musl", buildDockerBaseOciImage("busybox:musl", cacheDir, ["sh"]));
   }
 
   if (want.has("app_v2") && alpineBase) {
@@ -451,9 +575,17 @@ function buildBuiltinFixtures(cacheDir, selectedFixtures) {
         Cmd: ["/bin/sh"],
         User: "0:0",
       },
-      layers: [alpineBase.layer, appLayer],
+      layers: [...alpineBase.layers, appLayer],
       multiArch: true,
     }));
+  }
+
+  if (want.has("python")) {
+    images.set("library/python:3.12-slim", buildDockerBaseOciImage("python:3.12-slim", cacheDir, ["python3"]));
+  }
+
+  if (want.has("node")) {
+    images.set("library/node:22-slim", buildDockerBaseOciImage("node:22-slim", cacheDir, ["node"]));
   }
 
   return images;
@@ -587,13 +719,34 @@ export async function startMockOciRegistry(opts = {}) {
       leakedAuth: false,
       timestamp: Date.now(),
     });
+    sendBlobResponse(req, res, blob);
+  });
+
+  function sendBlobResponse(req, res, blob) {
+    const size = blob.size ?? blob.bytes.length;
     res.writeHead(200, {
       "Content-Type": blob.mediaType || "application/octet-stream",
-      "Content-Length": String(blob.bytes.length),
+      "Content-Length": String(size),
       "Docker-Content-Digest": blob.digest,
     });
-    res.end(req.method === "HEAD" ? undefined : Buffer.from(blob.bytes));
-  });
+    if (req.method === "HEAD") {
+      res.end();
+      return;
+    }
+    if (blob.filePath) {
+      const stream = fs.createReadStream(blob.filePath);
+      stream.on("error", () => {
+        if (!res.headersSent) {
+          res.writeHead(500);
+        }
+        res.destroy();
+      });
+      stream.pipe(res);
+    } else {
+      const buf = Buffer.from(blob.bytes.buffer, blob.bytes.byteOffset, blob.bytes.byteLength);
+      res.end(buf);
+    }
+  }
 
   function checkBearerAuth(req, res, scope, pathname, search) {
     if (!requireAuth) return true;
@@ -752,7 +905,11 @@ export async function startMockOciRegistry(opts = {}) {
         "Content-Length": String(entry.bytes.length),
         "Docker-Distribution-Api-Version": "registry/2.0",
       });
-      res.end(req.method === "HEAD" ? undefined : Buffer.from(entry.bytes));
+      res.end(
+        req.method === "HEAD"
+          ? undefined
+          : Buffer.from(entry.bytes.buffer, entry.bytes.byteOffset, entry.bytes.byteLength)
+      );
       return;
     }
 
@@ -789,12 +946,7 @@ export async function startMockOciRegistry(opts = {}) {
       }
 
       record(200);
-      res.writeHead(200, {
-        "Content-Type": blob.mediaType || "application/octet-stream",
-        "Content-Length": String(blob.bytes.length),
-        "Docker-Content-Digest": blob.digest,
-      });
-      res.end(req.method === "HEAD" ? undefined : Buffer.from(blob.bytes));
+      sendBlobResponse(req, res, blob);
       return;
     }
 
@@ -827,6 +979,33 @@ export async function startMockOciRegistry(opts = {}) {
     },
     registerImage(repo, tag, ociImage) {
       indexImage(repo, tag, ociImage);
+    },
+    ensureBuiltinFixture(name) {
+      if (name === "python") {
+        if (!images.has("library/python:3.12-slim")) {
+          indexImage("library/python", "3.12-slim", buildDockerBaseOciImage("python:3.12-slim", cacheDir, ["python3"]));
+        }
+        return `127.0.0.1:${regPort}/library/python:3.12-slim`;
+      }
+      if (name === "node") {
+        if (!images.has("library/node:22-slim")) {
+          indexImage("library/node", "22-slim", buildDockerBaseOciImage("node:22-slim", cacheDir, ["node"]));
+        }
+        return `127.0.0.1:${regPort}/library/node:22-slim`;
+      }
+      const built = buildBuiltinFixtures(cacheDir, [name]);
+      if (built.size === 0) {
+        throw new Error(`Unknown builtin fixture: ${name}`);
+      }
+      let firstKey = null;
+      for (const [key, img] of built.entries()) {
+        if (!firstKey) firstKey = key;
+        if (!images.has(key)) {
+          const idx = key.lastIndexOf(":");
+          indexImage(key.slice(0, idx), key.slice(idx + 1), img);
+        }
+      }
+      return `127.0.0.1:${regPort}/${firstKey}`;
     },
     /**
      * Build an in-memory OCI + Docker-compatible tarball (Uint8Array) for offline loadOciTarball tests.
@@ -889,7 +1068,7 @@ export async function startMockOciRegistry(opts = {}) {
         tarEntries.push({
           path: `blobs/sha256/${lHex}`,
           type: "file",
-          content: l.gzBytes,
+          content: l.gzBytes ?? new Uint8Array(fs.readFileSync(l.filePath)),
         });
       }
 

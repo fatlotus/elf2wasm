@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { findChromeBinary } from "./server_harness.mjs";
-import { sleep, waitFor } from "./test_runner.mjs";
+import { sleep, stripAnsi, waitFor } from "./test_runner.mjs";
 
 export { findChromeBinary };
 
@@ -470,6 +470,83 @@ export async function launchCdpBrowser(opts = {}) {
       }
     }
 
+    async function getPresetChips() {
+      return evaluate(
+        `Array.from(document.querySelectorAll(".preset-chip")).map((el) => ({
+          image: el.dataset.image || "",
+          text: (el.textContent || "").trim(),
+        }))`,
+        { awaitPromise: false }
+      );
+    }
+
+    async function clickPresetChip(imageName) {
+      const selector = `button.preset-chip[data-image=${JSON.stringify(imageName)}]`;
+      await click(selector);
+      return evaluate(
+        'document.querySelector("#image-input")?.value ?? ""',
+        { awaitPromise: false }
+      );
+    }
+
+    async function waitForTerminalText(matcher, waitOpts = {}) {
+      const {
+        timeoutMs = 90000,
+        intervalMs = 250,
+        label = "terminal text",
+      } = waitOpts;
+      const t0 = Date.now();
+      let matchedText = "";
+      await waitFor(
+        async () => {
+          const text = stripAnsi(await getText("#terminal"));
+          let ok = false;
+          if (typeof matcher === "string") {
+            ok = text.includes(matcher);
+          } else if (matcher instanceof RegExp) {
+            ok = matcher.test(text);
+          } else if (typeof matcher === "function") {
+            ok = Boolean(matcher(text));
+          }
+          if (ok) {
+            matchedText = text;
+            return true;
+          }
+          return false;
+        },
+        { timeoutMs, intervalMs, label }
+      );
+      return { text: matchedText, elapsedMs: Date.now() - t0 };
+    }
+
+    async function sendControlKey(key, keyOpts = {}) {
+      const { selector = "#terminal" } = keyOpts;
+      await focusSelector(selector);
+      const ch = String(key || "").toLowerCase();
+      if (!ch || ch.length !== 1) {
+        throw new Error(`sendControlKey expects a single character, got ${JSON.stringify(key)}`);
+      }
+      const upper = ch.toUpperCase();
+      const vk = upper.charCodeAt(0);
+      const code = /^[A-Z]$/.test(upper) ? `Key${upper}` : "";
+      await send("Input.dispatchKeyEvent", {
+        type: "keyDown",
+        modifiers: 2,
+        key: ch,
+        code,
+        windowsVirtualKeyCode: vk,
+        nativeVirtualKeyCode: vk,
+      });
+      await send("Input.dispatchKeyEvent", {
+        type: "keyUp",
+        modifiers: 2,
+        key: ch,
+        code,
+        windowsVirtualKeyCode: vk,
+        nativeVirtualKeyCode: vk,
+      });
+    }
+
     return {
       chromePath,
       userDataDir,
@@ -489,6 +566,10 @@ export async function launchCdpBrowser(opts = {}) {
       getText,
       focusSelector,
       typeIntoTerminal,
+      getPresetChips,
+      clickPresetChip,
+      waitForTerminalText,
+      sendControlKey,
       clearLogs() {
         exceptions.length = 0;
         consoleErrors.length = 0;

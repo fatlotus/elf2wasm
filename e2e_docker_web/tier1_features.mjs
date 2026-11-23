@@ -7,12 +7,16 @@ import { pathToFileURL } from "node:url";
 import {
   assert,
   assertIncludes,
+  assertMatch,
   stripAnsi,
+  skip,
   waitFor,
+  waitWithTimeout,
   Suite,
 } from "./helpers/test_runner.mjs";
 import { startMockOciRegistry } from "./helpers/mock_oci_registry.mjs";
-import { REQUIRED_ARTIFACTS, startServer } from "./helpers/server_harness.mjs";
+import { REQUIRED_ARTIFACTS, findChromeBinary, startServer } from "./helpers/server_harness.mjs";
+import { launchCdpBrowser } from "./helpers/cdp_browser.mjs";
 
 function assertCoopCoep(headers, label) {
   assert.equal(
@@ -43,8 +47,28 @@ export async function runTier1(opts = {}) {
 
   let sharedDocker = null;
   let sharedAlpineImage = null;
+  let sharedPythonImage = null;
+  let sharedNodeImage = null;
   let alpineAmd64Digest = null;
   let alpineLayerDigest = null;
+
+  async function getPython() {
+    if (!sharedDocker) sharedDocker = await Elf2WasmDocker.create(sdkOpts);
+    if (!sharedPythonImage) {
+      const ref = registry.ensureBuiltinFixture("python");
+      sharedPythonImage = await sharedDocker.pullImage(ref);
+    }
+    return sharedPythonImage;
+  }
+
+  async function getNode() {
+    if (!sharedDocker) sharedDocker = await Elf2WasmDocker.create(sdkOpts);
+    if (!sharedNodeImage) {
+      const ref = registry.ensureBuiltinFixture("node");
+      sharedNodeImage = await sharedDocker.pullImage(ref);
+    }
+    return sharedNodeImage;
+  }
 
   const suite = new Suite("Tier 1 (Features)");
 
@@ -487,6 +511,236 @@ export async function runTier1(opts = {}) {
     ];
     for (const sym of required) {
       assert.ok(exportNames.has(sym), `Missing Contract §1 export in runtime-wasm: ${sym}`);
+    }
+  });
+
+  suite.add("T1.1.8", "GET / includes python:3.12-slim and node:22-slim preset chips while keeping alpine:latest default", async () => {
+    const resp = await fetch(`${server.url}/`);
+    assert.equal(resp.status, 200);
+    assertCoopCoep(resp.headers, "GET / presets");
+    const html = await resp.text();
+    assertIncludes(html, 'class="presets-row"', "index.html must contain .presets-row");
+    assertMatch(
+      html,
+      /<input[^>]*id="image-input"[^>]*value="alpine:latest"|<input[^>]*value="alpine:latest"[^>]*id="image-input"/s,
+      "#image-input must retain default value='alpine:latest'"
+    );
+    for (const preset of [
+      "alpine:latest",
+      "busybox:latest",
+      "debian:bookworm-slim",
+      "python:3.12-slim",
+      "node:22-slim",
+    ]) {
+      assertIncludes(html, `data-image="${preset}"`, `Missing preset chip data-image="${preset}"`);
+    }
+    for (const preset of ["python:3.12-slim", "node:22-slim"]) {
+      const escaped = preset.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      assertMatch(
+        html,
+        new RegExp(
+          `<button[^>]*class="[^"]*preset-chip[^"]*"[^>]*data-image="${escaped}"|<button[^>]*data-image="${escaped}"[^>]*class="[^"]*preset-chip[^"]*"`,
+          "s"
+        ),
+        `Preset chip for ${preset} must be a button.preset-chip[data-image="${preset}"]`
+      );
+    }
+  });
+
+  suite.add("T1.1.9", "Clicking .preset-chip buttons for python:3.12-slim and node:22-slim updates #image-input without breaking alpine:latest default", async () => {
+    if (!findChromeBinary()) {
+      skip("Chrome binary not available");
+    }
+    const browser = await launchCdpBrowser();
+    try {
+      await browser.navigate(`${server.url}/`);
+      await browser.waitForSelector("#image-input", 15000);
+      await browser.waitForSelector(".presets-row", 15000);
+
+      const initialVal = await browser.evaluate('document.querySelector("#image-input").value', { awaitPromise: false });
+      assert.equal(initialVal, "alpine:latest", "Initial #image-input value must be alpine:latest");
+
+      const chips = await browser.getPresetChips();
+      const chipImages = chips.map((c) => c.image);
+      assert.ok(chipImages.includes("python:3.12-slim"), "Preset chips must include python:3.12-slim");
+      assert.ok(chipImages.includes("node:22-slim"), "Preset chips must include node:22-slim");
+      assert.ok(chipImages.includes("alpine:latest"), "Preset chips must include alpine:latest");
+
+      const pyVal = await browser.clickPresetChip("python:3.12-slim");
+      assert.equal(pyVal, "python:3.12-slim", "Clicking python:3.12-slim chip must populate #image-input");
+
+      const nodeVal = await browser.clickPresetChip("node:22-slim");
+      assert.equal(nodeVal, "node:22-slim", "Clicking node:22-slim chip must populate #image-input");
+
+      const alpineVal = await browser.clickPresetChip("alpine:latest");
+      assert.equal(alpineVal, "alpine:latest", "Clicking alpine:latest chip must restore #image-input");
+
+      assert.deepEqual(browser.exceptions, [], `Uncaught exceptions: ${JSON.stringify(browser.exceptions)}`);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  suite.add("T1.7.1", "python:3.12-slim basic script execution (-c print(20+22))", async () => {
+    const img = await getPython();
+    const container = await img.createContainer({
+      cmd: ["python3", "-c", "import sys; print('PY_OK', sys.version_info[:2], 20+22)"],
+      tty: false,
+    });
+    await container.start();
+    try {
+      const res = await waitWithTimeout(container.wait(), 120000, "T1.7.1 python3 -c");
+      assert.equal(res.exitCode, 0, `Expected exitCode 0, stderr: ${res.stderr}`);
+      assertIncludes(stripAnsi(res.stdout), "PY_OK (3, 12) 42");
+    } finally {
+      await container.stop().catch(() => {});
+    }
+  });
+
+  suite.add("T1.7.2", "python:3.12-slim core stdlib imports & operations (12 modules)", async () => {
+    const img = await getPython();
+    const script = [
+      "import math, random, datetime, pathlib, json, hashlib, zlib, base64, struct, csv, urllib.parse, tempfile",
+      "assert int(math.sqrt(1764)) == 42",
+      "assert isinstance(random.Random(42).randint(1, 100), int)",
+      "assert datetime.date(2026, 1, 1).isoformat() == '2026-01-01'",
+      "assert pathlib.Path('/tmp').exists()",
+      "assert json.loads(json.dumps({'k': 42}))['k'] == 42",
+      "assert hashlib.sha256(b'abc').hexdigest().startswith('ba7816bf')",
+      "assert zlib.decompress(zlib.compress(b'hello_zlib')) == b'hello_zlib'",
+      "assert base64.b64decode(base64.b64encode(b'b64_ok')) == b'b64_ok'",
+      "assert struct.unpack('<I', struct.pack('<I', 123456))[0] == 123456",
+      "assert list(csv.reader(['a,b'])) == [['a', 'b']]",
+      "assert urllib.parse.urlparse('https://example.com/p?q=1').path == '/p'",
+      "with tempfile.NamedTemporaryFile(mode='w+', delete=True) as f:\n    f.write('tmp42'); f.flush(); f.seek(0); assert f.read() == 'tmp42'",
+      "print('STDLIB_ALL_12_OK')",
+    ].join("\n");
+    const container = await img.createContainer({
+      cmd: ["python3", "-c", script],
+      tty: false,
+    });
+    await container.start();
+    try {
+      const res = await waitWithTimeout(container.wait(), 60000, "T1.7.2 python stdlib 12 modules");
+      assert.equal(res.exitCode, 0, `Expected exitCode 0, stderr: ${res.stderr}`);
+      assertIncludes(stripAnsi(res.stdout), "STDLIB_ALL_12_OK");
+    } finally {
+      await container.stop().catch(() => {});
+    }
+  });
+
+  suite.add("T1.7.3", "python:3.12-slim interactive REPL (>>> prompt, canonical TTY echo, evaluation, exit)", async () => {
+    const img = await getPython();
+    const container = await img.createContainer({ tty: true });
+    let liveOut = "";
+    let liveErr = "";
+    const decOut = new TextDecoder();
+    const decErr = new TextDecoder();
+    container.onStdout((chunk) => {
+      liveOut += decOut.decode(chunk, { stream: true });
+    });
+    container.onStderr((chunk) => {
+      liveErr += decErr.decode(chunk, { stream: true });
+    });
+
+    await container.start();
+    try {
+      await waitFor(() => stripAnsi(liveOut + liveErr).includes(">>> "), {
+        timeoutMs: 60000,
+        intervalMs: 150,
+        label: "Python >>> prompt",
+      });
+
+      container.writeStdin("print(20 + 22)\n");
+      await waitFor(() => /(?:^|\n)42(?:\n|$)/.test(stripAnsi(liveOut)), {
+        timeoutMs: 25000,
+        intervalMs: 150,
+        label: "Python REPL computed output 42",
+      });
+
+      // Verify F17 visible canonical TTY echo
+      assertIncludes(stripAnsi(liveOut + liveErr), "print(20 + 22)", "Expected canonical TTY echo of typed REPL input");
+
+      container.writeStdin("exit()\n");
+      const res = await waitWithTimeout(container.wait(), 20000, "T1.7.3 Python REPL exit()");
+      assert.equal(res.exitCode, 0);
+    } finally {
+      await container.stop().catch(() => {});
+    }
+  });
+
+  suite.add("T1.8.1", "node:22-slim basic script execution (node -e console.log(process.version, 6*7))", async () => {
+    const img = await getNode();
+    const container = await img.createContainer({
+      cmd: ["node", "-e", "console.log('NODE_OK', process.version, 6*7)"],
+      tty: false,
+    });
+    await container.start();
+    try {
+      const res = await waitWithTimeout(container.wait(), 180000, "T1.8.1 node -e");
+      assert.equal(res.exitCode, 0, `Expected exitCode 0, stderr: ${res.stderr}`);
+      assertMatch(stripAnsi(res.stdout), /NODE_OK v22\.\d+\.\d+ 42/);
+    } finally {
+      await container.stop().catch(() => {});
+    }
+  });
+
+  suite.add("T1.8.2", "node:22-slim core built-ins (fs, path, crypto, zlib, Buffer, URL, JSON)", async () => {
+    const img = await getNode();
+    const script = [
+      "const fs = require('fs'), path = require('path'), crypto = require('crypto'), zlib = require('zlib');",
+      "if (!fs.existsSync('/tmp')) throw new Error('fs failed');",
+      "if (path.join('/a', 'b') !== '/a/b') throw new Error('path failed');",
+      "if (!crypto.createHash('sha256').update('abc').digest('hex').startsWith('ba7816bf')) throw new Error('crypto failed');",
+      "if (zlib.inflateSync(zlib.deflateSync(Buffer.from('hi_zlib'))).toString() !== 'hi_zlib') throw new Error('zlib failed');",
+      "if (Buffer.from('6e6f6465', 'hex').toString('utf8') !== 'node') throw new Error('Buffer failed');",
+      "if (new URL('https://example.com/x?a=1').pathname !== '/x') throw new Error('URL failed');",
+      "if (JSON.parse(JSON.stringify({ v: 42 })).v !== 42) throw new Error('JSON failed');",
+      "console.log('NODE_BUILTINS_ALL_7_OK');",
+    ].join("\n");
+    const container = await img.createContainer({
+      cmd: ["node", "-e", script],
+      tty: false,
+    });
+    await container.start();
+    try {
+      const res = await waitWithTimeout(container.wait(), 60000, "T1.8.2 node built-ins");
+      assert.equal(res.exitCode, 0, `Expected exitCode 0, stderr: ${res.stderr}`);
+      assertIncludes(stripAnsi(res.stdout), "NODE_BUILTINS_ALL_7_OK");
+    } finally {
+      await container.stop().catch(() => {});
+    }
+  });
+
+  suite.add("T1.8.3", "node:22-slim interactive REPL (> prompt, evaluation, .exit)", async () => {
+    const img = await getNode();
+    const container = await img.createContainer({ tty: true });
+    let liveOut = "";
+    const decOut = new TextDecoder();
+    container.onStdout((chunk) => {
+      liveOut += decOut.decode(chunk, { stream: true });
+    });
+
+    await container.start();
+    try {
+      await waitFor(() => stripAnsi(liveOut).includes("> "), {
+        timeoutMs: 90000,
+        intervalMs: 200,
+        label: "Node > prompt",
+      });
+
+      container.writeStdin("console.log(19 + 23)\n");
+      await waitFor(() => /(?:^|\n)42(?:\n|$)/.test(stripAnsi(liveOut)), {
+        timeoutMs: 30000,
+        intervalMs: 150,
+        label: "Node REPL computed output 42",
+      });
+
+      container.writeStdin(".exit\n");
+      const res = await waitWithTimeout(container.wait(), 25000, "T1.8.3 Node REPL .exit");
+      assert.equal(res.exitCode, 0);
+    } finally {
+      await container.stop().catch(() => {});
     }
   });
 
