@@ -187,9 +187,72 @@ function globToRegExp(pattern) {
   return new RegExp(re);
 }
 
+let _yieldChannel = null;
+let _yieldQueue = null;
+
 function yieldMacrotask() {
+  if (typeof MessageChannel !== "undefined") {
+    if (!_yieldChannel) {
+      _yieldChannel = new MessageChannel();
+      _yieldQueue = [];
+      _yieldChannel.port1.onmessage = () => {
+        const resolve = _yieldQueue.shift();
+        if (_yieldQueue.length === 0) {
+          if (typeof _yieldChannel.port1.unref === "function") _yieldChannel.port1.unref();
+          if (typeof _yieldChannel.port2.unref === "function") _yieldChannel.port2.unref();
+        }
+        if (resolve) resolve();
+      };
+      if (typeof _yieldChannel.port1.unref === "function") _yieldChannel.port1.unref();
+      if (typeof _yieldChannel.port2.unref === "function") _yieldChannel.port2.unref();
+    }
+    return new Promise((resolve) => {
+      if (_yieldQueue.length === 0) {
+        if (typeof _yieldChannel.port1.ref === "function") _yieldChannel.port1.ref();
+        if (typeof _yieldChannel.port2.ref === "function") _yieldChannel.port2.ref();
+      }
+      _yieldQueue.push(resolve);
+      _yieldChannel.port2.postMessage(null);
+    });
+  }
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
+
+const COMPILER_MEM_RESET_THRESHOLD = 128 * 1024 * 1024;
+
+const PYTHON_CORE_LIB_DYNLOAD = new Set([
+  "math",
+  "cmath",
+  "_struct",
+  "binascii",
+  "zlib",
+  "_json",
+  "_random",
+  "_datetime",
+  "_csv",
+  "_sha2",
+  "_md5",
+  "_sha1",
+  "_blake2",
+  "_sha3",
+  "_posixsubprocess",
+  "select",
+  "_socket",
+  "_opcode",
+  "_bisect",
+  "_heapq",
+  "array",
+  "_contextvars",
+  "fcntl",
+  "termios",
+  "_pickle",
+  "readline",
+  "grp",
+  "unicodedata",
+  "_statistics",
+  "_queue",
+  "mmap",
+]);
 
 function readCStringFromBytes(bytes, offset, maxEnd = bytes.length) {
   let end = offset;
@@ -436,11 +499,11 @@ function compileWithInstance(compilerInst, elfBytes, soEntries = [], options = {
   const cExp = compilerInst.exports;
   const bundle = encodeE2wbBundle(options.elfPath || "app", toUint8Array(elfBytes), soEntries);
 
-  const inPtr = cExp.alloc(bundle.length);
-  const outLenPtr = cExp.alloc(4);
+  const inPtr = cExp.alloc(bundle.length) >>> 0;
+  const outLenPtr = cExp.alloc(4) >>> 0;
   new Uint8Array(cExp.memory.buffer, inPtr, bundle.length).set(bundle);
 
-  const outPtr = cExp.compile_bundle(inPtr, bundle.length, outLenPtr);
+  const outPtr = cExp.compile_bundle(inPtr, bundle.length, outLenPtr) >>> 0;
   cExp.dealloc(inPtr, bundle.length);
 
   const outLen = new DataView(cExp.memory.buffer).getUint32(outLenPtr, true);
@@ -670,17 +733,28 @@ async function createNodeHostVfs(vfsRo, vfsRw) {
 }
 
 export class Elf2WasmSystem {
-  constructor({ compilerInst, runtimeInst, hostVfs, moduleCache = null }) {
+  constructor({
+    compilerInst,
+    compilerMod = null,
+    runtimeInst,
+    hostVfs,
+    moduleCache = null,
+    onCompilerInstChange = null,
+  }) {
     this.compilerInst = compilerInst;
+    this.compilerMod = compilerMod;
     this.runtimeInst = runtimeInst;
     this.hostVfs = hostVfs;
     this.moduleCache = moduleCache instanceof Map ? moduleCache : new Map();
+    this._onCompilerInstChange =
+      typeof onCompilerInstChange === "function" ? onCompilerInstChange : null;
     this.initialSoMap = new Map();
     this.vfsSymlinks = new Map();
     this.vfsFilePaths = new Set();
     this.activeGuest = null;
     this._processes = null;
     this._inputWaiters = [];
+    this._inputSignaled = false;
     this._aborted = false;
     this.reapedPidCount = 0;
     this.lastActiveProcessCount = 0;
@@ -690,12 +764,18 @@ export class Elf2WasmSystem {
     compilerWasm,
     runtimeWasm,
     compilerInst: existingCompilerInst = null,
+    compilerMod: existingCompilerMod = null,
     moduleCache = null,
+    onCompilerInstChange = null,
     vfsRo = [],
     vfsRw = [],
   } = {}) {
     const [cMod, rMod] = await Promise.all([
-      !existingCompilerInst && compilerWasm ? compileWasmModule(compilerWasm) : Promise.resolve(null),
+      existingCompilerMod
+        ? Promise.resolve(existingCompilerMod)
+        : !existingCompilerInst && compilerWasm
+          ? compileWasmModule(compilerWasm)
+          : Promise.resolve(null),
       runtimeWasm ? compileWasmModule(runtimeWasm) : Promise.resolve(null),
     ]);
 
@@ -708,9 +788,11 @@ export class Elf2WasmSystem {
     let runtimeInst = null;
     const sys = new Elf2WasmSystem({
       compilerInst,
+      compilerMod: cMod,
       runtimeInst: null,
       hostVfs,
       moduleCache,
+      onCompilerInstChange,
     });
 
     if (rMod) {
@@ -728,53 +810,100 @@ export class Elf2WasmSystem {
 
   _makeRuntimeEnv() {
     const sys = this;
+    let cachedGuest = null;
+    let cachedGlobals = null;
+    let cachedGMemBuf = null;
+    let cachedGMem = null;
+    let cachedRMemBuf = null;
+    let cachedRMem = null;
+
+    const getRMem = () => {
+      const buf = sys.runtimeInst.exports.memory.buffer;
+      if (buf !== cachedRMemBuf) {
+        cachedRMemBuf = buf;
+        cachedRMem = new Uint8Array(buf);
+      }
+      return cachedRMem;
+    };
+
+    const syncGuest = () => {
+      const g = sys.activeGuest;
+      if (g !== cachedGuest) {
+        cachedGuest = g;
+        cachedGMemBuf = null;
+        cachedGMem = null;
+        if (g) {
+          const ex = g.exports;
+          const arr = new Array(GLOBAL_NAMES.length);
+          for (let i = 0; i < GLOBAL_NAMES.length; i++) {
+            arr[i] = ex[GLOBAL_NAMES[i]] || null;
+          }
+          cachedGlobals = arr;
+        } else {
+          cachedGlobals = null;
+        }
+      }
+      return g;
+    };
+
+    const getGMem = () => {
+      const g = syncGuest();
+      if (!g) return null;
+      const buf = g.exports.memory.buffer;
+      if (buf !== cachedGMemBuf) {
+        cachedGMemBuf = buf;
+        cachedGMem = new Uint8Array(buf);
+      }
+      return cachedGMem;
+    };
+
     const readRtStr = (ptr, len) => {
-      const mem = new Uint8Array(sys.runtimeInst.exports.memory.buffer, ptr, len);
-      return normalizeGuestPath(textDecoder.decode(mem));
+      const rMem = getRMem();
+      const p = ptr >>> 0;
+      return normalizeGuestPath(textDecoder.decode(rMem.subarray(p, p + len)));
     };
 
     return {
       host_mem_size() {
-        return sys.activeGuest ? sys.activeGuest.exports.memory.buffer.byteLength >>> 0 : 0;
+        const gMem = getGMem();
+        return gMem ? gMem.length >>> 0 : 0;
       },
       host_read_guest(guestAddr, rtPtr, len) {
-        if (!sys.activeGuest) return -1;
+        const gMem = getGMem();
+        if (!gMem) return -1;
         const gAddr = guestAddr >>> 0;
-        const gMem = new Uint8Array(sys.activeGuest.exports.memory.buffer);
         if (gAddr + len > gMem.length) return -1;
-        const rMem = new Uint8Array(sys.runtimeInst.exports.memory.buffer);
-        rMem.set(gMem.subarray(gAddr, gAddr + len), rtPtr >>> 0);
+        getRMem().set(gMem.subarray(gAddr, gAddr + len), rtPtr >>> 0);
         return 0;
       },
       host_write_guest(guestAddr, rtPtr, len) {
-        if (!sys.activeGuest) return -1;
+        const gMem = getGMem();
+        if (!gMem) return -1;
         const gAddr = guestAddr >>> 0;
-        const gMem = new Uint8Array(sys.activeGuest.exports.memory.buffer);
         if (gAddr + len > gMem.length) return -1;
-        const rMem = new Uint8Array(sys.runtimeInst.exports.memory.buffer);
-        gMem.set(rMem.subarray(rtPtr >>> 0, (rtPtr >>> 0) + len), gAddr);
+        const rMem = getRMem();
+        const rPtr = rtPtr >>> 0;
+        gMem.set(rMem.subarray(rPtr, rPtr + len), gAddr);
         return 0;
       },
       host_zero_guest(guestAddr, len) {
-        if (!sys.activeGuest) return -1;
+        const gMem = getGMem();
+        if (!gMem) return -1;
         const gAddr = guestAddr >>> 0;
-        const gMem = new Uint8Array(sys.activeGuest.exports.memory.buffer);
         if (gAddr + len > gMem.length) return -1;
         gMem.fill(0, gAddr, gAddr + len);
         return 0;
       },
       host_get_global(id) {
-        if (!sys.activeGuest) return 0n;
-        const name = GLOBAL_NAMES[id];
-        const g = name ? sys.activeGuest.exports[name] : null;
+        if (!syncGuest() || !cachedGlobals) return 0n;
+        const g = cachedGlobals[id];
         if (!g) return 0n;
         if (I32_GLOBAL_IDS.has(id)) return BigInt(g.value | 0);
         return BigInt.asIntN(64, BigInt(g.value));
       },
       host_set_global(id, val) {
-        if (!sys.activeGuest) return;
-        const name = GLOBAL_NAMES[id];
-        const g = name ? sys.activeGuest.exports[name] : null;
+        if (!syncGuest() || !cachedGlobals) return;
+        const g = cachedGlobals[id];
         if (!g) return;
         if (I32_GLOBAL_IDS.has(id)) {
           g.value = Number(BigInt.asIntN(32, val));
@@ -868,7 +997,27 @@ export class Elf2WasmSystem {
     const cached = this.moduleCache.get(key);
     if (cached) return cached;
 
-    const wasmBytes = this.compile(elfBytes, soEntries, { elfPath });
+    if (!this.compilerInst && this.compilerMod) {
+      this.compilerInst = await WebAssembly.instantiate(this.compilerMod, {});
+      if (this._onCompilerInstChange) this._onCompilerInstChange(this.compilerInst);
+    }
+    let wasmBytes;
+    try {
+      wasmBytes = this.compile(elfBytes, soEntries, { elfPath });
+    } catch (err) {
+      if (this.compilerMod) {
+        this.compilerInst = null;
+        if (this._onCompilerInstChange) this._onCompilerInstChange(null);
+      }
+      throw err;
+    }
+    if (
+      this.compilerMod &&
+      this.compilerInst?.exports?.memory?.buffer?.byteLength > COMPILER_MEM_RESET_THRESHOLD
+    ) {
+      this.compilerInst = null;
+      if (this._onCompilerInstChange) this._onCompilerInstChange(null);
+    }
     const mod = await WebAssembly.compile(wasmBytes);
     const sections = WebAssembly.Module.customSections(mod, "elf2wasm_meta");
     if (!sections || sections.length === 0) {
@@ -1013,6 +1162,7 @@ export class Elf2WasmSystem {
   }
 
   _notifyInput() {
+    this._inputSignaled = true;
     if (this._inputWaiters.length === 0) return;
     const waiters = this._inputWaiters.splice(0, this._inputWaiters.length);
     for (const resolve of waiters) {
@@ -1022,6 +1172,11 @@ export class Elf2WasmSystem {
 
   _waitForInput(signal) {
     if (this._aborted || signal?.aborted) {
+      this._inputSignaled = false;
+      return Promise.resolve();
+    }
+    if (this._inputSignaled) {
+      this._inputSignaled = false;
       return Promise.resolve();
     }
     return new Promise((resolve) => {
@@ -1029,6 +1184,7 @@ export class Elf2WasmSystem {
       const onWake = () => {
         if (done) return;
         done = true;
+        this._inputSignaled = false;
         if (signal) signal.removeEventListener("abort", onWake);
         resolve();
       };
@@ -1249,9 +1405,8 @@ export class Elf2WasmSystem {
     }
     const configDirs = this._getConfigSoSearchDirs();
 
-    const rootOriginDir = options.elfPath
-      ? dirname(this.resolveVfsPath(options.elfPath))
-      : "/";
+    const resolvedElfPath = options.elfPath ? this.resolveVfsPath(options.elfPath) : "";
+    const rootOriginDir = resolvedElfPath ? dirname(resolvedElfPath) : "/";
 
     const enqueue = (nameOrPath, { originDir = rootOriginDir, rpath = [], runpath = [], isInterp = false } = {}) => {
       if (!nameOrPath) return;
@@ -1279,6 +1434,42 @@ export class Elf2WasmSystem {
     }
     for (const ep of extraPaths) {
       enqueue(ep, { originDir: rootOriginDir });
+    }
+
+    // F20: Auto-bundle core Python stdlib C extensions from lib-dynload/*.so
+    const rawElfBase = options.elfPath ? basename(options.elfPath) : "";
+    const resolvedElfBase = resolvedElfPath ? basename(resolvedElfPath) : "";
+    const pyPattern = /^python3(?:\.\d+)?$/;
+    if (pyPattern.test(rawElfBase) || pyPattern.test(resolvedElfBase)) {
+      const verMatch = resolvedElfBase.match(/^python(3\.\d+)$/) || rawElfBase.match(/^python(3\.\d+)$/);
+      const pyVer = verMatch ? verMatch[1] : null;
+      const allDynload = [];
+      for (const p of this.vfsFilePaths) {
+        if (p.includes("/lib-dynload/") && p.endsWith(".so")) {
+          allDynload.push(p);
+        }
+      }
+      let candidates = allDynload;
+      if (pyVer) {
+        const verNeedle = `/python${pyVer}/lib-dynload/`;
+        const verMatched = allDynload.filter((p) => p.includes(verNeedle));
+        if (verMatched.length > 0) {
+          candidates = verMatched;
+        }
+      }
+      const selected = [];
+      for (const p of candidates) {
+        const base = basename(p);
+        const dot = base.indexOf(".");
+        const modName = dot > 0 ? base.slice(0, dot) : base;
+        if (PYTHON_CORE_LIB_DYNLOAD.has(modName)) {
+          selected.push(p);
+        }
+      }
+      selected.sort();
+      for (const soPath of selected) {
+        enqueue(soPath, { originDir: dirname(soPath) });
+      }
     }
 
     while (queue.length > 0) {
@@ -1455,11 +1646,12 @@ export class Elf2WasmSystem {
   }
 
   async runElf(elfBytes, soEntries = [], args = [], options = {}) {
-    if (!this.compilerInst || !this.runtimeInst) {
+    if ((!this.compilerInst && !this.compilerMod) || !this.runtimeInst) {
       throw new Error("Elf2WasmSystem requires both compilerWasm and runtimeWasm to run ELFs");
     }
 
     this._aborted = false;
+    this._inputSignaled = false;
     const rExp = this.runtimeInst.exports;
     const elfU8 = toUint8Array(elfBytes);
     const elfPath = options.elfPath || "app";
@@ -1476,13 +1668,30 @@ export class Elf2WasmSystem {
     }
 
     const { mod, metaBytes } = await this._compileCached(elfU8, normSos, elfPath);
+    if (this._aborted || options.signal?.aborted) {
+      return {
+        exitCode: 137,
+        stdout: new Uint8Array(0),
+        stderr: new Uint8Array(0),
+        virtualTimeNs: Number(rExp.runtime_get_virtual_time_ns()),
+      };
+    }
 
     const guestImports = {};
+
+    const mainInst = await WebAssembly.instantiate(mod, guestImports);
+    if (this._aborted || options.signal?.aborted) {
+      return {
+        exitCode: 137,
+        stdout: new Uint8Array(0),
+        stderr: new Uint8Array(0),
+        virtualTimeNs: Number(rExp.runtime_get_virtual_time_ns()),
+      };
+    }
 
     const processes = new Map();
     this._processes = processes;
     let activePid = 1000;
-    const mainInst = await WebAssembly.instantiate(mod, guestImports);
     processes.set(activePid, { instance: mainInst, module: mod });
     this.activeGuest = mainInst;
 
@@ -1528,9 +1737,15 @@ export class Elf2WasmSystem {
     const onStdout = typeof options.onStdout === "function" ? options.onStdout : null;
     const onStderr = typeof options.onStderr === "function" ? options.onStderr : null;
     const signal = options.signal || null;
-    const yieldEvery = Number.isInteger(options.yieldEvery) && options.yieldEvery > 0
-      ? options.yieldEvery
-      : 100;
+    const yieldEvery =
+      Number.isInteger(options.yieldEvery) && options.yieldEvery > 0
+        ? options.yieldEvery
+        : 0;
+    const yieldIntervalMs =
+      Number.isFinite(options.yieldIntervalMs) && options.yieldIntervalMs > 0
+        ? options.yieldIntervalMs
+        : 16;
+    const nowMs = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
 
     const flushStdio = () => {
       if (onStdout) {
@@ -1545,6 +1760,7 @@ export class Elf2WasmSystem {
 
     const pendingReap = new Set();
     const reapChildren = () => {
+      if (processes.size <= 1 && pendingReap.size === 0) return;
       const reaped = this.takeReapedPids();
       for (const pid of reaped) {
         this.reapedPidCount++;
@@ -1569,7 +1785,7 @@ export class Elf2WasmSystem {
 
     let lastCode = 0;
     let steps = 0;
-    let lastYieldTime = Date.now();
+    let lastYieldTime = nowMs();
     let skipStart = false;
 
     try {
@@ -1597,11 +1813,14 @@ export class Elf2WasmSystem {
           break;
         } else if (yieldAction === 1) {
           steps++;
-          const now = Date.now();
-          if (steps % yieldEvery === 0 || now - lastYieldTime >= 16) {
-            flushStdio();
-            await yieldMacrotask();
-            lastYieldTime = Date.now();
+          const hitStepYield = yieldEvery > 0 && steps % yieldEvery === 0;
+          if (hitStepYield || (steps & 3) === 0) {
+            const now = nowMs();
+            if (hitStepYield || now - lastYieldTime >= yieldIntervalMs) {
+              flushStdio();
+              await yieldMacrotask();
+              lastYieldTime = nowMs();
+            }
           }
           continue;
         } else if (yieldAction === 2) {
@@ -1615,11 +1834,14 @@ export class Elf2WasmSystem {
             skipStart = true;
           }
           steps++;
-          const now = Date.now();
-          if (steps % yieldEvery === 0 || now - lastYieldTime >= 16) {
-            flushStdio();
-            await yieldMacrotask();
-            lastYieldTime = Date.now();
+          const hitStepYield = yieldEvery > 0 && steps % yieldEvery === 0;
+          if (hitStepYield || (steps & 3) === 0) {
+            const now = nowMs();
+            if (hitStepYield || now - lastYieldTime >= yieldIntervalMs) {
+              flushStdio();
+              await yieldMacrotask();
+              lastYieldTime = nowMs();
+            }
           }
         } else if (yieldAction === 3) {
           // NeedFork
@@ -1628,6 +1850,9 @@ export class Elf2WasmSystem {
           const scratchAddr = rExp.runtime_get_pending_scratch_addr() >>> 0;
           const parentEntry = processes.get(activePid);
           const childInst = await WebAssembly.instantiate(parentEntry.module, guestImports);
+          if (this._aborted || signal?.aborted) {
+            break;
+          }
 
           const parentMem = parentEntry.instance.exports.memory;
           const childMem = childInst.exports.memory;
@@ -1683,7 +1908,13 @@ export class Elf2WasmSystem {
             env: execInfo.envp,
           });
           const compiled = await this._compileCached(execElf, execSos, execInfo.path);
+          if (this._aborted || signal?.aborted) {
+            break;
+          }
           const newInst = await WebAssembly.instantiate(compiled.mod, guestImports);
+          if (this._aborted || signal?.aborted) {
+            break;
+          }
 
           processes.set(execInfo.pid, { instance: newInst, module: compiled.mod });
           activePid = execInfo.pid;
@@ -1696,6 +1927,7 @@ export class Elf2WasmSystem {
           );
         } else if (yieldAction === 5) {
           // NeedStdin
+          this._inputSignaled = false;
           flushStdio();
           reapChildren();
           if (this._aborted || signal?.aborted) {
@@ -1720,7 +1952,7 @@ export class Elf2WasmSystem {
           if (resumed === 0) {
             skipStart = true;
           }
-          lastYieldTime = Date.now();
+          lastYieldTime = nowMs();
         } else {
           throw new Error(`Unexpected runtime_on_yield return code: ${yieldAction}`);
         }
@@ -1760,6 +1992,39 @@ export class Elf2WasmSystem {
       stderr,
       virtualTimeNs: Number(rExp.runtime_get_virtual_time_ns()),
     };
+  }
+
+  async precompileFromVfs(guestPath, options = {}) {
+    try {
+      let currentPath = String(guestPath || "");
+      if (!currentPath) return false;
+      const env = options.env || ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"];
+
+      if (!currentPath.includes("/")) {
+        const found = this.resolveCommandPath(currentPath, env);
+        if (!found) return false;
+        currentPath = found;
+      } else {
+        currentPath = normalizeGuestPath(currentPath);
+      }
+
+      const normPath = normalizeGuestPath(currentPath);
+      const resolvedPath = this.resolveVfsPath(normPath);
+      const elfBytes = this.readVfsFile(resolvedPath);
+
+      if (!elfBytes || !isElf64Bytes(elfBytes)) {
+        return false;
+      }
+
+      const soEntries = this._resolveElfSos(elfBytes, options.extraSos || [], {
+        elfPath: resolvedPath,
+        env,
+      });
+      await this._compileCached(elfBytes, soEntries, normPath);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async runFromVfs(guestPath, args = [], options = {}) {
@@ -1922,6 +2187,7 @@ async function decompressStreamBytes(bytes, format) {
       out.set(c, off);
       off += c.length;
     }
+    chunks.length = 0;
     return out;
   }
 
@@ -2049,7 +2315,7 @@ export function extractTarToVfs(arg1, arg2) {
     }
 
     const dataEnd = Math.min(offset + size, tar.length);
-    const payload = tar.slice(offset, dataEnd);
+    const payload = sys ? tar.subarray(offset, dataEnd) : tar.slice(offset, dataEnd);
     const paddedBlocks = Math.ceil(size / 512) * 512;
     offset += paddedBlocks;
 
@@ -2122,7 +2388,7 @@ export function extractTarToVfs(arg1, arg2) {
       const targetGuestPath = normalizeGuestPath("/" + linkTarget.replace(/^\.\//, ""));
       const existing = files.get(targetGuestPath);
       if (existing) {
-        const copy = existing.bytes.slice();
+        const copy = sys ? existing.bytes : existing.bytes.slice();
         symlinks.delete(guestPath);
         dirs.delete(guestPath);
         files.set(guestPath, { bytes: copy, mode: mode || existing.mode || 0o644 });
