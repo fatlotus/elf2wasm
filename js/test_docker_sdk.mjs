@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
@@ -9,6 +10,7 @@ import { fileURLToPath } from "node:url";
 
 import { createServer } from "../server/server.mjs";
 import { createMockRegistry, createTarGzLayer, sha256Digest } from "../server/mock_registry.mjs";
+import { createMockGitServer, createGitArchiveTarGz } from "../server/mock_git_server.mjs";
 import {
   compileElfToWasm,
   compileBundle,
@@ -35,6 +37,7 @@ import {
   DockerImage,
   DockerContainer,
   runDockerImage,
+  fetchGitArchive,
 } from "./docker_sdk.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1553,4 +1556,978 @@ test("Adversarial: MessageChannel yield exits cleanly in Node.js and falls back 
   assert.equal(withoutMc.status, 0, `Without MessageChannel fallback failed: ${withoutMc.stderr}`);
   assert.match(withoutMc.stdout, /CHILD_DONE:YIELD_OK/);
 });
+
+// ============================================================================
+// 8. M11 Contract 8: VFS Tar Overlay Extraction (mountPath, stripComponents,
+//    path-escape blocking, hardlink rebasing, symlinks, ignoreWhiteouts)
+// ============================================================================
+
+test("Contract 8: extractTarToVfs mountPath, stripComponents, path-escape blocking, hardlinks & symlinks", async () => {
+  const tarBytes = buildCustomTar([
+    { path: "repo-main/", type: "5" },
+    { path: "./repo-main/src/", type: "5" },
+    { path: "/repo-main//src/./app.py", type: "0", content: "print('ok')\n" },
+    { path: "repo-main/a/../b.txt", type: "0", content: "internal-dotdot" },
+    { path: "repo-main/../escape1.txt", type: "0", content: "BAD1" },
+    { path: "repo-main/a/../../escape2.txt", type: "0", content: "BAD2" },
+    { path: "../repo-main/escape3.txt", type: "0", content: "BAD3" },
+    { path: "repo-main/src/app_hard.py", type: "1", linkname: "repo-main/src/app.py" },
+    { path: "repo-main/bad_hard", type: "1", linkname: "repo-main/../escape1.txt" },
+    { path: "repo-main/src/link_rel", type: "2", linkname: "../b.txt" },
+    { path: "repo-main/src/link_abs", type: "2", linkname: "/usr/bin/env" },
+  ]);
+
+  const vfs = extractTarToVfs(tarBytes, {
+    mountPath: "/workspace",
+    stripComponents: 1,
+  });
+
+  // mountPath directory itself is seeded in dirs
+  assert.equal(vfs.dirs.has("/workspace"), true);
+  assert.equal(vfs.dirs.has("/workspace/src"), true);
+
+  // Normal & internal-dotdot entries are rebased under /workspace
+  assert.equal(textDecoder.decode(vfs.files.get("/workspace/src/app.py").bytes), "print('ok')\n");
+  assert.equal(textDecoder.decode(vfs.files.get("/workspace/b.txt").bytes), "internal-dotdot");
+
+  // Escaping entries are strictly rejected
+  assert.equal(vfs.files.has("/escape1.txt"), false);
+  assert.equal(vfs.files.has("/escape2.txt"), false);
+  assert.equal(vfs.files.has("/escape3.txt"), false);
+  assert.equal(vfs.files.has("/workspace/escape3.txt"), false);
+
+  // Hardlink target is rebased under /workspace with stripComponents; escaping hardlink skipped
+  assert.equal(textDecoder.decode(vfs.files.get("/workspace/src/app_hard.py").bytes), "print('ok')\n");
+  assert.equal(vfs.files.has("/workspace/bad_hard"), false);
+  assert.equal(vfs.symlinks.has("/workspace/bad_hard"), false);
+
+  // Relative & absolute symlinks are preserved verbatim
+  assert.equal(vfs.symlinks.get("/workspace/src/link_rel"), "../b.txt");
+  assert.equal(vfs.symlinks.get("/workspace/src/link_abs"), "/usr/bin/env");
+
+  // Also test stripComponents: 2 and extractTarGzToVfs forwarding
+  const gzBytes = new Uint8Array(zlib.gzipSync(Buffer.from(tarBytes)));
+  const vfs2 = await extractTarGzToVfs(gzBytes, {
+    mountPath: "/opt/code",
+    stripComponents: 2,
+  });
+  assert.equal(vfs2.dirs.has("/opt/code"), true);
+  assert.equal(textDecoder.decode(vfs2.files.get("/opt/code/app.py").bytes), "print('ok')\n");
+  assert.equal(vfs2.files.has("/opt/code/b.txt"), false, "entry with <= 2 segments must be skipped");
+
+  // Empty tar still seeds mountPath dir
+  const emptyTar = buildCustomTar([]);
+  const emptyVfs = extractTarToVfs(emptyTar, { mountPath: "/empty_ws" });
+  assert.equal(emptyVfs.dirs.has("/empty_ws"), true);
+});
+
+test("Contract 8: ignoreWhiteouts=true preserves base VFS files while ignoreWhiteouts=false removes them", async () => {
+  const sys = await Elf2WasmSystem.create({
+    compilerWasm: fs.readFileSync(COMPILER_WASM_PATH),
+    runtimeWasm: fs.readFileSync(RUNTIME_WASM_PATH),
+  });
+
+  // Base layer seeds /workspace/keep.txt and /workspace/opaque/a.txt
+  const baseTar = buildCustomTar([
+    { path: "workspace/keep.txt", type: "0", content: "base-keep" },
+    { path: "workspace/opaque/a.txt", type: "0", content: "base-opaque" },
+  ]);
+  extractTarToVfs(sys, baseTar);
+  assert.equal(textDecoder.decode(sys.readVfsFile("/workspace/keep.txt")), "base-keep");
+
+  // Overlay tar with .wh.keep.txt and .wh..wh..opq using ignoreWhiteouts: true
+  const overlayTar = buildCustomTar([
+    { path: "repo-ref/.wh.keep.txt", type: "0", content: "literal-wh" },
+    { path: "repo-ref/opaque/.wh..wh..opq", type: "0", content: "literal-opq" },
+  ]);
+  const overlayGz = new Uint8Array(zlib.gzipSync(Buffer.from(overlayTar)));
+  await extractTarGzToVfs(sys, overlayGz, {
+    mountPath: "/workspace",
+    stripComponents: 1,
+    ignoreWhiteouts: true,
+  });
+
+  assert.equal(textDecoder.decode(sys.readVfsFile("/workspace/keep.txt")), "base-keep");
+  assert.equal(textDecoder.decode(sys.readVfsFile("/workspace/opaque/a.txt")), "base-opaque");
+  assert.equal(textDecoder.decode(sys.readVfsFile("/workspace/.wh.keep.txt")), "literal-wh");
+
+  // Now apply the same overlay with ignoreWhiteouts: false (default) -> deletes base files
+  extractTarToVfs(sys, overlayTar, {
+    mountPath: "/workspace",
+    stripComponents: 1,
+    ignoreWhiteouts: false,
+  });
+  assert.equal(sys.readVfsFile("/workspace/keep.txt"), null);
+  assert.equal(sys.readVfsFile("/workspace/opaque/a.txt"), null);
+});
+
+// ============================================================================
+// 9. M11 Contract 9: Git Client, Docker SDK Git Overlay & WorkerBackend RPC
+// ============================================================================
+
+test("Contract 9: fetchGitArchive streaming, progress, stripComponents, errors & AbortSignal", async () => {
+  const mockGit = createMockGitServer();
+  mockGit.addRepo("acme/demo", "v1.0.0", [
+    { path: "README.md", content: "# Demo\n" },
+    { path: "src/hello.txt", content: "hello-git\n" },
+  ]);
+  mockGit.addRepo("acme/flat", "main", [
+    { path: "flat.txt", content: "flat-content\n" },
+  ], { stripComponents: 0, explicitStripHeader: 0 });
+  mockGit.addRepo("acme/corrupt", "main", {
+    tarGzBytes: Buffer.from("NOT_A_VALID_GZIP_STREAM_1234567890"),
+    stripComponents: 1,
+  });
+  mockGit.addRepo("acme/slow", "main", [
+    { path: "slow.txt", content: "slow" },
+  ]);
+  mockGit.setRouteBehavior("acme/slow", "main", { delayMs: 2000 });
+  await mockGit.start();
+
+  const srv = createServer({ port: 0, host: "127.0.0.1", allowLocalRegistries: true });
+  await srv.start();
+
+  try {
+    const gitProxyBase = `${srv.url}/api/git/archive`;
+
+    // 1. Happy path: streaming + progress + decompression
+    const events = [];
+    const archive = await fetchGitArchive({
+      repo: `${mockGit.url}/acme/demo`,
+      ref: "v1.0.0",
+      gitProxyBase,
+      onProgress: (ev) => events.push(ev),
+    });
+    assert.equal(archive.stripComponents, 1);
+    assert.equal(archive.ref, "v1.0.0");
+    assert.ok(archive.tarBytes instanceof Uint8Array && archive.tarBytes.length > 0);
+    assert.ok(events.some((e) => e.stage === "git-download" && e.loaded > 0));
+    assert.ok(events.some((e) => e.stage === "git-decompress"));
+
+    const extracted = extractTarToVfs(archive.tarBytes, {
+      mountPath: "/workspace",
+      stripComponents: archive.stripComponents,
+    });
+    assert.equal(textDecoder.decode(extracted.files.get("/workspace/src/hello.txt").bytes), "hello-git\n");
+
+    // 2. Respects X-Git-Strip-Components: 0
+    const flatArchive = await fetchGitArchive({
+      repo: `${mockGit.url}/acme/flat`,
+      ref: "main",
+      gitProxyBase,
+    });
+    assert.equal(flatArchive.stripComponents, 0);
+    const flatVfs = extractTarToVfs(flatArchive.tarBytes, {
+      mountPath: "/workspace",
+      stripComponents: flatArchive.stripComponents,
+    });
+    assert.equal(textDecoder.decode(flatVfs.files.get("/workspace/flat.txt").bytes), "flat-content\n");
+
+    // 3. Error handling: 404, 400, 403, corrupt gzip
+    await assert.rejects(
+      () => fetchGitArchive({ repo: `${mockGit.url}/acme/missing`, ref: "main", gitProxyBase }),
+      /404/
+    );
+    await assert.rejects(
+      () => fetchGitArchive({ repo: `${mockGit.url}/acme/demo`, ref: "bad..ref", gitProxyBase }),
+      /400/
+    );
+    await assert.rejects(
+      () => fetchGitArchive({ repo: "http://169.254.169.254/latest/meta-data", ref: "main", gitProxyBase }),
+      /403|400/
+    );
+    await assert.rejects(
+      () => fetchGitArchive({ repo: `${mockGit.url}/acme/corrupt`, ref: "main", gitProxyBase }),
+      /Failed to decompress git archive/
+    );
+
+    // 4. Pre-aborted signal
+    const preCtrl = new AbortController();
+    preCtrl.abort();
+    await assert.rejects(
+      () =>
+        fetchGitArchive({
+          repo: `${mockGit.url}/acme/demo`,
+          ref: "v1.0.0",
+          gitProxyBase,
+          signal: preCtrl.signal,
+        }),
+      (err) => err.name === "AbortError"
+    );
+
+    // 5. In-flight abort against delayed route
+    const inflightCtrl = new AbortController();
+    setTimeout(() => inflightCtrl.abort(), 80);
+    await assert.rejects(
+      () =>
+        fetchGitArchive({
+          repo: `${mockGit.url}/acme/slow`,
+          ref: "main",
+          gitProxyBase,
+          signal: inflightCtrl.signal,
+        }),
+      (err) => err.name === "AbortError"
+    );
+  } finally {
+    await srv.stop();
+    await mockGit.stop();
+  }
+});
+
+test("Contract 9: Elf2WasmDocker, runDockerImage & WorkerBackend gitRepo + overlayTarBytes integration", async () => {
+  // Build a static ELF that prints getcwd(), PWD env var, and contents of a relative file + /workspace/keep.txt
+  const probeElf = buildStaticTestElf(`
+    static long sys_write(int fd, const void *buf, unsigned long len) {
+      long ret;
+      __asm__ volatile ("syscall" : "=a"(ret) : "a"(1), "D"(fd), "S"(buf), "d"(len) : "rcx", "r11", "memory");
+      return ret;
+    }
+    static long sys_openat(int dirfd, const char *p, int flags, int mode) {
+      long ret;
+      register long r10 __asm__("r10") = mode;
+      __asm__ volatile ("syscall" : "=a"(ret) : "a"(257), "D"(dirfd), "S"(p), "d"(flags), "r"(r10) : "rcx", "r11", "memory");
+      return ret;
+    }
+    static long sys_read(int fd, void *buf, unsigned long len) {
+      long ret;
+      __asm__ volatile ("syscall" : "=a"(ret) : "a"(0), "D"(fd), "S"(buf), "d"(len) : "rcx", "r11", "memory");
+      return ret;
+    }
+    static long sys_close(int fd) {
+      long ret;
+      __asm__ volatile ("syscall" : "=a"(ret) : "a"(3), "D"(fd) : "rcx", "r11", "memory");
+      return ret;
+    }
+    static long sys_getcwd(char *buf, unsigned long size) {
+      long ret;
+      __asm__ volatile ("syscall" : "=a"(ret) : "a"(79), "D"(buf), "S"(size) : "rcx", "r11", "memory");
+      return ret;
+    }
+    static void sys_exit(int code) {
+      __asm__ volatile ("syscall" :: "a"(60), "D"(code));
+      __builtin_unreachable();
+    }
+    static unsigned long slen(const char *s) {
+      unsigned long n = 0;
+      while (s[n]) n++;
+      return n;
+    }
+    static void print_str(const char *s) { sys_write(1, s, slen(s)); }
+    static void dump_file(const char *label, const char *path) {
+      print_str(label);
+      int fd = (int)sys_openat(-100, path, 0, 0);
+      if (fd < 0) {
+        print_str("MISSING\\n");
+        return;
+      }
+      char buf[256];
+      long n = sys_read(fd, buf, sizeof(buf));
+      if (n > 0) sys_write(1, buf, (unsigned long)n);
+      sys_close(fd);
+    }
+    void entry_c(long *sp) {
+      long argc = sp[0];
+      char **envp = (char **)&sp[argc + 2];
+
+      char cwd[256];
+      sys_getcwd(cwd, sizeof(cwd));
+      print_str("CWD=");
+      print_str(cwd);
+      print_str("\\n");
+
+      const char *pwd = "UNSET";
+      for (int i = 0; envp[i]; i++) {
+        if (envp[i][0] == 'P' && envp[i][1] == 'W' && envp[i][2] == 'D' && envp[i][3] == '=') {
+          pwd = envp[i] + 4;
+          break;
+        }
+      }
+      print_str("PWD=");
+      print_str(pwd);
+      print_str("\\n");
+
+      dump_file("FILE=", "data/msg.txt");
+      dump_file("KEEP=", "/workspace/keep.txt");
+      sys_exit(0);
+    }
+    __asm__(".global _start\\n_start:\\n  mov %rsp, %rdi\\n  call entry_c\\n");
+  `);
+
+  const mockReg = createMockRegistry();
+  const baseLayer = createTarGzLayer([
+    { path: "bin/probe", content: probeElf, mode: 0o755 },
+    { path: "workspace/keep.txt", content: "BASE_KEEP_OK\n", mode: 0o644 },
+  ]);
+  mockReg.addImage("test/probe", "latest", {
+    config: {
+      cmd: ["/bin/probe"],
+      workingDir: "/base_dir",
+      env: ["PWD=/base_dir", "PATH=/bin"],
+    },
+    layers: [{ tarGzBytes: baseLayer.gzipBytes }],
+  });
+  await mockReg.start();
+
+  const mockGit = createMockGitServer();
+  mockGit.addRepo("acme/app", "v2", [
+    { path: "data/msg.txt", content: "FROM_GIT_V2\n" },
+    { path: ".wh.keep.txt", content: "not-a-whiteout\n" },
+  ]);
+  mockGit.addRepo("acme/slow", "main", [{ path: "data/msg.txt", content: "SLOW\n" }]);
+  mockGit.setRouteBehavior("acme/slow", "main", { delayMs: 2000 });
+  await mockGit.start();
+
+  const srv = createServer({ port: 0, host: "127.0.0.1", allowLocalRegistries: true });
+  await srv.start();
+
+  try {
+    const imageRef = `${mockReg.host}/test/probe:latest`;
+    const registryProxyBase = `${srv.url}/api/v2`;
+    const gitProxyBase = `${srv.url}/api/git/archive`;
+
+    // 1. runDockerImage with gitRepo (default mountPath=/workspace, default cwd=/workspace, PWD=/workspace)
+    const stages = [];
+    const res1 = await runDockerImage(imageRef, {
+      compilerWasmUrl: `${srv.url}/wasm/elf2wasm_compiler_wasm.wasm`,
+      runtimeWasmUrl: `${srv.url}/wasm/elf2wasm_runtime_wasm.wasm`,
+      registryProxyBase,
+      gitProxyBase,
+      useWorker: false,
+      gitRepo: { repo: `${mockGit.url}/acme/app`, ref: "v2" },
+      onProgress: (ev) => stages.push(ev.stage),
+    });
+    assert.equal(res1.exitCode, 0);
+    assert.match(res1.stdout, /CWD=\/workspace\n/);
+    assert.match(res1.stdout, /PWD=\/workspace\n/);
+    assert.match(res1.stdout, /FILE=FROM_GIT_V2\n/);
+    assert.match(res1.stdout, /KEEP=BASE_KEEP_OK\n/, "ignoreWhiteouts: true must preserve base file");
+    assert.ok(stages.includes("git-download"));
+    assert.ok(stages.includes("git-decompress"));
+    assert.ok(stages.includes("git-overlay"));
+
+    // 2. Custom mountPath + explicit cwd override
+    const res2 = await runDockerImage(imageRef, {
+      compilerWasmUrl: `${srv.url}/wasm/elf2wasm_compiler_wasm.wasm`,
+      runtimeWasmUrl: `${srv.url}/wasm/elf2wasm_runtime_wasm.wasm`,
+      registryProxyBase,
+      gitProxyBase,
+      useWorker: false,
+      gitRepo: { repo: `${mockGit.url}/acme/app`, ref: "v2", mountPath: "/src/app" },
+    });
+    assert.equal(res2.exitCode, 0);
+    assert.match(res2.stdout, /CWD=\/src\/app\n/);
+    assert.match(res2.stdout, /PWD=\/src\/app\n/);
+    assert.match(res2.stdout, /FILE=FROM_GIT_V2\n/);
+
+    const res3 = await runDockerImage(imageRef, {
+      compilerWasmUrl: `${srv.url}/wasm/elf2wasm_compiler_wasm.wasm`,
+      runtimeWasmUrl: `${srv.url}/wasm/elf2wasm_runtime_wasm.wasm`,
+      registryProxyBase,
+      gitProxyBase,
+      useWorker: false,
+      gitRepo: { repo: `${mockGit.url}/acme/app`, ref: "v2", mountPath: "/src/app" },
+      cwd: "/src",
+    });
+    assert.equal(res3.exitCode, 0);
+    assert.match(res3.stdout, /CWD=\/src\n/);
+    assert.match(res3.stdout, /PWD=\/src\n/);
+
+    // 3. Offline overlayTarBytes (both gzipped .tar.gz and plain .tar)
+    const { tarBytes: offlineTar, gzipBytes: offlineGz } = createGitArchiveTarGz(
+      [{ path: "data/msg.txt", content: "FROM_OFFLINE_TAR\n" }],
+      { rootDir: "offline-main" }
+    );
+    const resOffline = await runDockerImage(imageRef, {
+      compilerWasmUrl: `${srv.url}/wasm/elf2wasm_compiler_wasm.wasm`,
+      runtimeWasmUrl: `${srv.url}/wasm/elf2wasm_runtime_wasm.wasm`,
+      registryProxyBase,
+      useWorker: false,
+      overlayTarBytes: offlineGz,
+      overlayMountPath: "/offline_ws",
+      overlayStripComponents: 1,
+    });
+    assert.equal(resOffline.exitCode, 0);
+    assert.match(resOffline.stdout, /CWD=\/offline_ws\n/);
+    assert.match(resOffline.stdout, /FILE=FROM_OFFLINE_TAR\n/);
+
+    // 4. WorkerBackend + container_worker.mjs via InProcessWorker
+    const origWorker = globalThis.Worker;
+    const origSelf = globalThis.self;
+    class InProcessWorker {
+      constructor(url) {
+        this._listeners = new Map();
+        this._terminated = false;
+        this._workerListeners = [];
+        const selfShim = {
+          addEventListener: (type, fn) => {
+            if (type === "message") this._workerListeners.push(fn);
+          },
+          postMessage: (data) => {
+            if (this._terminated) return;
+            queueMicrotask(() => {
+              if (this._terminated) return;
+              for (const fn of this._listeners.get("message") || []) fn({ data });
+            });
+          },
+        };
+        globalThis.self = selfShim;
+        this._ready = import(`${url.href}?inproc_m11=${Date.now()}_${Math.random()}`);
+      }
+      addEventListener(type, fn) {
+        if (!this._listeners.has(type)) this._listeners.set(type, new Set());
+        this._listeners.get(type).add(fn);
+      }
+      postMessage(data) {
+        if (this._terminated) return;
+        this._ready.then(() => {
+          if (this._terminated) return;
+          for (const fn of this._workerListeners) fn({ data });
+        });
+      }
+      terminate() {
+        this._terminated = true;
+      }
+    }
+
+    globalThis.Worker = InProcessWorker;
+    let wDocker = null;
+    try {
+      wDocker = await Elf2WasmDocker.create({
+        compilerWasmUrl: `${srv.url}/wasm/elf2wasm_compiler_wasm.wasm`,
+        runtimeWasmUrl: `${srv.url}/wasm/elf2wasm_runtime_wasm.wasm`,
+        registryProxyBase,
+        gitProxyBase,
+        useWorker: true,
+      });
+      const wImg = await wDocker.pullImage(imageRef);
+
+      // 4a. WorkerBackend gitRepo overlay + progress
+      const wStages = [];
+      const wCont = await wImg.createContainer({
+        gitRepo: { repo: `${mockGit.url}/acme/app`, ref: "v2" },
+        onProgress: (ev) => wStages.push(ev.stage),
+      });
+      await wCont.start();
+      const wRes = await wCont.wait();
+      assert.equal(wRes.exitCode, 0);
+      assert.match(wRes.stdout, /CWD=\/workspace\n/);
+      assert.match(wRes.stdout, /PWD=\/workspace\n/);
+      assert.match(wRes.stdout, /FILE=FROM_GIT_V2\n/);
+      assert.ok(wStages.includes("git-download"));
+      assert.ok(wStages.includes("git-decompress"));
+      assert.ok(wStages.includes("git-overlay"));
+
+      // 4b. WorkerBackend transferable overlayTarBytes (plain tar)
+      const wCont2 = await wImg.createContainer({
+        overlayTarBytes: offlineTar,
+        overlayMountPath: "/worker_ws",
+        overlayStripComponents: 1,
+      });
+      await wCont2.start();
+      const wRes2 = await wCont2.wait();
+      assert.equal(wRes2.exitCode, 0);
+      assert.match(wRes2.stdout, /CWD=\/worker_ws\n/);
+      assert.match(wRes2.stdout, /FILE=FROM_OFFLINE_TAR\n/);
+
+      // 4c. WorkerBackend in-flight AbortSignal cancellation during gitRepo download
+      const abortCtrl = new AbortController();
+      setTimeout(() => abortCtrl.abort(), 80);
+      await assert.rejects(
+        () =>
+          wImg.createContainer({
+            gitRepo: { repo: `${mockGit.url}/acme/slow`, ref: "main" },
+            signal: abortCtrl.signal,
+          }),
+        (err) => err.name === "AbortError"
+      );
+    } finally {
+      if (wDocker) await wDocker.dispose();
+      globalThis.Worker = origWorker;
+      globalThis.self = origSelf;
+    }
+  } finally {
+    await srv.stop();
+    await mockGit.stop();
+    await mockReg.stop();
+  }
+});
+
+test("Contract 9: fetchGitArchive retries once on transient TypeError and fails fast on ECONNREFUSED / AbortError / HTTP 404", async () => {
+  const { gzipBytes } = createGitArchiveTarGz(
+    [{ path: "hello.txt", content: "retried-ok\n" }],
+    { rootDir: "demo-main" }
+  );
+
+  const makeOkResponse = () =>
+    new Response(gzipBytes, {
+      status: 200,
+      headers: {
+        "content-type": "application/gzip",
+        "content-length": String(gzipBytes.length),
+        "x-git-archive-format": "tar.gz",
+        "x-git-strip-components": "1",
+      },
+    });
+
+  // 1. Transient UND_ERR_SOCKET TypeError on attempt 1 succeeds on attempt 2
+  let socketCalls = 0;
+  const socketResult = await fetchGitArchive({
+    repo: "acme/demo",
+    ref: "main",
+    gitProxyBase: "http://127.0.0.1:1/api/git/archive",
+    fetchImpl: async () => {
+      socketCalls++;
+      if (socketCalls === 1) {
+        const cause = Object.assign(new Error("other side closed"), { code: "UND_ERR_SOCKET" });
+        throw new TypeError("fetch failed", { cause });
+      }
+      return makeOkResponse();
+    },
+  });
+  assert.equal(socketCalls, 2);
+  assert.ok(socketResult.tarBytes.length > 0);
+  assert.equal(socketResult.stripComponents, 1);
+
+  // 2. Codeless browser-style TypeError on attempt 1 succeeds on attempt 2
+  let codelessCalls = 0;
+  const codelessResult = await fetchGitArchive({
+    repo: "acme/demo",
+    ref: "main",
+    gitProxyBase: "http://127.0.0.1:1/api/git/archive",
+    fetchImpl: async () => {
+      codelessCalls++;
+      if (codelessCalls === 1) {
+        throw new TypeError("Failed to fetch");
+      }
+      return makeOkResponse();
+    },
+  });
+  assert.equal(codelessCalls, 2);
+  assert.ok(codelessResult.tarBytes.length > 0);
+
+  // 3. Deterministic ECONNREFUSED inside AggregateError fails fast without retry & surfaces cause
+  let refusedCalls = 0;
+  await assert.rejects(
+    () =>
+      fetchGitArchive({
+        repo: "acme/demo",
+        ref: "main",
+        gitProxyBase: "http://127.0.0.1:1/api/git/archive",
+        fetchImpl: async () => {
+          refusedCalls++;
+          const e1 = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:1"), {
+            code: "ECONNREFUSED",
+          });
+          const agg = new AggregateError([e1], "");
+          throw new TypeError("fetch failed", { cause: agg });
+        },
+      }),
+    (err) =>
+      err instanceof Error &&
+      /ECONNREFUSED/.test(err.message) &&
+      err.cause instanceof TypeError
+  );
+  assert.equal(refusedCalls, 1);
+
+  // 4. AbortError fails fast without retry
+  let abortCalls = 0;
+  await assert.rejects(
+    () =>
+      fetchGitArchive({
+        repo: "acme/demo",
+        ref: "main",
+        gitProxyBase: "http://127.0.0.1:1/api/git/archive",
+        fetchImpl: async () => {
+          abortCalls++;
+          const err = new Error("The operation was aborted");
+          err.name = "AbortError";
+          throw err;
+        },
+      }),
+    (err) => err.name === "AbortError"
+  );
+  assert.equal(abortCalls, 1);
+
+  // 5. Non-2xx HTTP response fails fast without retry
+  let http404Calls = 0;
+  await assert.rejects(
+    () =>
+      fetchGitArchive({
+        repo: "acme/demo",
+        ref: "missing",
+        gitProxyBase: "http://127.0.0.1:1/api/git/archive",
+        fetchImpl: async () => {
+          http404Calls++;
+          return new Response(JSON.stringify({ error: "not found" }), {
+            status: 404,
+            statusText: "Not Found",
+            headers: { "content-type": "application/json" },
+          });
+        },
+      }),
+    /404/
+  );
+  assert.equal(http404Calls, 1);
+});
+
+// ============================================================================
+// 8. M13 Phase 2 Adversarial Regressions (BUG-B1, B2, B5, B6 + GAP-B1..B3)
+// ============================================================================
+test("BUG-B1: extractTarToVfs rejects negative tar entry sizes (ASCII octal and GNU base-256) without hanging", () => {
+  function makeRawHeader(name, sizeMutator) {
+    const hdr = new Uint8Array(512);
+    const enc = new TextEncoder();
+    hdr.set(enc.encode(name), 0);
+    hdr.set(enc.encode("0000644\0"), 100);
+    hdr.set(enc.encode("0000000\0"), 108);
+    hdr.set(enc.encode("0000000\0"), 116);
+    sizeMutator(hdr);
+    hdr[156] = "0".charCodeAt(0);
+    hdr.set(enc.encode("ustar\0"), 257);
+    hdr.set(enc.encode("00"), 263);
+    const full = new Uint8Array(1536);
+    full.set(hdr, 0);
+    return full;
+  }
+
+  // 1. ASCII octal "-1000" (-512)
+  const negOctalTar = makeRawHeader("repo-main/evil.txt", (hdr) => {
+    hdr.set(new TextEncoder().encode("-1000\0"), 124);
+  });
+  const resOctal = extractTarToVfs(negOctalTar, { mountPath: "/workspace", stripComponents: 1 });
+  assert.equal(resOctal.files.size, 0, "Negative octal size tar must terminate immediately with 0 files");
+
+  // 2. GNU base-256 negative (-512: 0xff ... 0xfe 0x00)
+  const negBase256Tar = makeRawHeader("repo-main/evil2.txt", (hdr) => {
+    for (let i = 124; i < 134; i++) hdr[i] = 0xff;
+    hdr[134] = 0xfe;
+    hdr[135] = 0x00;
+  });
+  const resBase256 = extractTarToVfs(negBase256Tar, { mountPath: "/workspace", stripComponents: 1 });
+  assert.equal(resBase256.files.size, 0, "Negative base-256 size tar must terminate immediately with 0 files");
+});
+
+test("GAP-B1: PAX x/g and GNU L/K path traversal blocked under mountPath; negative/NaN/huge stripComponents safe", () => {
+  function buildHeader(name, typeFlag, size, linkName = "") {
+    const hdr = new Uint8Array(512);
+    const enc = new TextEncoder();
+    hdr.set(enc.encode(name).subarray(0, 100), 0);
+    hdr.set(enc.encode("0000644\0"), 100);
+    hdr.set(enc.encode("0000000\0"), 108);
+    hdr.set(enc.encode("0000000\0"), 116);
+    hdr.set(enc.encode(size.toString(8).padStart(11, "0") + "\0"), 124);
+    hdr[156] = typeFlag.charCodeAt(0);
+    hdr.set(enc.encode(linkName).subarray(0, 100), 157);
+    hdr.set(enc.encode("ustar\0"), 257);
+    hdr.set(enc.encode("00"), 263);
+    return hdr;
+  }
+  function padBlock(bytes) {
+    const padded = new Uint8Array(Math.ceil(bytes.length / 512) * 512);
+    padded.set(bytes);
+    return padded;
+  }
+  function makePaxRecord(key, value) {
+    const body = `${key}=${value}\n`;
+    let len = body.length + 2;
+    while (String(len).length + 1 + body.length !== len) {
+      len = String(len).length + 1 + body.length;
+    }
+    return new TextEncoder().encode(`${len} ${body}`);
+  }
+
+  const enc = new TextEncoder();
+  const paxEscapePayload = makePaxRecord("path", "repo-main/../../etc/pwned_pax");
+  const gnuEscapeName = enc.encode("repo-main/../../etc/pwned_gnu\0");
+  const safeData = enc.encode("safe-content");
+
+  const chunks = [
+    // PAX x traversal attempt
+    buildHeader("pax_hdr", "x", paxEscapePayload.length),
+    padBlock(paxEscapePayload),
+    buildHeader("placeholder", "0", 4),
+    padBlock(enc.encode("evil")),
+    // GNU LongName L traversal attempt
+    buildHeader("././@LongLink", "L", gnuEscapeName.length),
+    padBlock(gnuEscapeName),
+    buildHeader("placeholder2", "0", 4),
+    padBlock(enc.encode("evil")),
+    // Legitimate file inside mountPath
+    buildHeader("repo-main/sub/ok.txt", "0", safeData.length),
+    padBlock(safeData),
+    new Uint8Array(1024),
+  ];
+  const totalLen = chunks.reduce((a, b) => a + b.length, 0);
+  const tarBuf = new Uint8Array(totalLen);
+  let pos = 0;
+  for (const c of chunks) {
+    tarBuf.set(c, pos);
+    pos += c.length;
+  }
+
+  const out = extractTarToVfs(tarBuf, { mountPath: "/workspace", stripComponents: 1 });
+  assert.equal(out.files.has("/etc/pwned_pax"), false, "PAX traversal must not escape /workspace");
+  assert.equal(out.files.has("/etc/pwned_gnu"), false, "GNU LongName traversal must not escape /workspace");
+  assert.equal(textDecoder.decode(out.files.get("/workspace/sub/ok.txt").bytes), "safe-content");
+
+  // Negative, NaN, and huge stripComponents must not crash or escape
+  const negStrip = extractTarToVfs(tarBuf, { mountPath: "/workspace", stripComponents: -5 });
+  assert.ok(negStrip.files.has("/workspace/repo-main/sub/ok.txt"));
+  const nanStrip = extractTarToVfs(tarBuf, { mountPath: "/workspace", stripComponents: Number.NaN });
+  assert.ok(nanStrip.files.has("/workspace/repo-main/sub/ok.txt"));
+  const hugeStrip = extractTarToVfs(tarBuf, { mountPath: "/workspace", stripComponents: 999 });
+  assert.equal(hugeStrip.files.size, 0);
+});
+
+test("BUG-B2 & BUG-B6 & GAP-B2: fetchGitArchive post-decompress abort, direct err.code fast-fail, bad strip header & gitProxyBase query", async () => {
+  const { gzipBytes } = createGitArchiveTarGz(
+    [{ path: "file.txt", content: "hello\n" }],
+    { rootDir: "demo-main" }
+  );
+
+  // 1. BUG-B2: AbortSignal triggered during git-decompress rejects with AbortError
+  const ac = new AbortController();
+  await assert.rejects(
+    () =>
+      fetchGitArchive({
+        repo: "acme/demo",
+        ref: "main",
+        gitProxyBase: "http://127.0.0.1:1/api/git/archive",
+        signal: ac.signal,
+        onProgress: (ev) => {
+          if (ev.stage === "git-decompress") {
+            ac.abort();
+          }
+        },
+        fetchImpl: async () =>
+          new Response(gzipBytes, {
+            status: 200,
+            headers: {
+              "content-type": "application/gzip",
+              "x-git-archive-format": "tar.gz",
+              "x-git-strip-components": "1",
+            },
+          }),
+      }),
+    (err) => err && err.name === "AbortError"
+  );
+
+  // 2. BUG-B6: Direct err.code = "ECONNREFUSED" on TypeError fails fast (1 call) and surfaces code
+  let directCodeCalls = 0;
+  await assert.rejects(
+    () =>
+      fetchGitArchive({
+        repo: "acme/demo",
+        ref: "main",
+        gitProxyBase: "http://127.0.0.1:1/api/git/archive",
+        fetchImpl: async () => {
+          directCodeCalls++;
+          const err = new TypeError("fetch failed");
+          err.code = "ECONNREFUSED";
+          throw err;
+        },
+      }),
+    (err) => err instanceof Error && /ECONNREFUSED/.test(err.message)
+  );
+  assert.equal(directCodeCalls, 1, "Direct err.code=ECONNREFUSED must not retry");
+
+  // 3. GAP-B2: Malformed X-Git-Strip-Components falls back to 1
+  for (const badHeader of ["-1", "NaN", "1.5", "999", ""]) {
+    const res = await fetchGitArchive({
+      repo: "acme/demo",
+      ref: "main",
+      gitProxyBase: "http://127.0.0.1:1/api/git/archive",
+      fetchImpl: async () =>
+        new Response(gzipBytes, {
+          status: 200,
+          headers: {
+            "content-type": "application/gzip",
+            "x-git-archive-format": "tar.gz",
+            "x-git-strip-components": badHeader,
+          },
+        }),
+    });
+    assert.equal(res.stripComponents, 1, `Expected stripComponents=1 for header=${JSON.stringify(badHeader)}`);
+  }
+
+  // 4. GAP-B2: gitProxyBase with trailing slash and existing query string
+  const seenUrls = [];
+  await fetchGitArchive({
+    repo: "acme/demo",
+    ref: "main",
+    gitProxyBase: "http://127.0.0.1:1/api/git/archive/?token=abc",
+    fetchImpl: async (url) => {
+      seenUrls.push(String(url));
+      return new Response(gzipBytes, { status: 200 });
+    },
+  });
+  assert.equal(
+    seenUrls[0],
+    "http://127.0.0.1:1/api/git/archive/?token=abc&repo=acme%2Fdemo&ref=main"
+  );
+});
+
+test("BUG-B2: ContainerEngine.createContainer racing with dispose() during gitRepo fetch leaks zero containers", async () => {
+  const { gzipBytes } = createGitArchiveTarGz(
+    [{ path: "readme.txt", content: "ok\n" }],
+    { rootDir: "demo-main" }
+  );
+
+  // Hold the upstream git proxy response until after dispose() is called
+  let releaseGitResponse;
+  let gitRequestArrived;
+  const gitRequestArrivedPromise = new Promise((r) => {
+    gitRequestArrived = r;
+  });
+  const gitGate = new Promise((r) => {
+    releaseGitResponse = r;
+  });
+
+  const slowGitProxy = http.createServer(async (_req, res) => {
+    gitRequestArrived();
+    await gitGate;
+    res.writeHead(200, {
+      "Content-Type": "application/gzip",
+      "Content-Length": String(gzipBytes.length),
+      "X-Git-Archive-Format": "tar.gz",
+      "X-Git-Strip-Components": "1",
+    });
+    res.end(gzipBytes);
+  });
+  await new Promise((resolve) => slowGitProxy.listen(0, "127.0.0.1", resolve));
+  const slowPort = slowGitProxy.address().port;
+
+  const engine = new ContainerEngine();
+  await engine.init({
+    compilerWasm: fs.readFileSync(COMPILER_WASM_PATH),
+    runtimeWasm: fs.readFileSync(RUNTIME_WASM_PATH),
+  });
+
+  try {
+    const emptyTar = buildCustomTar([{ path: "bin/", type: "5", mode: 0o755 }]);
+    const imgMeta = await engine.loadOciTarball(emptyTar, { name: "local/dispose-race:latest" });
+
+    const createPromise = engine.createContainer(imgMeta.imageId, {
+      gitRepo: {
+        repo: "acme/demo",
+        ref: "main",
+        gitProxyBase: `http://127.0.0.1:${slowPort}/api/git/archive`,
+      },
+    });
+
+    await gitRequestArrivedPromise;
+    await engine.dispose();
+    releaseGitResponse();
+
+    await assert.rejects(createPromise, /disposed/i);
+    assert.equal(engine.containers.size, 0, "Disposed engine must not retain leaked containers");
+  } finally {
+    await engine.dispose();
+    await new Promise((resolve) => slowGitProxy.close(resolve));
+  }
+});
+
+test("BUG-B5 & GAP-B3: WorkerBackend null overlayTarBytes/stdin parity, non-detachment, and combined gitRepo+overlayTarBytes precedence", async () => {
+  // Verify WorkerBackend handles overlayTarBytes: null and stdin: null without TypeError,
+  // and does not detach caller's Uint8Array when transferring overlayTarBytes.
+  const calls = [];
+  class FakeWorker {
+    constructor() {
+      this._listeners = new Map();
+    }
+    addEventListener(type, fn) {
+      if (!this._listeners.has(type)) this._listeners.set(type, []);
+      this._listeners.get(type).push(fn);
+    }
+    postMessage(msg, transfer) {
+      calls.push({ msg, transfer });
+      queueMicrotask(() => {
+        const result = msg.method === "createContainer" ? { containerId: calls.length } : {};
+        for (const fn of this._listeners.get("message") || []) {
+          fn({ data: { type: "res", id: msg.id, ok: true, result } });
+        }
+      });
+    }
+    terminate() {}
+  }
+
+  const origWorker = globalThis.Worker;
+  globalThis.Worker = FakeWorker;
+  try {
+    const docker = await Elf2WasmDocker.create({
+      compilerWasm: fs.readFileSync(COMPILER_WASM_PATH),
+      runtimeWasm: fs.readFileSync(RUNTIME_WASM_PATH),
+      useWorker: true,
+    });
+    try {
+      const img = await docker.loadOciTarball(
+        buildCustomTar([{ path: "bin/", type: "5", mode: 0o755 }]),
+        { name: "local/worker-parity:latest" }
+      );
+      // 1. null overlayTarBytes & null stdin must not throw TypeError
+      const cNull = await img.createContainer({ overlayTarBytes: null, stdin: null });
+      assert.ok(cNull);
+
+      // 2. Non-null overlayTarBytes must slice-copy so caller's buffer is never detached
+      const callerBuf = new Uint8Array([1, 2, 3, 4]);
+      const cBuf = await img.createContainer({ overlayTarBytes: callerBuf });
+      assert.ok(cBuf);
+      assert.equal(callerBuf.byteLength, 4, "Caller overlayTarBytes must not be detached");
+      const lastCall = calls[calls.length - 1];
+      assert.equal(lastCall.transfer.length, 1);
+      assert.notEqual(lastCall.transfer[0], callerBuf.buffer, "Worker must transfer a cloned buffer");
+    } finally {
+      await docker.dispose();
+    }
+  } finally {
+    globalThis.Worker = origWorker;
+  }
+
+  // Combined gitRepo + overlayTarBytes precedence and mountPath normalization
+  const mockGit = createMockGitServer();
+  mockGit.addRepo("acme/combo", "main", [
+    { path: "shared.txt", content: "from-git\n" },
+    { path: "only-git.txt", content: "git-only\n" },
+  ]);
+  await mockGit.start();
+
+  const srv = createServer({ port: 0, host: "127.0.0.1", allowLocalRegistries: true });
+  await srv.start();
+  const docker = await Elf2WasmDocker.create({
+    compilerWasm: fs.readFileSync(COMPILER_WASM_PATH),
+    runtimeWasm: fs.readFileSync(RUNTIME_WASM_PATH),
+    gitProxyBase: `${srv.url}/api/git/archive`,
+    useWorker: false,
+  });
+
+  try {
+    const baseTar = buildCustomTar([{ path: "bin/", type: "5", mode: 0o755 }]);
+    const img = await docker.loadOciTarball(baseTar, { name: "local/combo:latest" });
+    const overlayTar = buildCustomTar([
+      { path: "shared.txt", type: "0", mode: 0o644, content: Buffer.from("from-overlay\n") },
+      { path: "only-overlay.txt", type: "0", mode: 0o644, content: Buffer.from("overlay-only\n") },
+    ]);
+
+    const c = await img.createContainer({
+      gitRepo: {
+        repo: `${mockGit.url}/acme/combo`,
+        ref: "main",
+        mountPath: "relative/dir/",
+      },
+      overlayTarBytes: overlayTar,
+      overlayMountPath: "/relative/dir",
+      overlayStripComponents: 0,
+    });
+    assert.equal(textDecoder.decode(await c.readFile("/relative/dir/shared.txt")), "from-overlay\n");
+    assert.equal(textDecoder.decode(await c.readFile("/relative/dir/only-git.txt")), "git-only\n");
+    assert.equal(textDecoder.decode(await c.readFile("/relative/dir/only-overlay.txt")), "overlay-only\n");
+  } finally {
+    await docker.dispose();
+    await srv.stop();
+    await mockGit.stop();
+  }
+});
+
+
+
 

@@ -671,7 +671,10 @@ export async function loadOciTarball(tarBytes, options = {}) {
 
     for (let depth = 0; depth < 4; depth++) {
       if (Array.isArray(currentDoc.manifests)) {
-        const selected = selectPlatformManifest(currentDoc, platform);
+        const selected =
+          currentDoc.manifests.length === 1 && !currentDoc.manifests[0].platform
+            ? currentDoc.manifests[0]
+            : selectPlatformManifest(currentDoc, platform);
         manifestDigest = selected.digest;
         const nextBytes = readTarEntryBytes(files, digestToBlobPath(selected.digest));
         if (!nextBytes) {

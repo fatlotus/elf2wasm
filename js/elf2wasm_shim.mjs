@@ -252,6 +252,9 @@ const PYTHON_CORE_LIB_DYNLOAD = new Set([
   "_statistics",
   "_queue",
   "mmap",
+  "pyexpat",
+  "_elementtree",
+  "_decimal",
 ]);
 
 function readCStringFromBytes(bytes, offset, maxEnd = bytes.length) {
@@ -2265,21 +2268,84 @@ function parsePaxRecords(bytes) {
   return records;
 }
 
-export function extractTarToVfs(arg1, arg2) {
+function resolveTarEntryPath(rawPath, mountPath, stripComponents) {
+  const str = String(rawPath || "");
+  if (!str || str.includes("\0")) return null;
+
+  const rawParts = [];
+  for (const seg of str.split("/")) {
+    if (!seg || seg === ".") continue;
+    rawParts.push(seg);
+  }
+
+  if (rawParts.length <= stripComponents) {
+    return null;
+  }
+
+  // Reject any '..' inside the stripped prefix so '../repo/file' cannot bypass escape checks.
+  for (let i = 0; i < stripComponents; i++) {
+    if (rawParts[i] === "..") return null;
+  }
+
+  const relParts = [];
+  for (let i = stripComponents; i < rawParts.length; i++) {
+    const seg = rawParts[i];
+    if (seg === "..") {
+      if (relParts.length === 0) {
+        if (mountPath !== "/") {
+          // Path escapes mountPath (e.g., '../outside' or 'a/../../outside') — reject entry.
+          return null;
+        }
+        // mountPath === "/": preserve legacy normalizeGuestPath clamping at root.
+      } else {
+        relParts.pop();
+      }
+    } else {
+      relParts.push(seg);
+    }
+  }
+
+  if (relParts.length === 0) {
+    return null;
+  }
+
+  return mountPath === "/"
+    ? "/" + relParts.join("/")
+    : `${mountPath}/${relParts.join("/")}`;
+}
+
+export function extractTarToVfs(arg1, arg2, arg3) {
   let sys = null;
   let rawBytes;
+  let options;
   if (arg1 && typeof arg1.writeVfsFile === "function") {
     sys = arg1;
     rawBytes = arg2;
+    options = arg3;
   } else {
     rawBytes = arg1;
+    options = arg2;
   }
+
+  const opts = options && typeof options === "object" ? options : {};
+  const mountPath = normalizeGuestPath(opts.mountPath ?? "/");
+  const stripComponents = Math.max(
+    0,
+    Number.isFinite(Number(opts.stripComponents))
+      ? Math.floor(Number(opts.stripComponents))
+      : 0
+  );
+  const ignoreWhiteouts = Boolean(opts.ignoreWhiteouts);
 
   const tar = toUint8Array(rawBytes);
   const files = new Map();
   const symlinks = new Map();
   const dirs = new Map();
   const whiteouts = [];
+
+  if (mountPath !== "/") {
+    dirs.set(mountPath, 0o755);
+  }
 
   let offset = 0;
   let nextLongName = null;
@@ -2314,9 +2380,16 @@ export function extractTarToVfs(arg1, arg2) {
       if (Number.isFinite(paxSize) && paxSize >= 0) size = paxSize;
     }
 
+    if (!Number.isFinite(size) || size < 0) {
+      break;
+    }
+
     const dataEnd = Math.min(offset + size, tar.length);
     const payload = sys ? tar.subarray(offset, dataEnd) : tar.slice(offset, dataEnd);
     const paddedBlocks = Math.ceil(size / 512) * 512;
+    if (!Number.isFinite(paddedBlocks) || paddedBlocks < 0) {
+      break;
+    }
     offset += paddedBlocks;
 
     if (typeFlag === "L") {
@@ -2350,26 +2423,28 @@ export function extractTarToVfs(arg1, arg2) {
     nextLongLink = null;
     nextPax = null;
 
-    const guestPath = normalizeGuestPath("/" + rawPath.replace(/^\.\//, ""));
-    if (guestPath === "/") continue;
+    const guestPath = resolveTarEntryPath(rawPath, mountPath, stripComponents);
+    if (!guestPath) continue;
 
     // OCI whiteout markers (.wh..wh..opq and .wh.<name>) apply only to lower
     // layers (handled in applyVfsOverlay before applying this layer's entries),
     // never to sibling entries within the same layer.
-    const base = basename(guestPath);
-    const parentDir = dirname(guestPath);
-    if (base === ".wh..wh..opq") {
-      whiteouts.push({ type: "opaque", dir: parentDir });
-      continue;
-    }
-    if (base.startsWith(".wh.")) {
-      const targetName = base.slice(4);
-      if (targetName) {
-        const targetPath =
-          parentDir === "/" ? "/" + targetName : `${parentDir}/${targetName}`;
-        whiteouts.push({ type: "remove", path: targetPath });
+    if (!ignoreWhiteouts) {
+      const base = basename(guestPath);
+      const parentDir = dirname(guestPath);
+      if (base === ".wh..wh..opq") {
+        whiteouts.push({ type: "opaque", dir: parentDir });
+        continue;
       }
-      continue;
+      if (base.startsWith(".wh.")) {
+        const targetName = base.slice(4);
+        if (targetName) {
+          const targetPath =
+            parentDir === "/" ? "/" + targetName : `${parentDir}/${targetName}`;
+          whiteouts.push({ type: "remove", path: targetPath });
+        }
+        continue;
+      }
     }
 
     if (typeFlag === "5") {
@@ -2385,7 +2460,8 @@ export function extractTarToVfs(arg1, arg2) {
       continue;
     }
     if (typeFlag === "1") {
-      const targetGuestPath = normalizeGuestPath("/" + linkTarget.replace(/^\.\//, ""));
+      const targetGuestPath = resolveTarEntryPath(linkTarget, mountPath, stripComponents);
+      if (!targetGuestPath) continue;
       const existing = files.get(targetGuestPath);
       if (existing) {
         const copy = sys ? existing.bytes : existing.bytes.slice();
@@ -2426,17 +2502,22 @@ export function extractTarToVfs(arg1, arg2) {
   return vfs;
 }
 
-export async function extractTarGzToVfs(arg1, arg2) {
+export async function extractTarGzToVfs(arg1, arg2, arg3) {
   let sys = null;
   let rawBytes;
+  let options;
   if (arg1 && typeof arg1.writeVfsFile === "function") {
     sys = arg1;
     rawBytes = arg2;
+    options = arg3;
   } else {
     rawBytes = arg1;
+    options = arg2;
   }
   const tarBytes = await decompressStreamBytes(rawBytes, "gzip");
-  return sys ? extractTarToVfs(sys, tarBytes) : extractTarToVfs(tarBytes);
+  return sys
+    ? extractTarToVfs(sys, tarBytes, options)
+    : extractTarToVfs(tarBytes, options);
 }
 
 export async function extractZipToVfs(arg1, arg2) {

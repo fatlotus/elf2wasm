@@ -12,9 +12,11 @@ import {
   parseImageRef,
   pullImage as ociPullImage,
   loadOciTarball as ociLoadOciTarball,
+  decompressLayer,
 } from "./oci_client.mjs";
+import { fetchGitArchive } from "./git_client.mjs";
 
-export { parseImageRef };
+export { parseImageRef, fetchGitArchive };
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: false });
@@ -34,6 +36,20 @@ function normalizeCmdArray(val) {
   if (typeof val === "string") return [val];
   if (Array.isArray(val)) return val.map((x) => String(x));
   return [];
+}
+
+function normalizeMountPath(rawPath, fallback = "/workspace") {
+  if (typeof rawPath !== "string" || !rawPath.trim()) return fallback;
+  const parts = [];
+  for (const seg of rawPath.trim().split("/")) {
+    if (!seg || seg === ".") continue;
+    if (seg === "..") {
+      if (parts.length > 0) parts.pop();
+    } else {
+      parts.push(seg);
+    }
+  }
+  return parts.length === 0 ? "/" : "/" + parts.join("/");
 }
 
 function mergeEnv(baseEnv, imageEnv, overrideEnv) {
@@ -206,6 +222,7 @@ export class ContainerEngine {
     this.runtimeMod = null;
     this.compilerInst = null;
     this.registryProxyBase = "/api/v2";
+    this.gitProxyBase = "/api/git/archive";
     this.maxCachedImages =
       Number.isInteger(options.maxCachedImages) && options.maxCachedImages > 0
         ? options.maxCachedImages
@@ -220,6 +237,7 @@ export class ContainerEngine {
 
   async init(options = {}) {
     this.registryProxyBase = options.registryProxyBase ?? "/api/v2";
+    this.gitProxyBase = options.gitProxyBase ?? "/api/git/archive";
     if (Number.isInteger(options.maxCachedImages) && options.maxCachedImages > 0) {
       this.maxCachedImages = options.maxCachedImages;
     }
@@ -276,6 +294,18 @@ export class ContainerEngine {
   }
 
   async createContainer(imageId, options = {}, callbacks = {}) {
+    const assertActive = () => {
+      if (this.disposed) {
+        throw new Error("ContainerEngine has been disposed");
+      }
+      if (options.signal && options.signal.aborted) {
+        const err = new Error("Operation aborted");
+        err.name = "AbortError";
+        throw err;
+      }
+    };
+    assertActive();
+
     const image = this.images.get(imageId);
     if (!image) {
       throw new Error(`Unknown imageId: ${imageId}`);
@@ -297,6 +327,7 @@ export class ContainerEngine {
         this.compilerInst = inst;
       },
     });
+    assertActive();
     if (sys.compilerInst) {
       this.compilerInst = sys.compilerInst;
     }
@@ -314,6 +345,98 @@ export class ContainerEngine {
         });
       }
       extractTarToVfs(sys, image.layers[i].tarBytes);
+    }
+
+    let overlayDefaultCwd = null;
+
+    if (options.gitRepo && typeof options.gitRepo === "object" && options.gitRepo.repo) {
+      const mountPath = normalizeMountPath(options.gitRepo.mountPath, "/workspace");
+      // Yield a macrotask tick after synchronous layer extraction so Node/libuv
+      // processes any pending socket close events before fetch() picks a pooled socket.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assertActive();
+      let archive = await fetchGitArchive({
+        repo: options.gitRepo.repo,
+        ref: options.gitRepo.ref,
+        gitProxyBase:
+          options.gitRepo.gitProxyBase ?? options.gitProxyBase ?? this.gitProxyBase,
+        onProgress,
+        signal: options.signal,
+      });
+      assertActive();
+      const stripComponents =
+        options.gitRepo.stripComponents !== undefined
+          ? options.gitRepo.stripComponents
+          : archive.stripComponents;
+      if (onProgress) {
+        onProgress({
+          stage: "git-overlay",
+          message: `Overlaying ${archive.repo}@${archive.ref} onto ${mountPath}...`,
+          layerIndex: 0,
+          layerCount: 1,
+          loaded: 0,
+          total: 1,
+        });
+      }
+      extractTarToVfs(sys, archive.tarBytes, {
+        mountPath,
+        stripComponents,
+        ignoreWhiteouts: true,
+      });
+      // Release uncompressed git archive buffer immediately after VFS extraction.
+      archive.tarBytes = null;
+      archive = null;
+      if (onProgress) {
+        onProgress({
+          stage: "git-overlay",
+          message: `Overlayed ${options.gitRepo.repo} onto ${mountPath}`,
+          layerIndex: 1,
+          layerCount: 1,
+          loaded: 1,
+          total: 1,
+        });
+      }
+      overlayDefaultCwd = mountPath;
+    }
+
+    if (options.overlayTarBytes) {
+      const mountPath = normalizeMountPath(options.overlayMountPath, "/workspace");
+      const stripComponents =
+        options.overlayStripComponents !== undefined ? options.overlayStripComponents : 0;
+      if (onProgress) {
+        onProgress({
+          stage: "git-overlay",
+          message: `Overlaying archive onto ${mountPath}...`,
+          layerIndex: 0,
+          layerCount: 1,
+          loaded: 0,
+          total: 1,
+        });
+      }
+      let rawBytes = toUint8Array(options.overlayTarBytes);
+      let tarBytes =
+        rawBytes.length >= 2 && rawBytes[0] === 0x1f && rawBytes[1] === 0x8b
+          ? await decompressLayer(rawBytes)
+          : rawBytes;
+      assertActive();
+      extractTarToVfs(sys, tarBytes, {
+        mountPath,
+        stripComponents,
+        ignoreWhiteouts: true,
+      });
+      tarBytes = null;
+      rawBytes = null;
+      if (onProgress) {
+        onProgress({
+          stage: "git-overlay",
+          message: `Overlayed archive onto ${mountPath}`,
+          layerIndex: 1,
+          layerCount: 1,
+          loaded: 1,
+          total: 1,
+        });
+      }
+      overlayDefaultCwd = mountPath;
     }
 
     // Merge Entrypoint + Cmd following Docker semantics
@@ -334,10 +457,10 @@ export class ContainerEngine {
       fullArgv = ["/bin/sh"];
     }
 
-    const cwd =
-      typeof options.cwd === "string" && options.cwd.length > 0
-        ? options.cwd
-        : image.config.workingDir || "/";
+    const hasExplicitCwd = typeof options.cwd === "string" && options.cwd.length > 0;
+    const cwd = hasExplicitCwd
+      ? options.cwd
+      : overlayDefaultCwd || image.config.workingDir || "/";
     const tty = Boolean(options.tty);
     const cols = Number.isInteger(options.cols) && options.cols > 0 ? options.cols : 80;
     const rows = Number.isInteger(options.rows) && options.rows > 0 ? options.rows : 24;
@@ -351,7 +474,12 @@ export class ContainerEngine {
     if (isNodeContainer(image.config.env, entrypoint, cmd, fullArgv)) {
       baseEnv.push(...getNodeDefaultEnv(image.config.env));
     }
-    const env = mergeEnv(baseEnv, image.config.env, options.env);
+    const postImageEnv = hasExplicitCwd || overlayDefaultCwd ? [`PWD=${cwd}`] : [];
+    const env = mergeEnv(
+      baseEnv,
+      image.config.env,
+      postImageEnv.length ? [...postImageEnv, ...(options.env || [])] : options.env
+    );
 
     const { uid, gid } = resolveUserUidGid(
       sys,
@@ -834,6 +962,7 @@ class WorkerBackend {
       compilerWasmUrl: options.compilerWasmUrl,
       runtimeWasmUrl: options.runtimeWasmUrl,
       registryProxyBase: options.registryProxyBase,
+      gitProxyBase: options.gitProxyBase,
       maxCachedImages: options.maxCachedImages,
     };
     await this._call("init", payload);
@@ -869,6 +998,7 @@ class WorkerBackend {
   }
 
   async createContainer(imageId, options = {}, handlers = {}) {
+    const transfer = [];
     const cleanOptions = {
       cmd: options.cmd,
       entrypoint: options.entrypoint,
@@ -880,12 +1010,30 @@ class WorkerBackend {
       user: options.user,
       uid: options.uid,
       gid: options.gid,
-      stdin: options.stdin !== undefined ? toUint8Array(options.stdin).slice() : undefined,
+      stdin: options.stdin != null ? toUint8Array(options.stdin).slice() : undefined,
+      gitRepo:
+        options.gitRepo && typeof options.gitRepo === "object"
+          ? {
+              repo: options.gitRepo.repo,
+              ref: options.gitRepo.ref,
+              mountPath: options.gitRepo.mountPath,
+              stripComponents: options.gitRepo.stripComponents,
+              gitProxyBase: options.gitRepo.gitProxyBase,
+            }
+          : undefined,
+      gitProxyBase: options.gitProxyBase,
+      overlayMountPath: options.overlayMountPath,
+      overlayStripComponents: options.overlayStripComponents,
     };
+    if (options.overlayTarBytes != null) {
+      const overlayCopy = toUint8Array(options.overlayTarBytes).slice();
+      cleanOptions.overlayTarBytes = overlayCopy;
+      transfer.push(overlayCopy.buffer);
+    }
     const res = await this._call(
       "createContainer",
       { imageId, options: cleanOptions },
-      { onProgress: options.onProgress }
+      { onProgress: options.onProgress, signal: options.signal, transfer }
     );
     this.containerHandlers.set(res.containerId, {
       ...handlers,
@@ -1153,6 +1301,7 @@ export class Elf2WasmDocker {
       compilerWasmUrl: options.compilerWasmUrl ?? "/wasm/elf2wasm_compiler_wasm.wasm",
       runtimeWasmUrl: options.runtimeWasmUrl ?? "/wasm/elf2wasm_runtime_wasm.wasm",
       registryProxyBase: options.registryProxyBase ?? "/api/v2",
+      gitProxyBase: options.gitProxyBase ?? "/api/git/archive",
       useWorker: options.useWorker ?? typeof Worker !== "undefined",
       compilerWasm: options.compilerWasm,
       runtimeWasm: options.runtimeWasm,
@@ -1203,6 +1352,7 @@ export async function runDockerImage(imageRef, options = {}) {
       compilerWasmUrl: options.compilerWasmUrl,
       runtimeWasmUrl: options.runtimeWasmUrl,
       registryProxyBase: options.registryProxyBase,
+      gitProxyBase: options.gitProxyBase,
       useWorker: options.useWorker,
       compilerWasm: options.compilerWasm,
       runtimeWasm: options.runtimeWasm,
@@ -1232,6 +1382,12 @@ export async function runDockerImage(imageRef, options = {}) {
       uid: options.uid,
       gid: options.gid,
       stdin,
+      gitRepo: options.gitRepo,
+      gitProxyBase: options.gitProxyBase,
+      overlayTarBytes: options.overlayTarBytes,
+      overlayMountPath: options.overlayMountPath,
+      overlayStripComponents: options.overlayStripComponents,
+      signal: options.signal,
       onProgress: options.onProgress,
     });
     // Release uncompressed layer tarBytes immediately after VFS extraction

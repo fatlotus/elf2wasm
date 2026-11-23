@@ -85,45 +85,56 @@ async function handleMessage(ev) {
       }
 
       case "createContainer": {
-        let boundContainerId = 0;
-        const res = await engine.createContainer(
-          payload.imageId,
-          {
-            ...(payload.options || {}),
-            onProgress: (data) => {
-              if (boundContainerId !== 0) {
-                self.postMessage({
-                  event: "containerProgress",
-                  containerId: boundContainerId,
-                  data,
-                });
-              } else {
-                self.postMessage({ event: "progress", reqId: id, data });
-              }
+        const ctrl = new AbortController();
+        if (id) activeAborts.set(id, ctrl);
+        try {
+          let boundContainerId = 0;
+          const opts = payload.options || {};
+          const res = await engine.createContainer(
+            payload.imageId,
+            {
+              ...opts,
+              signal: ctrl.signal,
+              onProgress: (data) => {
+                if (boundContainerId !== 0) {
+                  self.postMessage({
+                    event: "containerProgress",
+                    containerId: boundContainerId,
+                    data,
+                  });
+                } else {
+                  self.postMessage({ event: "progress", reqId: id, data });
+                }
+              },
             },
-          },
-          {
-            onStdout: (chunk) => {
-              const copy = chunk instanceof Uint8Array ? chunk.slice() : new Uint8Array(chunk);
-              self.postMessage(
-                { event: "stdout", containerId: boundContainerId, chunk: copy },
-                [copy.buffer]
-              );
-            },
-            onStderr: (chunk) => {
-              const copy = chunk instanceof Uint8Array ? chunk.slice() : new Uint8Array(chunk);
-              self.postMessage(
-                { event: "stderr", containerId: boundContainerId, chunk: copy },
-                [copy.buffer]
-              );
-            },
-            onExit: (exitCode) => {
-              self.postMessage({ event: "exit", containerId: boundContainerId, exitCode });
-            },
+            {
+              onStdout: (chunk) => {
+                const copy = chunk instanceof Uint8Array ? chunk.slice() : new Uint8Array(chunk);
+                self.postMessage(
+                  { event: "stdout", containerId: boundContainerId, chunk: copy },
+                  [copy.buffer]
+                );
+              },
+              onStderr: (chunk) => {
+                const copy = chunk instanceof Uint8Array ? chunk.slice() : new Uint8Array(chunk);
+                self.postMessage(
+                  { event: "stderr", containerId: boundContainerId, chunk: copy },
+                  [copy.buffer]
+                );
+              },
+              onExit: (exitCode) => {
+                self.postMessage({ event: "exit", containerId: boundContainerId, exitCode });
+              },
+            }
+          );
+          boundContainerId = res.containerId;
+          postReply(id, true, res);
+        } finally {
+          if (payload.options && payload.options.overlayTarBytes) {
+            payload.options.overlayTarBytes = null;
           }
-        );
-        boundContainerId = res.containerId;
-        postReply(id, true, res);
+          if (id) activeAborts.delete(id);
+        }
         break;
       }
 
