@@ -495,7 +495,7 @@ impl VirtualFs {
             cur.push_str(part);
             self.overlay.entry(cur.clone()).or_insert(OverlayNode::Dir {
                 mode: 0o755,
-                mtime_ns: 0,
+                mtime_ns: crate::scheduler::INITIAL_REALTIME_BASE_NS,
             });
         }
         let final_path = if resolved_parent == "/" {
@@ -515,7 +515,7 @@ impl VirtualFs {
             OverlayNode::File {
                 data: Arc::new(bytes.to_vec()),
                 mode: mode & 0o7777,
-                mtime_ns: 0,
+                mtime_ns: crate::scheduler::INITIAL_REALTIME_BASE_NS,
             },
         );
     }
@@ -528,7 +528,7 @@ impl VirtualFs {
             final_path,
             OverlayNode::Symlink {
                 target: target.to_string(),
-                mtime_ns: 0,
+                mtime_ns: crate::scheduler::INITIAL_REALTIME_BASE_NS,
             },
         );
     }
@@ -540,7 +540,7 @@ impl VirtualFs {
                 "/".to_string(),
                 OverlayNode::Dir {
                     mode: mode & 0o7777,
-                    mtime_ns: 0,
+                    mtime_ns: crate::scheduler::INITIAL_REALTIME_BASE_NS,
                 },
             );
             return;
@@ -552,7 +552,7 @@ impl VirtualFs {
             final_path,
             OverlayNode::Dir {
                 mode: mode & 0o7777,
-                mtime_ns: 0,
+                mtime_ns: crate::scheduler::INITIAL_REALTIME_BASE_NS,
             },
         );
     }
