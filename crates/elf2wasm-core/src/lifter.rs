@@ -1,5 +1,7 @@
-use iced_x86::{Code, ConditionCode, Instruction as X86Inst, Mnemonic, OpKind, Register};
-use wasm_encoder::{BlockType, Function, Instruction as WInst, MemArg};
+use crate::x87::*;
+use iced_x86::{Code, ConditionCode, Instruction as X86Inst, MemorySize, Mnemonic, OpKind, Register};
+use std::borrow::Cow;
+use wasm_encoder::{BlockType, Function, Instruction as WInst, MemArg, ValType};
 
 // ============================================================================
 // CPU State Global Indices
@@ -47,7 +49,11 @@ pub const YIELD_QUANTUM: i32 = 2;
 pub const YIELD_SYSCALL_PENDING: i32 = 3;
 pub const GLOBAL_QUANTUM: u32 = 48; // i32, init DEFAULT_QUANTUM
 pub const DEFAULT_QUANTUM: i32 = 128;
-pub const CTX_SIZE: usize = 464;
+pub const GLOBAL_X87_ST_BASE: u32 = 49; // 49..=56 (8 i64 physical mantissa registers)
+pub const GLOBAL_X87_TOP: u32 = 57; // i32, init 0 (0..7)
+pub const GLOBAL_X87_SW: u32 = 58; // i32, init 0 (x87 status word)
+pub const GLOBAL_X87_SE_BASE: u32 = 59; // 59..=66 (8 i32 physical sign+exponent registers)
+pub const CTX_SIZE: usize = 544;
 
 pub const GPR_NAMES: [&str; 16] = [
     "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
@@ -243,11 +249,15 @@ fn memarg(offset: u64, align: u32) -> MemArg {
 
 pub struct Lifter<'a> {
     pub func: &'a mut Function,
+    pub x87_helper_base: u32,
 }
 
 impl<'a> Lifter<'a> {
-    pub fn new(func: &'a mut Function) -> Self {
-        Self { func }
+    pub fn new(func: &'a mut Function, x87_helper_base: u32) -> Self {
+        Self {
+            func,
+            x87_helper_base,
+        }
     }
 
     #[inline]
@@ -1864,11 +1874,11 @@ impl<'a> Lifter<'a> {
             }
 
             // ----------------------------------------------------------------
-            // SSE / SSE2
+            // SSE / SSE2 / x87 FPU
             // ----------------------------------------------------------------
             _ => {
-                if !self.lift_sse(instr) {
-                    // Rare/VEX/EVEX/x87 unimplemented opcodes: emit trap at runtime.
+                if !self.lift_sse(instr) && !self.lift_x87(instr) {
+                    // Rare/VEX/EVEX unimplemented opcodes: emit trap at runtime.
                     self.emit(WInst::Unreachable);
                 }
             }
@@ -3978,6 +3988,987 @@ impl<'a> Lifter<'a> {
     /// Computes indirect jump/call target address from `instr.op0` onto stack as `i64`.
     pub fn emit_indirect_target_i64(&mut self, instr: &X86Inst) {
         self.read_op_i64(instr, 0, 8);
+    }
+
+    // ------------------------------------------------------------------------
+    // x87 FPU Lifter
+    // ------------------------------------------------------------------------
+
+    fn map_st(reg: Register) -> Option<u32> {
+        match reg {
+            Register::ST0 => Some(0),
+            Register::ST1 => Some(1),
+            Register::ST2 => Some(2),
+            Register::ST3 => Some(3),
+            Register::ST4 => Some(4),
+            Register::ST5 => Some(5),
+            Register::ST6 => Some(6),
+            Register::ST7 => Some(7),
+            _ => None,
+        }
+    }
+
+    /// Pushes `ST(i)` mantissa (`i64`) onto the WASM value stack without touching any locals.
+    fn x87_read_st_mant(&mut self, i: u32) {
+        self.emit(WInst::Block(BlockType::Result(ValType::I64)));
+        for _ in 0..8 {
+            self.emit(WInst::Block(BlockType::Empty));
+        }
+        self.emit(WInst::GlobalGet(GLOBAL_X87_TOP));
+        if i != 0 {
+            self.emit(WInst::I32Const(i as i32));
+            self.emit(WInst::I32Add);
+        }
+        self.emit(WInst::I32Const(7));
+        self.emit(WInst::I32And);
+        self.emit(WInst::BrTable(Cow::Borrowed(&[0, 1, 2, 3, 4, 5, 6, 7]), 0));
+        for reg in 0..8u32 {
+            self.emit(WInst::End);
+            self.emit(WInst::GlobalGet(GLOBAL_X87_ST_BASE + reg));
+            self.emit(WInst::Br(7 - reg));
+        }
+        self.emit(WInst::End);
+    }
+
+    /// Pushes `ST(i)` sign+exponent (`i32`) onto the WASM value stack without touching any locals.
+    fn x87_read_st_se(&mut self, i: u32) {
+        self.emit(WInst::Block(BlockType::Result(ValType::I32)));
+        for _ in 0..8 {
+            self.emit(WInst::Block(BlockType::Empty));
+        }
+        self.emit(WInst::GlobalGet(GLOBAL_X87_TOP));
+        if i != 0 {
+            self.emit(WInst::I32Const(i as i32));
+            self.emit(WInst::I32Add);
+        }
+        self.emit(WInst::I32Const(7));
+        self.emit(WInst::I32And);
+        self.emit(WInst::BrTable(Cow::Borrowed(&[0, 1, 2, 3, 4, 5, 6, 7]), 0));
+        for reg in 0..8u32 {
+            self.emit(WInst::End);
+            self.emit(WInst::GlobalGet(GLOBAL_X87_SE_BASE + reg));
+            self.emit(WInst::Br(7 - reg));
+        }
+        self.emit(WInst::End);
+    }
+
+    /// Pushes `ST(i)` as `(mant: i64, se: i32)` onto the WASM value stack without touching any locals.
+    fn x87_read_st(&mut self, i: u32) {
+        self.x87_read_st_mant(i);
+        self.x87_read_st_se(i);
+    }
+
+    /// Pops `(mant: i64, se: i32)` from the WASM value stack and stores into `ST(i)`.
+    /// Clobbers only `LOCAL_I32_7` and `LOCAL_I64_7`.
+    fn x87_write_st(&mut self, i: u32) {
+        self.emit(WInst::LocalSet(LOCAL_I32_7));
+        self.emit(WInst::LocalSet(LOCAL_I64_7));
+        self.emit(WInst::Block(BlockType::Empty));
+        for _ in 0..8 {
+            self.emit(WInst::Block(BlockType::Empty));
+        }
+        self.emit(WInst::GlobalGet(GLOBAL_X87_TOP));
+        if i != 0 {
+            self.emit(WInst::I32Const(i as i32));
+            self.emit(WInst::I32Add);
+        }
+        self.emit(WInst::I32Const(7));
+        self.emit(WInst::I32And);
+        self.emit(WInst::BrTable(Cow::Borrowed(&[0, 1, 2, 3, 4, 5, 6, 7]), 0));
+        for reg in 0..8u32 {
+            self.emit(WInst::End);
+            self.emit(WInst::LocalGet(LOCAL_I64_7));
+            self.emit(WInst::GlobalSet(GLOBAL_X87_ST_BASE + reg));
+            self.emit(WInst::LocalGet(LOCAL_I32_7));
+            self.emit(WInst::GlobalSet(GLOBAL_X87_SE_BASE + reg));
+            self.emit(WInst::Br(7 - reg));
+        }
+        self.emit(WInst::End);
+    }
+
+    fn x87_dec_top(&mut self) {
+        self.emit(WInst::GlobalGet(GLOBAL_X87_TOP));
+        self.emit(WInst::I32Const(1));
+        self.emit(WInst::I32Sub);
+        self.emit(WInst::I32Const(7));
+        self.emit(WInst::I32And);
+        self.emit(WInst::GlobalSet(GLOBAL_X87_TOP));
+    }
+
+    fn x87_inc_top(&mut self) {
+        self.emit(WInst::GlobalGet(GLOBAL_X87_TOP));
+        self.emit(WInst::I32Const(1));
+        self.emit(WInst::I32Add);
+        self.emit(WInst::I32Const(7));
+        self.emit(WInst::I32And);
+        self.emit(WInst::GlobalSet(GLOBAL_X87_TOP));
+    }
+
+    /// Consumes `(mant: i64, se: i32)` from top of WASM stack, decrements TOP, writes to new ST(0).
+    fn x87_push(&mut self) {
+        self.x87_dec_top();
+        self.x87_write_st(0);
+    }
+
+    fn x87_pop(&mut self) {
+        self.x87_inc_top();
+    }
+
+    /// Loads a memory float/int operand for x87 instructions and pushes `(mant: i64, se: i32)`.
+    /// Clobbers only `LOCAL_I32_0`.
+    fn x87_load_mem_f80(&mut self, instr: &X86Inst) -> bool {
+        match instr.memory_size() {
+            MemorySize::Float32 => {
+                self.compute_ea_i32(instr);
+                self.emit(WInst::F32Load(memarg(0, 0)));
+                self.emit(WInst::F64PromoteF32);
+                self.emit(WInst::Call(self.x87_helper_base + X87_FN_F64_TO_F80));
+                true
+            }
+            MemorySize::Float64 => {
+                self.compute_ea_i32(instr);
+                self.emit(WInst::F64Load(memarg(0, 0)));
+                self.emit(WInst::Call(self.x87_helper_base + X87_FN_F64_TO_F80));
+                true
+            }
+            MemorySize::Float80 => {
+                self.compute_ea_i32(instr);
+                self.emit(WInst::LocalTee(LOCAL_I32_0));
+                self.emit(WInst::I64Load(memarg(0, 0)));
+                self.emit(WInst::LocalGet(LOCAL_I32_0));
+                self.emit(WInst::I32Load16U(memarg(8, 0)));
+                true
+            }
+            MemorySize::Int16 | MemorySize::UInt16 => {
+                self.compute_ea_i32(instr);
+                self.emit(WInst::I64Load16S(memarg(0, 0)));
+                self.emit(WInst::Call(self.x87_helper_base + X87_FN_I64_TO_F80));
+                true
+            }
+            MemorySize::Int32 | MemorySize::UInt32 => {
+                self.compute_ea_i32(instr);
+                self.emit(WInst::I64Load32S(memarg(0, 0)));
+                self.emit(WInst::Call(self.x87_helper_base + X87_FN_I64_TO_F80));
+                true
+            }
+            MemorySize::Int64 | MemorySize::UInt64 => {
+                self.compute_ea_i32(instr);
+                self.emit(WInst::I64Load(memarg(0, 0)));
+                self.emit(WInst::Call(self.x87_helper_base + X87_FN_I64_TO_F80));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Consumes `f80_cmp` result (`0=eq, 1=lt, 2=gt, 3=unordered`) from stack and updates x87 SW C3/C2/C1/C0.
+    fn x87_cmp_res_to_sw(&mut self) {
+        self.emit(WInst::LocalSet(LOCAL_I32_0));
+        // Clear C0(8), C1(9), C2(10), C3(14) = 0x4700
+        self.emit(WInst::GlobalGet(GLOBAL_X87_SW));
+        self.emit(WInst::I32Const(!0x4700i32 & 0xFFFF));
+        self.emit(WInst::I32And);
+
+        self.emit(WInst::LocalGet(LOCAL_I32_0));
+        self.emit(WInst::I32Eqz);
+        self.emit(WInst::If(BlockType::Result(ValType::I32)));
+        {
+            self.emit(WInst::I32Const(0x4000)); // eq: C3=1
+        }
+        self.emit(WInst::Else);
+        {
+            self.emit(WInst::LocalGet(LOCAL_I32_0));
+            self.emit(WInst::I32Const(1));
+            self.emit(WInst::I32Eq);
+            self.emit(WInst::If(BlockType::Result(ValType::I32)));
+            {
+                self.emit(WInst::I32Const(0x0100)); // lt: C0=1
+            }
+            self.emit(WInst::Else);
+            {
+                self.emit(WInst::LocalGet(LOCAL_I32_0));
+                self.emit(WInst::I32Const(2));
+                self.emit(WInst::I32Eq);
+                self.emit(WInst::If(BlockType::Result(ValType::I32)));
+                {
+                    self.emit(WInst::I32Const(0x0000)); // gt
+                }
+                self.emit(WInst::Else);
+                {
+                    self.emit(WInst::I32Const(0x4500)); // unordered: C3=1, C2=1, C0=1
+                }
+                self.emit(WInst::End);
+            }
+            self.emit(WInst::End);
+        }
+        self.emit(WInst::End);
+
+        self.emit(WInst::I32Or);
+        self.emit(WInst::GlobalSet(GLOBAL_X87_SW));
+    }
+
+    /// Consumes `f80_cmp` result (`0=eq, 1=lt, 2=gt, 3=unordered`) from stack and updates EFLAGS.
+    fn x87_cmp_res_to_eflags(&mut self) {
+        self.emit(WInst::LocalSet(LOCAL_I32_0));
+        self.emit(WInst::I32Const(0));
+        self.emit(WInst::GlobalSet(GLOBAL_OF));
+        self.emit(WInst::I32Const(0));
+        self.emit(WInst::GlobalSet(GLOBAL_SF));
+        self.emit(WInst::I32Const(0));
+        self.emit(WInst::GlobalSet(GLOBAL_AF));
+
+        // ZF = (res == 0 || res == 3)
+        self.emit(WInst::LocalGet(LOCAL_I32_0));
+        self.emit(WInst::I32Eqz);
+        self.emit(WInst::LocalGet(LOCAL_I32_0));
+        self.emit(WInst::I32Const(3));
+        self.emit(WInst::I32Eq);
+        self.emit(WInst::I32Or);
+        self.emit(WInst::GlobalSet(GLOBAL_ZF));
+
+        // CF = (res == 1 || res == 3)
+        self.emit(WInst::LocalGet(LOCAL_I32_0));
+        self.emit(WInst::I32Const(1));
+        self.emit(WInst::I32Eq);
+        self.emit(WInst::LocalGet(LOCAL_I32_0));
+        self.emit(WInst::I32Const(3));
+        self.emit(WInst::I32Eq);
+        self.emit(WInst::I32Or);
+        self.emit(WInst::GlobalSet(GLOBAL_CF));
+
+        // PF = (res == 3)
+        self.emit(WInst::LocalGet(LOCAL_I32_0));
+        self.emit(WInst::I32Const(3));
+        self.emit(WInst::I32Eq);
+        self.emit(WInst::GlobalSet(GLOBAL_PF));
+    }
+
+    /// Stores `ST(0)` as a signed integer (Int16/Int32/Int64) to `instr` memory operand,
+    /// using x87 integer indefinite value on NaN or out-of-range.
+    fn x87_store_int(&mut self, instr: &X86Inst, truncate: bool) -> bool {
+        self.compute_ea_i32(instr);
+        self.emit(WInst::LocalSet(LOCAL_I32_0));
+
+        self.x87_read_st(0);
+        self.emit(WInst::I32Const(if truncate { 1 } else { 0 }));
+        self.emit(WInst::Call(self.x87_helper_base + X87_FN_F80_TO_I64));
+        self.emit(WInst::LocalSet(LOCAL_I64_0));
+
+        match instr.memory_size() {
+            MemorySize::Int16 | MemorySize::UInt16 => {
+                self.emit(WInst::LocalGet(LOCAL_I32_0));
+                self.emit(WInst::LocalGet(LOCAL_I64_0));
+                self.emit(WInst::I64Const(-32768));
+                self.emit(WInst::I64GeS);
+                self.emit(WInst::LocalGet(LOCAL_I64_0));
+                self.emit(WInst::I64Const(32767));
+                self.emit(WInst::I64LeS);
+                self.emit(WInst::I32And);
+                self.emit(WInst::If(BlockType::Result(ValType::I32)));
+                {
+                    self.emit(WInst::LocalGet(LOCAL_I64_0));
+                    self.emit(WInst::I32WrapI64);
+                }
+                self.emit(WInst::Else);
+                {
+                    self.emit(WInst::I32Const(0x8000));
+                }
+                self.emit(WInst::End);
+                self.emit(WInst::I32Store16(memarg(0, 0)));
+                true
+            }
+            MemorySize::Int32 | MemorySize::UInt32 => {
+                self.emit(WInst::LocalGet(LOCAL_I32_0));
+                self.emit(WInst::LocalGet(LOCAL_I64_0));
+                self.emit(WInst::I64Const(i32::MIN as i64));
+                self.emit(WInst::I64GeS);
+                self.emit(WInst::LocalGet(LOCAL_I64_0));
+                self.emit(WInst::I64Const(i32::MAX as i64));
+                self.emit(WInst::I64LeS);
+                self.emit(WInst::I32And);
+                self.emit(WInst::If(BlockType::Result(ValType::I32)));
+                {
+                    self.emit(WInst::LocalGet(LOCAL_I64_0));
+                    self.emit(WInst::I32WrapI64);
+                }
+                self.emit(WInst::Else);
+                {
+                    self.emit(WInst::I32Const(i32::MIN));
+                }
+                self.emit(WInst::End);
+                self.emit(WInst::I32Store(memarg(0, 0)));
+                true
+            }
+            MemorySize::Int64 | MemorySize::UInt64 => {
+                self.emit(WInst::LocalGet(LOCAL_I32_0));
+                self.emit(WInst::LocalGet(LOCAL_I64_0));
+                self.emit(WInst::I64Store(memarg(0, 0)));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn lift_x87(&mut self, instr: &X86Inst) -> bool {
+        match instr.mnemonic() {
+            // ----------------------------------------------------------------
+            // Load / Store / Constants / Stack
+            // ----------------------------------------------------------------
+            Mnemonic::Fld => match instr.op0_kind() {
+                OpKind::Register => {
+                    let Some(i) = Self::map_st(instr.op0_register()) else {
+                        return false;
+                    };
+                    self.x87_read_st(i);
+                    self.x87_push();
+                    true
+                }
+                OpKind::Memory => {
+                    if !self.x87_load_mem_f80(instr) {
+                        return false;
+                    }
+                    self.x87_push();
+                    true
+                }
+                _ => false,
+            },
+            Mnemonic::Fst | Mnemonic::Fstp => {
+                let pop = instr.mnemonic() == Mnemonic::Fstp;
+                match instr.op0_kind() {
+                    OpKind::Register => {
+                        let Some(i) = Self::map_st(instr.op0_register()) else {
+                            return false;
+                        };
+                        self.x87_read_st(0);
+                        self.x87_write_st(i);
+                        if pop {
+                            self.x87_pop();
+                        }
+                        true
+                    }
+                    OpKind::Memory => {
+                        match instr.memory_size() {
+                            MemorySize::Float32 => {
+                                self.compute_ea_i32(instr);
+                                self.x87_read_st(0);
+                                self.emit(WInst::Call(self.x87_helper_base + X87_FN_F80_TO_F64));
+                                self.emit(WInst::F32DemoteF64);
+                                self.emit(WInst::F32Store(memarg(0, 0)));
+                            }
+                            MemorySize::Float64 => {
+                                self.compute_ea_i32(instr);
+                                self.x87_read_st(0);
+                                self.emit(WInst::Call(self.x87_helper_base + X87_FN_F80_TO_F64));
+                                self.emit(WInst::F64Store(memarg(0, 0)));
+                            }
+                            MemorySize::Float80 => {
+                                self.compute_ea_i32(instr);
+                                self.emit(WInst::LocalSet(LOCAL_I32_0));
+                                self.emit(WInst::LocalGet(LOCAL_I32_0));
+                                self.x87_read_st_mant(0);
+                                self.emit(WInst::I64Store(memarg(0, 0)));
+                                self.emit(WInst::LocalGet(LOCAL_I32_0));
+                                self.x87_read_st_se(0);
+                                self.emit(WInst::I32Store16(memarg(8, 0)));
+                            }
+                            _ => return false,
+                        }
+                        if pop {
+                            self.x87_pop();
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            Mnemonic::Fldz => {
+                self.emit(WInst::I64Const(0));
+                self.emit(WInst::I32Const(0));
+                self.x87_push();
+                true
+            }
+            Mnemonic::Fld1 => {
+                self.emit(WInst::I64Const(0x8000_0000_0000_0000u64 as i64));
+                self.emit(WInst::I32Const(0x3FFF));
+                self.x87_push();
+                true
+            }
+            Mnemonic::Fldpi => {
+                self.emit(WInst::I64Const(0xC90F_DAA2_2168_C235u64 as i64));
+                self.emit(WInst::I32Const(0x4000));
+                self.x87_push();
+                true
+            }
+            Mnemonic::Fldl2e => {
+                self.emit(WInst::I64Const(0xB8AA_3B29_5C17_F0BCu64 as i64));
+                self.emit(WInst::I32Const(0x3FFF));
+                self.x87_push();
+                true
+            }
+            Mnemonic::Fldl2t => {
+                self.emit(WInst::I64Const(0xD49A_784B_CD1B_8AFEu64 as i64));
+                self.emit(WInst::I32Const(0x4000));
+                self.x87_push();
+                true
+            }
+            Mnemonic::Fldlg2 => {
+                self.emit(WInst::I64Const(0x9A20_9A84_FBCF_F799u64 as i64));
+                self.emit(WInst::I32Const(0x3FFD));
+                self.x87_push();
+                true
+            }
+            Mnemonic::Fldln2 => {
+                self.emit(WInst::I64Const(0xB172_17F7_D1CF_79ACu64 as i64));
+                self.emit(WInst::I32Const(0x3FFE));
+                self.x87_push();
+                true
+            }
+            Mnemonic::Fild => {
+                if !self.x87_load_mem_f80(instr) {
+                    return false;
+                }
+                self.x87_push();
+                true
+            }
+            Mnemonic::Fist | Mnemonic::Fistp | Mnemonic::Fisttp => {
+                let pop = matches!(instr.mnemonic(), Mnemonic::Fistp | Mnemonic::Fisttp);
+                let trunc = instr.mnemonic() == Mnemonic::Fisttp;
+                if !self.x87_store_int(instr, trunc) {
+                    return false;
+                }
+                if pop {
+                    self.x87_pop();
+                }
+                true
+            }
+            Mnemonic::Fxch => {
+                let i = if instr.op_count() >= 2 {
+                    match Self::map_st(instr.op1_register()) {
+                        Some(idx) => idx,
+                        None => return false,
+                    }
+                } else if instr.op_count() == 1 {
+                    match Self::map_st(instr.op0_register()) {
+                        Some(idx) => idx,
+                        None => return false,
+                    }
+                } else {
+                    1
+                };
+                if i != 0 {
+                    self.x87_read_st_mant(0);
+                    self.emit(WInst::LocalSet(LOCAL_I64_0));
+                    self.x87_read_st_se(0);
+                    self.emit(WInst::LocalSet(LOCAL_I32_0));
+                    self.x87_read_st(i);
+                    self.x87_write_st(0);
+                    self.emit(WInst::LocalGet(LOCAL_I64_0));
+                    self.emit(WInst::LocalGet(LOCAL_I32_0));
+                    self.x87_write_st(i);
+                }
+                true
+            }
+            Mnemonic::Ffree | Mnemonic::Fnop => true,
+            Mnemonic::Ffreep => {
+                self.x87_pop();
+                true
+            }
+            Mnemonic::Fdecstp => {
+                self.x87_dec_top();
+                true
+            }
+            Mnemonic::Fincstp => {
+                self.x87_inc_top();
+                true
+            }
+
+            // ----------------------------------------------------------------
+            // Binary Arithmetic (True 80-bit Extended Precision)
+            // ----------------------------------------------------------------
+            Mnemonic::Fadd
+            | Mnemonic::Faddp
+            | Mnemonic::Fiadd
+            | Mnemonic::Fsub
+            | Mnemonic::Fsubp
+            | Mnemonic::Fisub
+            | Mnemonic::Fsubr
+            | Mnemonic::Fsubrp
+            | Mnemonic::Fisubr
+            | Mnemonic::Fmul
+            | Mnemonic::Fmulp
+            | Mnemonic::Fimul
+            | Mnemonic::Fdiv
+            | Mnemonic::Fdivp
+            | Mnemonic::Fidiv
+            | Mnemonic::Fdivr
+            | Mnemonic::Fdivrp
+            | Mnemonic::Fidivr => {
+                let m = instr.mnemonic();
+                let pop = matches!(
+                    m,
+                    Mnemonic::Faddp
+                        | Mnemonic::Fsubp
+                        | Mnemonic::Fsubrp
+                        | Mnemonic::Fmulp
+                        | Mnemonic::Fdivp
+                        | Mnemonic::Fdivrp
+                );
+                let reversed = matches!(
+                    m,
+                    Mnemonic::Fsubr
+                        | Mnemonic::Fsubrp
+                        | Mnemonic::Fisubr
+                        | Mnemonic::Fdivr
+                        | Mnemonic::Fdivrp
+                        | Mnemonic::Fidivr
+                );
+
+                // Load dst -> (LOCAL_I64_0, LOCAL_I32_1), src -> (LOCAL_I64_1, LOCAL_I32_2)
+                let dst_idx = if instr.op_count() == 0 {
+                    self.x87_read_st_mant(1);
+                    self.emit(WInst::LocalSet(LOCAL_I64_0));
+                    self.x87_read_st_se(1);
+                    self.emit(WInst::LocalSet(LOCAL_I32_1));
+                    self.x87_read_st_mant(0);
+                    self.emit(WInst::LocalSet(LOCAL_I64_1));
+                    self.x87_read_st_se(0);
+                    self.emit(WInst::LocalSet(LOCAL_I32_2));
+                    1u32
+                } else if instr.op0_kind() == OpKind::Memory {
+                    self.x87_read_st_mant(0);
+                    self.emit(WInst::LocalSet(LOCAL_I64_0));
+                    self.x87_read_st_se(0);
+                    self.emit(WInst::LocalSet(LOCAL_I32_1));
+                    if !self.x87_load_mem_f80(instr) {
+                        return false;
+                    }
+                    self.emit(WInst::LocalSet(LOCAL_I32_2));
+                    self.emit(WInst::LocalSet(LOCAL_I64_1));
+                    0u32
+                } else if instr.op_count() == 2
+                    && instr.op0_kind() == OpKind::Register
+                    && instr.op1_kind() == OpKind::Register
+                {
+                    let Some(d) = Self::map_st(instr.op0_register()) else {
+                        return false;
+                    };
+                    let Some(s) = Self::map_st(instr.op1_register()) else {
+                        return false;
+                    };
+                    self.x87_read_st_mant(d);
+                    self.emit(WInst::LocalSet(LOCAL_I64_0));
+                    self.x87_read_st_se(d);
+                    self.emit(WInst::LocalSet(LOCAL_I32_1));
+                    self.x87_read_st_mant(s);
+                    self.emit(WInst::LocalSet(LOCAL_I64_1));
+                    self.x87_read_st_se(s);
+                    self.emit(WInst::LocalSet(LOCAL_I32_2));
+                    d
+                } else {
+                    return false;
+                };
+
+                if reversed {
+                    self.emit(WInst::LocalGet(LOCAL_I64_1));
+                    self.emit(WInst::LocalGet(LOCAL_I32_2));
+                    self.emit(WInst::LocalGet(LOCAL_I64_0));
+                    self.emit(WInst::LocalGet(LOCAL_I32_1));
+                } else {
+                    self.emit(WInst::LocalGet(LOCAL_I64_0));
+                    self.emit(WInst::LocalGet(LOCAL_I32_1));
+                    self.emit(WInst::LocalGet(LOCAL_I64_1));
+                    self.emit(WInst::LocalGet(LOCAL_I32_2));
+                }
+
+                match m {
+                    Mnemonic::Fadd | Mnemonic::Faddp | Mnemonic::Fiadd => {
+                        self.emit(WInst::Call(self.x87_helper_base + X87_FN_F80_ADD));
+                    }
+                    Mnemonic::Fsub
+                    | Mnemonic::Fsubp
+                    | Mnemonic::Fisub
+                    | Mnemonic::Fsubr
+                    | Mnemonic::Fsubrp
+                    | Mnemonic::Fisubr => {
+                        self.emit(WInst::I32Const(0x8000));
+                        self.emit(WInst::I32Xor);
+                        self.emit(WInst::Call(self.x87_helper_base + X87_FN_F80_ADD));
+                    }
+                    Mnemonic::Fmul | Mnemonic::Fmulp | Mnemonic::Fimul => {
+                        self.emit(WInst::Call(self.x87_helper_base + X87_FN_F80_MUL));
+                    }
+                    Mnemonic::Fdiv
+                    | Mnemonic::Fdivp
+                    | Mnemonic::Fidiv
+                    | Mnemonic::Fdivr
+                    | Mnemonic::Fdivrp
+                    | Mnemonic::Fidivr => {
+                        self.emit(WInst::Call(self.x87_helper_base + X87_FN_F80_DIV));
+                    }
+                    _ => unreachable!(),
+                }
+
+                self.x87_write_st(dst_idx);
+                if pop {
+                    self.x87_pop();
+                }
+                true
+            }
+
+            // ----------------------------------------------------------------
+            // Unary / Special Arithmetic
+            // ----------------------------------------------------------------
+            Mnemonic::Fchs => {
+                self.x87_read_st_mant(0);
+                self.x87_read_st_se(0);
+                self.emit(WInst::I32Const(0x8000));
+                self.emit(WInst::I32Xor);
+                self.x87_write_st(0);
+                true
+            }
+            Mnemonic::Fabs => {
+                self.x87_read_st_mant(0);
+                self.x87_read_st_se(0);
+                self.emit(WInst::I32Const(0x7FFF));
+                self.emit(WInst::I32And);
+                self.x87_write_st(0);
+                true
+            }
+            Mnemonic::Fsqrt => {
+                self.x87_read_st(0);
+                self.emit(WInst::Call(self.x87_helper_base + X87_FN_F80_TO_F64));
+                self.emit(WInst::F64Sqrt);
+                self.emit(WInst::Call(self.x87_helper_base + X87_FN_F64_TO_F80));
+                self.x87_write_st(0);
+                true
+            }
+            Mnemonic::Frndint => {
+                self.x87_read_st(0);
+                self.emit(WInst::Call(self.x87_helper_base + X87_FN_F80_RNDINT));
+                self.x87_write_st(0);
+                true
+            }
+            Mnemonic::Fscale => {
+                self.x87_read_st(0);
+                self.x87_read_st(1);
+                self.emit(WInst::Call(self.x87_helper_base + X87_FN_F80_SCALE));
+                self.x87_write_st(0);
+                true
+            }
+            Mnemonic::Fprem | Mnemonic::Fprem1 => {
+                let is_ieee = if instr.mnemonic() == Mnemonic::Fprem1 { 1 } else { 0 };
+                self.x87_read_st(0);
+                self.x87_read_st(1);
+                self.emit(WInst::I32Const(is_ieee));
+                self.emit(WInst::Call(self.x87_helper_base + X87_FN_F80_REM));
+                self.x87_write_st(0);
+                true
+            }
+
+            // ----------------------------------------------------------------
+            // Comparisons / Status / CMOV / Control
+            // ----------------------------------------------------------------
+            Mnemonic::Fcomi | Mnemonic::Fcomip | Mnemonic::Fucomi | Mnemonic::Fucomip => {
+                let pop = matches!(instr.mnemonic(), Mnemonic::Fcomip | Mnemonic::Fucomip);
+                let src_idx = if instr.op_count() >= 2 {
+                    match Self::map_st(instr.op1_register()) {
+                        Some(i) => i,
+                        None => return false,
+                    }
+                } else if instr.op_count() == 1 {
+                    match Self::map_st(instr.op0_register()) {
+                        Some(i) => i,
+                        None => return false,
+                    }
+                } else {
+                    1
+                };
+                self.x87_read_st(0);
+                self.x87_read_st(src_idx);
+                self.emit(WInst::Call(self.x87_helper_base + X87_FN_F80_CMP));
+                self.x87_cmp_res_to_eflags();
+                if pop {
+                    self.x87_pop();
+                }
+                true
+            }
+            Mnemonic::Fcom
+            | Mnemonic::Fcomp
+            | Mnemonic::Fcompp
+            | Mnemonic::Fucom
+            | Mnemonic::Fucomp
+            | Mnemonic::Fucompp
+            | Mnemonic::Ficom
+            | Mnemonic::Ficomp => {
+                let m = instr.mnemonic();
+                self.x87_read_st(0);
+                if instr.op_count() == 0 {
+                    self.x87_read_st(1);
+                } else {
+                    let src_op = if instr.op_count() >= 2 { 1 } else { 0 };
+                    match instr.op_kind(src_op) {
+                        OpKind::Register => {
+                            let Some(i) = Self::map_st(instr.op_register(src_op)) else {
+                                return false;
+                            };
+                            self.x87_read_st(i);
+                        }
+                        OpKind::Memory => {
+                            if !self.x87_load_mem_f80(instr) {
+                                return false;
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+                self.emit(WInst::Call(self.x87_helper_base + X87_FN_F80_CMP));
+                self.x87_cmp_res_to_sw();
+                match m {
+                    Mnemonic::Fcomp | Mnemonic::Fucomp | Mnemonic::Ficomp => {
+                        self.x87_pop();
+                    }
+                    Mnemonic::Fcompp | Mnemonic::Fucompp => {
+                        self.x87_pop();
+                        self.x87_pop();
+                    }
+                    _ => {}
+                }
+                true
+            }
+            Mnemonic::Ftst => {
+                self.x87_read_st(0);
+                self.emit(WInst::I64Const(0));
+                self.emit(WInst::I32Const(0));
+                self.emit(WInst::Call(self.x87_helper_base + X87_FN_F80_CMP));
+                self.x87_cmp_res_to_sw();
+                true
+            }
+            Mnemonic::Fxam => {
+                self.x87_read_st_mant(0);
+                self.emit(WInst::LocalSet(LOCAL_I64_0));
+                self.x87_read_st_se(0);
+                self.emit(WInst::LocalSet(LOCAL_I32_1));
+                // C1 (bit 9) = sign bit
+                self.emit(WInst::LocalGet(LOCAL_I32_1));
+                self.emit(WInst::I32Const(15));
+                self.emit(WInst::I32ShrU);
+                self.emit(WInst::I32Const(1));
+                self.emit(WInst::I32And);
+                self.emit(WInst::I32Const(9));
+                self.emit(WInst::I32Shl);
+                self.emit(WInst::LocalSet(LOCAL_I32_0));
+                // exp15 = se & 0x7FFF -> LOCAL_I32_1
+                self.emit(WInst::LocalGet(LOCAL_I32_1));
+                self.emit(WInst::I32Const(0x7FFF));
+                self.emit(WInst::I32And);
+                self.emit(WInst::LocalSet(LOCAL_I32_1));
+
+                self.emit(WInst::LocalGet(LOCAL_I32_1));
+                self.emit(WInst::I32Const(0x7FFF));
+                self.emit(WInst::I32Eq);
+                self.emit(WInst::If(BlockType::Result(ValType::I32)));
+                {
+                    self.emit(WInst::LocalGet(LOCAL_I64_0));
+                    self.emit(WInst::I64Const(0x7FFF_FFFF_FFFF_FFFFu64 as i64));
+                    self.emit(WInst::I64And);
+                    self.emit(WInst::I64Eqz);
+                    self.emit(WInst::If(BlockType::Result(ValType::I32)));
+                    {
+                        self.emit(WInst::I32Const(0x0500)); // Inf
+                    }
+                    self.emit(WInst::Else);
+                    {
+                        self.emit(WInst::I32Const(0x0100)); // NaN
+                    }
+                    self.emit(WInst::End);
+                }
+                self.emit(WInst::Else);
+                {
+                    self.emit(WInst::LocalGet(LOCAL_I64_0));
+                    self.emit(WInst::I64Eqz);
+                    self.emit(WInst::If(BlockType::Result(ValType::I32)));
+                    {
+                        self.emit(WInst::I32Const(0x4000)); // Zero
+                    }
+                    self.emit(WInst::Else);
+                    {
+                        self.emit(WInst::LocalGet(LOCAL_I32_1));
+                        self.emit(WInst::I32Eqz);
+                        self.emit(WInst::If(BlockType::Result(ValType::I32)));
+                        {
+                            self.emit(WInst::I32Const(0x4400)); // Denormal
+                        }
+                        self.emit(WInst::Else);
+                        {
+                            self.emit(WInst::I32Const(0x0400)); // Normal
+                        }
+                        self.emit(WInst::End);
+                    }
+                    self.emit(WInst::End);
+                }
+                self.emit(WInst::End);
+                self.emit(WInst::LocalGet(LOCAL_I32_0));
+                self.emit(WInst::I32Or);
+                self.emit(WInst::LocalSet(LOCAL_I32_2));
+
+                self.emit(WInst::GlobalGet(GLOBAL_X87_SW));
+                self.emit(WInst::I32Const(!0x4700i32 & 0xFFFF));
+                self.emit(WInst::I32And);
+                self.emit(WInst::LocalGet(LOCAL_I32_2));
+                self.emit(WInst::I32Or);
+                self.emit(WInst::GlobalSet(GLOBAL_X87_SW));
+                true
+            }
+            Mnemonic::Fnstsw | Mnemonic::Fstsw => {
+                // Compose SW with current TOP in bits 11..13
+                self.emit(WInst::GlobalGet(GLOBAL_X87_SW));
+                self.emit(WInst::I32Const(!0x3800i32 & 0xFFFF));
+                self.emit(WInst::I32And);
+                self.emit(WInst::GlobalGet(GLOBAL_X87_TOP));
+                self.emit(WInst::I32Const(7));
+                self.emit(WInst::I32And);
+                self.emit(WInst::I32Const(11));
+                self.emit(WInst::I32Shl);
+                self.emit(WInst::I32Or);
+                match instr.op0_kind() {
+                    OpKind::Register => {
+                        self.emit(WInst::I64ExtendI32U);
+                        self.write_gpr(instr.op0_register());
+                        true
+                    }
+                    OpKind::Memory => {
+                        self.emit(WInst::LocalSet(LOCAL_I32_0));
+                        self.compute_ea_i32(instr);
+                        self.emit(WInst::LocalGet(LOCAL_I32_0));
+                        self.emit(WInst::I32Store16(memarg(0, 0)));
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            Mnemonic::Fcmovb
+            | Mnemonic::Fcmove
+            | Mnemonic::Fcmovbe
+            | Mnemonic::Fcmovu
+            | Mnemonic::Fcmovnb
+            | Mnemonic::Fcmovne
+            | Mnemonic::Fcmovnbe
+            | Mnemonic::Fcmovnu => {
+                let Some(src_idx) = Self::map_st(instr.op1_register()) else {
+                    return false;
+                };
+                match instr.mnemonic() {
+                    Mnemonic::Fcmovb => {
+                        self.emit(WInst::GlobalGet(GLOBAL_CF));
+                    }
+                    Mnemonic::Fcmove => {
+                        self.emit(WInst::GlobalGet(GLOBAL_ZF));
+                    }
+                    Mnemonic::Fcmovbe => {
+                        self.emit(WInst::GlobalGet(GLOBAL_CF));
+                        self.emit(WInst::GlobalGet(GLOBAL_ZF));
+                        self.emit(WInst::I32Or);
+                    }
+                    Mnemonic::Fcmovu => {
+                        self.emit(WInst::GlobalGet(GLOBAL_PF));
+                    }
+                    Mnemonic::Fcmovnb => {
+                        self.emit(WInst::GlobalGet(GLOBAL_CF));
+                        self.emit(WInst::I32Eqz);
+                    }
+                    Mnemonic::Fcmovne => {
+                        self.emit(WInst::GlobalGet(GLOBAL_ZF));
+                        self.emit(WInst::I32Eqz);
+                    }
+                    Mnemonic::Fcmovnbe => {
+                        self.emit(WInst::GlobalGet(GLOBAL_CF));
+                        self.emit(WInst::GlobalGet(GLOBAL_ZF));
+                        self.emit(WInst::I32Or);
+                        self.emit(WInst::I32Eqz);
+                    }
+                    Mnemonic::Fcmovnu => {
+                        self.emit(WInst::GlobalGet(GLOBAL_PF));
+                        self.emit(WInst::I32Eqz);
+                    }
+                    _ => unreachable!(),
+                }
+                self.emit(WInst::If(BlockType::Empty));
+                {
+                    self.x87_read_st(src_idx);
+                    self.x87_write_st(0);
+                }
+                self.emit(WInst::End);
+                true
+            }
+            Mnemonic::Fnclex | Mnemonic::Fclex => {
+                self.emit(WInst::GlobalGet(GLOBAL_X87_SW));
+                self.emit(WInst::I32Const(0x7F00));
+                self.emit(WInst::I32And);
+                self.emit(WInst::GlobalSet(GLOBAL_X87_SW));
+                true
+            }
+            Mnemonic::Fninit | Mnemonic::Finit => {
+                self.emit(WInst::I32Const(0x037F));
+                self.emit(WInst::GlobalSet(GLOBAL_X87_CW));
+                self.emit(WInst::I32Const(0));
+                self.emit(WInst::GlobalSet(GLOBAL_X87_SW));
+                self.emit(WInst::I32Const(0));
+                self.emit(WInst::GlobalSet(GLOBAL_X87_TOP));
+                true
+            }
+            Mnemonic::Fnstenv | Mnemonic::Fstenv => {
+                self.compute_ea_i32(instr);
+                self.emit(WInst::LocalSet(LOCAL_I32_0));
+                // Zero 28-byte environment
+                for off in (0..28u64).step_by(4) {
+                    self.emit(WInst::LocalGet(LOCAL_I32_0));
+                    self.emit(WInst::I32Const(0));
+                    self.emit(WInst::I32Store(memarg(off, 0)));
+                }
+                // +0: CW (u16)
+                self.emit(WInst::LocalGet(LOCAL_I32_0));
+                self.emit(WInst::GlobalGet(GLOBAL_X87_CW));
+                self.emit(WInst::I32Store16(memarg(0, 0)));
+                // +4: SW with TOP (u16)
+                self.emit(WInst::LocalGet(LOCAL_I32_0));
+                self.emit(WInst::GlobalGet(GLOBAL_X87_SW));
+                self.emit(WInst::I32Const(!0x3800i32 & 0xFFFF));
+                self.emit(WInst::I32And);
+                self.emit(WInst::GlobalGet(GLOBAL_X87_TOP));
+                self.emit(WInst::I32Const(7));
+                self.emit(WInst::I32And);
+                self.emit(WInst::I32Const(11));
+                self.emit(WInst::I32Shl);
+                self.emit(WInst::I32Or);
+                self.emit(WInst::I32Store16(memarg(4, 0)));
+                // +8: Tag Word = 0xFFFF
+                self.emit(WInst::LocalGet(LOCAL_I32_0));
+                self.emit(WInst::I32Const(0xFFFF));
+                self.emit(WInst::I32Store16(memarg(8, 0)));
+                true
+            }
+            Mnemonic::Fldenv => {
+                self.compute_ea_i32(instr);
+                self.emit(WInst::LocalSet(LOCAL_I32_0));
+                // +0: CW
+                self.emit(WInst::LocalGet(LOCAL_I32_0));
+                self.emit(WInst::I32Load16U(memarg(0, 0)));
+                self.emit(WInst::GlobalSet(GLOBAL_X87_CW));
+                // +4: SW & TOP
+                self.emit(WInst::LocalGet(LOCAL_I32_0));
+                self.emit(WInst::I32Load16U(memarg(4, 0)));
+                self.emit(WInst::LocalTee(LOCAL_I32_1));
+                self.emit(WInst::GlobalSet(GLOBAL_X87_SW));
+                self.emit(WInst::LocalGet(LOCAL_I32_1));
+                self.emit(WInst::I32Const(11));
+                self.emit(WInst::I32ShrU);
+                self.emit(WInst::I32Const(7));
+                self.emit(WInst::I32And);
+                self.emit(WInst::GlobalSet(GLOBAL_X87_TOP));
+                true
+            }
+            _ => false,
+        }
     }
 }
 

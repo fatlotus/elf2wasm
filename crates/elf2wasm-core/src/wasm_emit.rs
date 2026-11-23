@@ -3,10 +3,11 @@ use crate::elf_loader::{LoadedImage, INITIAL_MEM_PAGES};
 use crate::lifter::{
     Lifter, DEFAULT_QUANTUM, GLOBAL_CF, GLOBAL_DF, GLOBAL_EXIT_CODE, GLOBAL_EXIT_FLAG,
     GLOBAL_FSBASE, GLOBAL_GSBASE, GLOBAL_MXCSR, GLOBAL_QUANTUM, GLOBAL_RAX, GLOBAL_RIP, GLOBAL_RSP,
-    GLOBAL_TSC, GLOBAL_X87_CW, GLOBAL_XMM_BASE, GLOBAL_YIELD_FLAG, GPR_NAMES, LOCAL_I64_0,
-    LOCAL_PC_IDX,
+    GLOBAL_TSC, GLOBAL_X87_CW, GLOBAL_X87_SE_BASE, GLOBAL_X87_ST_BASE, GLOBAL_X87_SW,
+    GLOBAL_X87_TOP, GLOBAL_XMM_BASE, GLOBAL_YIELD_FLAG, GPR_NAMES, LOCAL_I64_0, LOCAL_PC_IDX,
 };
 use crate::meta::{MetaSoFile, WasmMeta};
+use crate::x87::{emit_x87_functions, register_x87_functions, register_x87_types};
 use anyhow::Result;
 use iced_x86::Mnemonic;
 use std::borrow::Cow;
@@ -85,6 +86,7 @@ fn emit_push_ret_addr(func: &mut Function, ret_va: u32) {
 fn emit_chunk_function(
     chunk: &[&DecodedBlock],
     chunk_block_map: &FastHashMap<u32, u32>,
+    x87_helper_base: u32,
 ) -> Function {
     let mut func = make_chunk_function();
     let n = chunk.len() as u32;
@@ -134,7 +136,7 @@ fn emit_chunk_function(
         };
 
         {
-            let mut lifter = Lifter::new(&mut func);
+            let mut lifter = Lifter::new(&mut func, x87_helper_base);
             for instr in &instrs[..body_len] {
                 lifter.lift_instruction(instr);
             }
@@ -146,7 +148,7 @@ fn emit_chunk_function(
             }
             BlockTerminator::ConditionalBranch { taken, fallthrough } => {
                 if let Some(last) = instrs.last() {
-                    let mut lifter = Lifter::new(&mut func);
+                    let mut lifter = Lifter::new(&mut func, x87_helper_base);
                     match last.mnemonic() {
                         Mnemonic::Jrcxz => {
                             func.instruction(&WInst::GlobalGet(crate::lifter::GLOBAL_RCX));
@@ -179,7 +181,7 @@ fn emit_chunk_function(
             BlockTerminator::IndirectCall { fallthrough } => {
                 if let Some(last) = instrs.last() {
                     {
-                        let mut lifter = Lifter::new(&mut func);
+                        let mut lifter = Lifter::new(&mut func, x87_helper_base);
                         lifter.emit_indirect_target_i64(last);
                     }
                     func.instruction(&WInst::LocalSet(LOCAL_I64_0));
@@ -194,7 +196,7 @@ fn emit_chunk_function(
             BlockTerminator::IndirectJump => {
                 if let Some(last) = instrs.last() {
                     {
-                        let mut lifter = Lifter::new(&mut func);
+                        let mut lifter = Lifter::new(&mut func, x87_helper_base);
                         lifter.emit_indirect_target_i64(last);
                     }
                     func.instruction(&WInst::GlobalSet(GLOBAL_RIP));
@@ -429,6 +431,8 @@ fn emit_save_ctx_function() -> Function {
     }
     store_i32(&mut func, GLOBAL_MXCSR, 188);
     store_i32(&mut func, GLOBAL_X87_CW, 192);
+    store_i32(&mut func, GLOBAL_X87_TOP, 196);
+    store_i32(&mut func, GLOBAL_X87_SW, 200);
 
     for k in 0..16u32 {
         func.instruction(&WInst::LocalGet(0));
@@ -436,6 +440,19 @@ fn emit_save_ctx_function() -> Function {
         func.instruction(&WInst::V128Store(MemArg {
             offset: 208 + (k as u64) * 16,
             align: 4,
+            memory_index: 0,
+        }));
+    }
+
+    for k in 0..8u32 {
+        store_i64(&mut func, GLOBAL_X87_ST_BASE + k, 464 + (k as u64) * 8);
+    }
+    for k in 0..8u32 {
+        func.instruction(&WInst::LocalGet(0));
+        func.instruction(&WInst::GlobalGet(GLOBAL_X87_SE_BASE + k));
+        func.instruction(&WInst::I32Store16(MemArg {
+            offset: 528 + (k as u64) * 2,
+            align: 1,
             memory_index: 0,
         }));
     }
@@ -478,6 +495,8 @@ fn emit_load_ctx_function() -> Function {
     }
     load_i32(&mut func, GLOBAL_MXCSR, 188);
     load_i32(&mut func, GLOBAL_X87_CW, 192);
+    load_i32(&mut func, GLOBAL_X87_TOP, 196);
+    load_i32(&mut func, GLOBAL_X87_SW, 200);
 
     for k in 0..16u32 {
         func.instruction(&WInst::LocalGet(0));
@@ -487,6 +506,19 @@ fn emit_load_ctx_function() -> Function {
             memory_index: 0,
         }));
         func.instruction(&WInst::GlobalSet(GLOBAL_XMM_BASE + k));
+    }
+
+    for k in 0..8u32 {
+        load_i64(&mut func, GLOBAL_X87_ST_BASE + k, 464 + (k as u64) * 8);
+    }
+    for k in 0..8u32 {
+        func.instruction(&WInst::LocalGet(0));
+        func.instruction(&WInst::I32Load16U(MemArg {
+            offset: 528 + (k as u64) * 2,
+            align: 1,
+            memory_index: 0,
+        }));
+        func.instruction(&WInst::GlobalSet(GLOBAL_X87_SE_BASE + k));
     }
 
     func.instruction(&WInst::End);
@@ -563,6 +595,7 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
     let mut types = TypeSection::new();
     types.ty().function([ValType::I32], []); // 0: chunk_fn, save_ctx, load_ctx
     types.ty().function([], [ValType::I32]); // 1: _start
+    let x87_types = register_x87_types(&mut types, 2);
     module.section(&types);
 
     // Function Section
@@ -573,6 +606,7 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
     functions.function(1); // _start
     functions.function(0); // save_ctx
     functions.function(0); // load_ctx
+    register_x87_functions(&mut functions, &x87_types);
     module.section(&functions);
 
     // Table Section
@@ -709,6 +743,46 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
         },
         &ConstExpr::i32_const(DEFAULT_QUANTUM),
     );
+    // 49..=56: x87_st0..x87_st7 (i64 mantissas)
+    for _ in GLOBAL_X87_ST_BASE..GLOBAL_X87_ST_BASE + 8 {
+        globals.global(
+            GlobalType {
+                val_type: ValType::I64,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i64_const(0),
+        );
+    }
+    // 57: x87_top
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i32_const(0),
+    );
+    // 58: x87_sw
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i32_const(0),
+    );
+    // 59..=66: x87_se0..x87_se7 (i32 sign+exponent)
+    for _ in GLOBAL_X87_SE_BASE..GLOBAL_X87_SE_BASE + 8 {
+        globals.global(
+            GlobalType {
+                val_type: ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(0),
+        );
+    }
     module.section(&globals);
 
     // Export Section
@@ -730,6 +804,21 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
     exports.export("gsbase", ExportKind::Global, GLOBAL_GSBASE);
     exports.export("yield_flag", ExportKind::Global, GLOBAL_YIELD_FLAG);
     exports.export("quantum", ExportKind::Global, GLOBAL_QUANTUM);
+    exports.export("x87_cw", ExportKind::Global, GLOBAL_X87_CW);
+    exports.export("x87_top", ExportKind::Global, GLOBAL_X87_TOP);
+    exports.export("x87_sw", ExportKind::Global, GLOBAL_X87_SW);
+    for i in 0..8u32 {
+        exports.export(
+            &format!("x87_st{}", i),
+            ExportKind::Global,
+            GLOBAL_X87_ST_BASE + i,
+        );
+        exports.export(
+            &format!("x87_se{}", i),
+            ExportKind::Global,
+            GLOBAL_X87_SE_BASE + i,
+        );
+    }
     module.section(&exports);
 
     // Element Section
@@ -745,14 +834,16 @@ pub fn emit_wasm(image: &LoadedImage, prog: &DecodedProgram) -> Result<Vec<u8>> 
     }
 
     // Code Section
+    let x87_helper_base = num_chunks + 3;
     let mut codes = CodeSection::new();
     for (blocks, map) in &chunks {
-        let f = emit_chunk_function(blocks, map);
+        let f = emit_chunk_function(blocks, map, x87_helper_base);
         codes.function(&f);
     }
     codes.function(&emit_start_function(num_chunks, hash_mask));
     codes.function(&emit_save_ctx_function());
     codes.function(&emit_load_ctx_function());
+    emit_x87_functions(&mut codes, x87_helper_base);
     module.section(&codes);
 
     // Data Section
@@ -1769,5 +1860,318 @@ mod tests {
         mem.read(&store, (ctx_ptr2 + 208) as usize, &mut xmm0_re_saved)
             .unwrap();
         assert_eq!(xmm0_re_saved, xmm0_saved);
+    }
+
+    #[test]
+    fn test_x87_m80fp_roundtrip_and_arithmetic() {
+        // Test 1: m80fp round-trip (fld qword [rdi]; fstp tbyte [rsi]; fld tbyte [rsi]; fstp qword [rdx])
+        // + arithmetic: fld qword [rdi]; fld1; faddp st(1), st(0); fsqrt; fstp qword [rcx]
+        // + compare/status: fld1; fldz; fcomip st(0), st(1); fnstsw ax; fstp st(0); syscall
+        let code: Vec<u8> = vec![
+            // fld qword ptr [rdi]       (dd 07)
+            0xdd, 0x07,
+            // fstp tbyte ptr [rsi]      (db 3e)
+            0xdb, 0x3e,
+            // fld tbyte ptr [rsi]       (db 2e)
+            0xdb, 0x2e,
+            // fstp qword ptr [rdx]      (dd 1a)
+            0xdd, 0x1a,
+            // fld qword ptr [rdi]       (dd 07)
+            0xdd, 0x07,
+            // fld1                      (d9 e8)
+            0xd9, 0xe8,
+            // faddp st(1), st(0)        (de c1)
+            0xde, 0xc1,
+            // fsqrt                     (d9 fa)
+            0xd9, 0xfa,
+            // fstp qword ptr [rcx]      (dd 19)
+            0xdd, 0x19,
+            // fld1                      (d9 e8)
+            0xd9, 0xe8,
+            // fldz                      (d9 ee)
+            0xd9, 0xee,
+            // fcomip st(0), st(1)       (df f1) -> 0.0 < 1.0 => CF=1, ZF=0, PF=0
+            0xdf, 0xf1,
+            // fnstsw ax                 (df e0)
+            0xdf, 0xe0,
+            // fstp st(0)                (dd d8)
+            0xdd, 0xd8,
+            // mov rdi, 0; mov rax, 60; syscall
+            0x48, 0xc7, 0xc7, 0x00, 0x00, 0x00, 0x00,
+            0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00,
+            0x0f, 0x05,
+        ];
+
+        let image = LoadedImage {
+            entry_rip: 0x0010_0000,
+            at_phdr: 0,
+            at_phent: 56,
+            at_phnum: 0,
+            at_entry: 0x0010_0000,
+            at_base: 0,
+            exec_segments: vec![ExecSegment {
+                name: "x87_test".to_string(),
+                vaddr: 0x0010_0000,
+                data: code,
+            }],
+            data_segments: vec![],
+            so_files: vec![],
+            symbols: std::collections::HashMap::new(),
+            elf_path: "x87_test".to_string(),
+        };
+
+        let prog = crate::decoder::discover_code(&image).unwrap();
+        let wasm_bytes = emit_wasm(&image, &prog).unwrap();
+
+        let engine = Engine::default();
+        WasmModule::validate(&engine, &wasm_bytes)
+            .expect("x87 lifted WASM must pass WASM validation");
+        let module = WasmModule::new(&engine, &wasm_bytes).unwrap();
+
+        // Test round-trip for normal, negative, subnormal, +0.0, -0.0, +Inf, -Inf, NaN
+        let test_vals: [f64; 8] = [
+            8.0,
+            -42.5,
+            std::f64::consts::PI,
+            f64::from_bits(1), // smallest positive subnormal
+            0.0,
+            -0.0,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+
+        for &val in &test_vals {
+            let mut store = Store::new(&engine, ());
+            let inst = Instance::new(&mut store, &module, &[]).unwrap();
+            let mem = inst.get_memory(&mut store, "memory").unwrap();
+
+            let in_addr = 0x0020_0000u32;
+            let m80_addr = 0x0020_0010u32;
+            let rt_addr = 0x0020_0020u32;
+            let arith_addr = 0x0020_0030u32;
+
+            mem.write(&mut store, in_addr as usize, &val.to_le_bytes())
+                .unwrap();
+
+            inst.get_global(&mut store, "rsp")
+                .unwrap()
+                .set(&mut store, wasmtime::Val::I64(STACK_TOP as i64))
+                .unwrap();
+            inst.get_global(&mut store, "rdi")
+                .unwrap()
+                .set(&mut store, wasmtime::Val::I64(in_addr as i64))
+                .unwrap();
+            inst.get_global(&mut store, "rsi")
+                .unwrap()
+                .set(&mut store, wasmtime::Val::I64(m80_addr as i64))
+                .unwrap();
+            inst.get_global(&mut store, "rdx")
+                .unwrap()
+                .set(&mut store, wasmtime::Val::I64(rt_addr as i64))
+                .unwrap();
+            inst.get_global(&mut store, "rcx")
+                .unwrap()
+                .set(&mut store, wasmtime::Val::I64(arith_addr as i64))
+                .unwrap();
+
+            let start = inst.get_typed_func::<(), i32>(&mut store, "_start").unwrap();
+            let _ = start.call(&mut store, ()).unwrap();
+
+            let mut out_bytes = [0u8; 8];
+            mem.read(&store, rt_addr as usize, &mut out_bytes).unwrap();
+            let rt_val = f64::from_le_bytes(out_bytes);
+            if val.is_nan() {
+                assert!(rt_val.is_nan(), "expected NaN round-trip, got {}", rt_val);
+            } else {
+                assert_eq!(
+                    rt_val.to_bits(),
+                    val.to_bits(),
+                    "m80fp round-trip mismatch for {}: got {}",
+                    val,
+                    rt_val
+                );
+            }
+
+            if val == 8.0 {
+                let mut arith_bytes = [0u8; 8];
+                mem.read(&store, arith_addr as usize, &mut arith_bytes)
+                    .unwrap();
+                let arith_val = f64::from_le_bytes(arith_bytes);
+                assert_eq!(arith_val, 3.0, "sqrt(8.0 + 1.0) should be 3.0");
+            }
+
+            // Verify x87_top returned to 0 after balanced pushes/pops
+            assert_eq!(
+                inst.get_global(&mut store, "x87_top")
+                    .unwrap()
+                    .get(&mut store)
+                    .i32(),
+                Some(0)
+            );
+        }
+    }
+
+    #[test]
+    fn test_x87_80bit_precision_and_instructions() {
+        // Memory layout at RDI (0x0020_0000):
+        //   [rdi+0x00]: f64  2^63 (9223372036854775808.0)
+        //   [rdi+0x08]: f64  0.59
+        //   [rdi+0x10]: f64  10.0
+        //   [rdi+0x18]: f64  3.0
+        //   [rdi+0x20]: i64  0x1234_5678_9ABC_DEF1 (exceeds 53-bit f64 precision)
+        //   [rdi+0x28]: f64  1.5
+        //   [rdi+0x30]: f64  4.0
+        //   [rdi+0x38]: f64  2048.0 (2^11)
+        //   [rdi+0x40]: i64  0x4000_0000_0000_0321 (64-bit int with low 11 bits = 0x321 = 801)
+        //
+        // Outputs at RSI (0x0020_0100):
+        //   [rsi+0x00]: f64  (2^63 + 0.59) - 2^63  (musl fmt_fp rounding idiom -> must be 1.0)
+        //   [rsi+0x08]: f64  fxch st(1) + fstp st(1) result (must be 10.0, not 0.0)
+        //   [rsi+0x10]: f64  fsubrp st(1), st(0): ST(0)=3.0, ST(1)=10.0 -> 3.0 - 10.0 = -7.0
+        //   [rsi+0x18]: f64  fdivrp st(1), st(0): ST(0)=3.0, ST(1)=10.0 -> 3.0 / 10.0 = 0.3
+        //   [rsi+0x20]: i64  fild qword -> fistp qword exact 64-bit round-trip
+        //   [rsi+0x28]: f64  fscale: 1.5 * 2^4 = 24.0
+        //   [rsi+0x30]: f64  fprem: 0x4000_0000_0000_0321 % 2048.0 = 801.0 (exact 64-bit mod)
+        //   [rsi+0x38]: u16  fnstsw ax after fcom st(0), st(1) where 3.0 < 10.0 (C0=1 -> 0x0100)
+        let code: Vec<u8> = vec![
+            // 1. musl fmt_fp 64-bit rounding: (2^63 + 0.59) - 2^63 == 1.0
+            0xdd, 0x07,             // fld qword [rdi+0x00] (ST0 = 2^63)
+            0xdd, 0x47, 0x08,       // fld qword [rdi+0x08] (ST0 = 0.59, ST1 = 2^63)
+            0xd8, 0xc1,             // fadd st(0), st(1)    (ST0 = 2^63 + 1.0)
+            0xde, 0xe1,             // fsubrp st(1), st(0)  (ST0 = (2^63 + 1.0) - 2^63 = 1.0)
+            0xdd, 0x1e,             // fstp qword [rsi+0x00]
+
+            // 2. fxch st(1) + fstp st(1) (musl fmt_fp zero-check sequence)
+            0xdd, 0x47, 0x10,       // fld qword [rdi+0x10] (ST0 = 10.0)
+            0xd9, 0xee,             // fldz                 (ST0 = 0.0, ST1 = 10.0)
+            0xd9, 0xc9,             // fxch st(1)           (ST0 = 10.0, ST1 = 0.0)
+            0xdd, 0xd9,             // fstp st(1)           (ST1 = 10.0, pop -> ST0 = 10.0)
+            0xdd, 0x5e, 0x08,       // fstp qword [rsi+0x08]
+
+            // 3. fsubrp st(1), st(0): ST(1)=10.0, ST(0)=3.0 -> 3.0 - 10.0 = -7.0
+            0xdd, 0x47, 0x10,       // fld qword [rdi+0x10] (10.0)
+            0xdd, 0x47, 0x18,       // fld qword [rdi+0x18] (3.0)
+            0xde, 0xe1,             // fsubrp st(1), st(0)
+            0xdd, 0x5e, 0x10,       // fstp qword [rsi+0x10]
+
+            // 4. fdivrp st(1), st(0): ST(1)=10.0, ST(0)=3.0 -> 3.0 / 10.0 = 0.3
+            0xdd, 0x47, 0x10,       // fld qword [rdi+0x10] (10.0)
+            0xdd, 0x47, 0x18,       // fld qword [rdi+0x18] (3.0)
+            0xde, 0xf1,             // fdivrp st(1), st(0)
+            0xdd, 0x5e, 0x18,       // fstp qword [rsi+0x18]
+
+            // 5. fild i64 -> fistp i64 exact 64-bit integer round-trip
+            0xdf, 0x6f, 0x20,       // fild qword [rdi+0x20]
+            0xdf, 0x7e, 0x20,       // fistp qword [rsi+0x20]
+
+            // 6. fscale: ST(1)=4.0, ST(0)=1.5 -> ST(0)=24.0
+            0xdd, 0x47, 0x30,       // fld qword [rdi+0x30] (4.0)
+            0xdd, 0x47, 0x28,       // fld qword [rdi+0x28] (1.5)
+            0xd9, 0xfd,             // fscale
+            0xdd, 0x5e, 0x28,       // fstp qword [rsi+0x28]
+            0xdd, 0xd8,             // fstp st(0)
+
+            // 7. fprem: exact 64-bit integer mod 2048.0 -> 801.0
+            0xdd, 0x47, 0x38,       // fld qword [rdi+0x38] (ST1 = 2048.0)
+            0xdf, 0x6f, 0x40,       // fild qword [rdi+0x40] (ST0 = 0x4000_0000_0000_0321)
+            0xd9, 0xf8,             // fprem
+            0xdd, 0x5e, 0x30,       // fstp qword [rsi+0x30]
+            0xdd, 0xd8,             // fstp st(0)
+
+            // 8. fcom st(0), st(1) (2-operand form): 3.0 < 10.0 -> C0=1 (0x0100)
+            0xdd, 0x47, 0x10,       // fld qword [rdi+0x10] (10.0)
+            0xdd, 0x47, 0x18,       // fld qword [rdi+0x18] (3.0)
+            0xd8, 0xd1,             // fcom st(0), st(1)
+            0xdf, 0xe0,             // fnstsw ax
+            0x66, 0x89, 0x46, 0x38, // mov word [rsi+0x38], ax
+            0xdd, 0xd8,             // fstp st(0)
+            0xdd, 0xd8,             // fstp st(0)
+
+            // exit(0)
+            0x48, 0xc7, 0xc7, 0x00, 0x00, 0x00, 0x00,
+            0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00,
+            0x0f, 0x05,
+        ];
+
+        let image = LoadedImage {
+            entry_rip: 0x0010_0000,
+            at_phdr: 0,
+            at_phent: 56,
+            at_phnum: 0,
+            at_entry: 0x0010_0000,
+            at_base: 0,
+            exec_segments: vec![ExecSegment {
+                name: "x87_80bit_test".to_string(),
+                vaddr: 0x0010_0000,
+                data: code,
+            }],
+            data_segments: vec![],
+            so_files: vec![],
+            symbols: std::collections::HashMap::new(),
+            elf_path: "x87_80bit_test".to_string(),
+        };
+
+        let prog = crate::decoder::discover_code(&image).unwrap();
+        let wasm_bytes = emit_wasm(&image, &prog).unwrap();
+
+        let engine = Engine::default();
+        WasmModule::validate(&engine, &wasm_bytes)
+            .expect("x87 80-bit WASM must pass validation");
+        let module = WasmModule::new(&engine, &wasm_bytes).unwrap();
+        let mut store = Store::new(&engine, ());
+        let inst = Instance::new(&mut store, &module, &[]).unwrap();
+        let mem = inst.get_memory(&mut store, "memory").unwrap();
+
+        let in_base = 0x0020_0000usize;
+        let out_base = 0x0020_0100usize;
+        let big_i64: i64 = 0x1234_5678_9ABC_DEF1;
+        let fprem_i64: i64 = 0x4000_0000_0000_0321;
+
+        mem.write(&mut store, in_base + 0x00, &(9223372036854775808.0f64).to_le_bytes()).unwrap();
+        mem.write(&mut store, in_base + 0x08, &(0.59f64).to_le_bytes()).unwrap();
+        mem.write(&mut store, in_base + 0x10, &(10.0f64).to_le_bytes()).unwrap();
+        mem.write(&mut store, in_base + 0x18, &(3.0f64).to_le_bytes()).unwrap();
+        mem.write(&mut store, in_base + 0x20, &big_i64.to_le_bytes()).unwrap();
+        mem.write(&mut store, in_base + 0x28, &(1.5f64).to_le_bytes()).unwrap();
+        mem.write(&mut store, in_base + 0x30, &(4.0f64).to_le_bytes()).unwrap();
+        mem.write(&mut store, in_base + 0x38, &(2048.0f64).to_le_bytes()).unwrap();
+        mem.write(&mut store, in_base + 0x40, &fprem_i64.to_le_bytes()).unwrap();
+
+        inst.get_global(&mut store, "rsp").unwrap().set(&mut store, wasmtime::Val::I64(STACK_TOP as i64)).unwrap();
+        inst.get_global(&mut store, "rdi").unwrap().set(&mut store, wasmtime::Val::I64(in_base as i64)).unwrap();
+        inst.get_global(&mut store, "rsi").unwrap().set(&mut store, wasmtime::Val::I64(out_base as i64)).unwrap();
+
+        let start = inst.get_typed_func::<(), i32>(&mut store, "_start").unwrap();
+        let _ = start.call(&mut store, ()).unwrap();
+
+        let read_f64 = |off: usize| -> f64 {
+            let mut b = [0u8; 8];
+            mem.read(&store, out_base + off, &mut b).unwrap();
+            f64::from_le_bytes(b)
+        };
+        let read_i64 = |off: usize| -> i64 {
+            let mut b = [0u8; 8];
+            mem.read(&store, out_base + off, &mut b).unwrap();
+            i64::from_le_bytes(b)
+        };
+        let read_u16 = |off: usize| -> u16 {
+            let mut b = [0u8; 2];
+            mem.read(&store, out_base + off, &mut b).unwrap();
+            u16::from_le_bytes(b)
+        };
+
+        assert_eq!(read_f64(0x00), 1.0, "(2^63 + 0.59) - 2^63 must round to 1.0 in 80-bit x87");
+        assert_eq!(read_f64(0x08), 10.0, "fxch st(1) + fstp st(1) must preserve 10.0");
+        assert_eq!(read_f64(0x10), -7.0, "fsubrp st(1), st(0) must compute 3.0 - 10.0 = -7.0");
+        assert!((read_f64(0x18) - 0.3).abs() < 1e-15, "fdivrp st(1), st(0) must compute 3.0 / 10.0 = 0.3");
+        assert_eq!(read_i64(0x20), big_i64, "fild/fistp i64 must preserve all 64 bits");
+        assert_eq!(read_f64(0x28), 24.0, "fscale 1.5 * 2^4 must equal 24.0");
+        assert_eq!(read_f64(0x30), 801.0, "fprem must preserve low 11 bits of 64-bit integer");
+        assert_eq!(read_u16(0x38) & 0x4500, 0x0100, "fcom st(0), st(1) for 3.0 < 10.0 must set C0=1");
+        assert_eq!(
+            inst.get_global(&mut store, "x87_top").unwrap().get(&mut store).i32(),
+            Some(0),
+            "x87_top must return to 0"
+        );
     }
 }

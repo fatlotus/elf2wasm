@@ -280,9 +280,6 @@ pub fn load_elf_and_sos_bytes(
     .context("e_entry exceeds 32-bit guest address space")?;
 
     let interp_path = main_elf.interpreter.map(|s| s.to_string());
-    let interp_basename = interp_path
-        .as_deref()
-        .map(|p| p.rsplit('/').next().unwrap_or(p));
 
     // Pre-parse all .so headers so we can compute dynamic ld_base and next_so_base
     // regardless of the order in which ld.so and other .so files are provided.
@@ -294,7 +291,7 @@ pub fn load_elf_and_sos_bytes(
         is_interp: bool,
     }
 
-    let mut parsed_sos = Vec::with_capacity(sos.len());
+    let mut parsed_sos: Vec<ParsedSo<'_>> = Vec::with_capacity(sos.len());
     let mut interp_idx: Option<usize> = None;
     for &(so_str, so_bytes) in sos {
         let so_elf =
@@ -303,12 +300,19 @@ pub fn load_elf_and_sos_bytes(
             bail!("Shared object {} is not an ELF64 x86-64 binary", so_str);
         }
         let so_base_name = so_str.rsplit('/').next().unwrap_or(so_str);
-        let is_interp = interp_idx.is_none()
-            && interp_path.as_ref().map_or(false, |ip| {
-                ip == so_str
-                    || interp_basename == Some(so_base_name)
-                    || (so_base_name.starts_with("ld-linux") && ip.contains("ld-linux"))
-            });
+        let matches_interp = interp_path
+            .as_deref()
+            .map_or(false, |ip| is_interp_name_match(ip, so_str, so_base_name));
+        if matches_interp {
+            if let Some(existing_idx) = interp_idx {
+                if parsed_sos[existing_idx].bytes == so_bytes {
+                    // musl combines ld-musl and libc.musl into one binary; skip duplicate entry
+                    // so we don't lift it twice or embed redundant bytes in WasmMeta.
+                    continue;
+                }
+            }
+        }
+        let is_interp = interp_idx.is_none() && matches_interp;
         if is_interp {
             interp_idx = Some(parsed_sos.len());
         }
@@ -479,6 +483,8 @@ pub fn load_elf_and_sos(main_path: &Path, so_paths: &[PathBuf]) -> Result<Loaded
                         .guest_paths
                         .push(format!("/lib/x86_64-linux-gnu/{}", cb));
                     so_file.guest_paths.push(format!("/lib64/{}", cb));
+                    so_file.guest_paths.push(format!("/lib/{}", cb));
+                    so_file.guest_paths.push(format!("/usr/lib/{}", cb));
                 }
                 so_file.guest_paths.sort();
                 so_file.guest_paths.dedup();
@@ -487,6 +493,34 @@ pub fn load_elf_and_sos(main_path: &Path, so_paths: &[PathBuf]) -> Result<Loaded
     }
 
     Ok(image)
+}
+
+fn is_interp_name_match(interp_path: &str, so_str: &str, so_base_name: &str) -> bool {
+    let ip_base = interp_path.rsplit('/').next().unwrap_or(interp_path);
+    if interp_path == so_str || ip_base == so_base_name {
+        return true;
+    }
+    // glibc dynamic linker aliases (e.g. ld-linux-x86-64.so.2)
+    if so_base_name.starts_with("ld-linux") && interp_path.contains("ld-linux") {
+        return true;
+    }
+    // musl dynamic linker <-> libc duality:
+    // PT_INTERP is typically /lib/ld-musl-x86_64.so.1 while the real file / DT_NEEDED is libc.musl-x86_64.so.1
+    if let Some(suffix) = ip_base.strip_prefix("ld-musl-") {
+        if so_base_name == format!("libc.musl-{}", suffix)
+            || so_base_name == format!("ld-musl-{}", suffix)
+        {
+            return true;
+        }
+    }
+    if let Some(suffix) = ip_base.strip_prefix("libc.musl-") {
+        if so_base_name == format!("ld-musl-{}", suffix)
+            || so_base_name == format!("libc.musl-{}", suffix)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -578,6 +612,91 @@ mod tests {
         assert_eq!(image.so_files.len(), 1);
         assert_eq!(image.so_files[0].base_addr, 0x0270_0000);
         assert!(image.so_files[0].base_addr + 0x20_0000 <= BRK_START);
+        Ok(())
+    }
+
+    #[test]
+    fn test_musl_interp_matches_libc_musl_symlink() -> Result<()> {
+        let main_bytes = make_minimal_elf64(
+            goblin::elf::header::ET_DYN,
+            0x1000,
+            0,
+            0x10_0000,
+            Some(b"/lib/ld-musl-x86_64.so.1\0"),
+        );
+        let musl_bytes =
+            make_minimal_elf64(goblin::elf::header::ET_DYN, 0x2000, 0, 0x10_0000, None);
+
+        let image = load_elf_and_sos_bytes(
+            "/bin/busybox",
+            &main_bytes,
+            &[("/lib/libc.musl-x86_64.so.1", &musl_bytes)],
+        )?;
+
+        assert_eq!(image.at_base, LD_BASE);
+        assert_eq!(image.entry_rip, LD_BASE + 0x2000);
+        assert!(image.so_files.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_musl_interp_deduplicates_both_ld_and_libc() -> Result<()> {
+        let main_bytes = make_minimal_elf64(
+            goblin::elf::header::ET_DYN,
+            0x1000,
+            0,
+            0x10_0000,
+            Some(b"/lib/ld-musl-x86_64.so.1\0"),
+        );
+        let musl_bytes =
+            make_minimal_elf64(goblin::elf::header::ET_DYN, 0x2000, 0, 0x10_0000, None);
+        let foo_bytes =
+            make_minimal_elf64(goblin::elf::header::ET_DYN, 0x1000, 0, 0x10_0000, None);
+
+        let image = load_elf_and_sos_bytes(
+            "/bin/busybox",
+            &main_bytes,
+            &[
+                ("/lib/ld-musl-x86_64.so.1", &musl_bytes),
+                ("/lib/libc.musl-x86_64.so.1", &musl_bytes),
+                ("/usr/lib/libfoo.so.1", &foo_bytes),
+            ],
+        )?;
+
+        assert_eq!(image.at_base, LD_BASE);
+        assert_eq!(image.so_files.len(), 1);
+        assert_eq!(image.so_files[0].host_path, "/usr/lib/libfoo.so.1");
+        assert_eq!(image.so_files[0].base_addr, SO_BASE_START);
+        Ok(())
+    }
+
+    #[test]
+    fn test_musl_interp_reverse_order_with_extra_so() -> Result<()> {
+        let main_bytes = make_minimal_elf64(
+            goblin::elf::header::ET_DYN,
+            0x1000,
+            0,
+            0x10_0000,
+            Some(b"/lib/ld-musl-x86_64.so.1\0"),
+        );
+        let musl_bytes =
+            make_minimal_elf64(goblin::elf::header::ET_DYN, 0x2000, 0, 0x10_0000, None);
+        let foo_bytes =
+            make_minimal_elf64(goblin::elf::header::ET_DYN, 0x1000, 0, 0x10_0000, None);
+
+        let image = load_elf_and_sos_bytes(
+            "/bin/busybox",
+            &main_bytes,
+            &[
+                ("/usr/lib/libfoo.so.1", &foo_bytes),
+                ("/lib/libc.musl-x86_64.so.1", &musl_bytes),
+            ],
+        )?;
+
+        assert_eq!(image.at_base, LD_BASE);
+        assert_eq!(image.so_files.len(), 1);
+        assert_eq!(image.so_files[0].host_path, "/usr/lib/libfoo.so.1");
+        assert_eq!(image.so_files[0].base_addr, SO_BASE_START);
         Ok(())
     }
 }
