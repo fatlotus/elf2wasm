@@ -102,6 +102,7 @@ const SYS_GETGROUPS: i64 = 115;
 const SYS_SETGROUPS: i64 = 116;
 const SYS_GETPGID: i64 = 121;
 const SYS_GETSID: i64 = 124;
+const SYS_CAPGET: i64 = 125;
 const SYS_SIGALTSTACK: i64 = 131;
 const SYS_STATFS: i64 = 137;
 const SYS_FSTATFS: i64 = 138;
@@ -180,13 +181,21 @@ const POLLNVAL: i16 = 0x0020;
 #[derive(Debug, Clone)]
 pub struct MmapAllocator {
     pub cursor: u32,
+    pub mmap_start: u32,
+    pub mmap_alloc_end: u32,
     pub free_regions: BTreeMap<u32, u32>,
 }
 
 impl MmapAllocator {
     pub fn new() -> Self {
+        Self::new_with_bounds(MMAP_START, MMAP_ALLOC_END)
+    }
+
+    pub fn new_with_bounds(mmap_start: u32, mmap_alloc_end: u32) -> Self {
         Self {
-            cursor: MMAP_START,
+            cursor: mmap_start,
+            mmap_start,
+            mmap_alloc_end,
             free_regions: BTreeMap::new(),
         }
     }
@@ -209,7 +218,7 @@ impl MmapAllocator {
             return Some(start);
         }
         let next = self.cursor.checked_add(aligned_len)?;
-        if next > MMAP_ALLOC_END {
+        if next > self.mmap_alloc_end {
             return None;
         }
         let addr = self.cursor;
@@ -221,7 +230,7 @@ impl MmapAllocator {
         if aligned_len == 0 {
             return;
         }
-        let mut start = addr.max(MMAP_START);
+        let mut start = addr.max(self.mmap_start);
         let mut end = addr.saturating_add(aligned_len).min(self.cursor);
         if start >= end {
             return;
@@ -254,8 +263,8 @@ impl MmapAllocator {
         if aligned_len == 0 {
             return;
         }
-        let start = addr.max(MMAP_START);
-        let end = addr.saturating_add(aligned_len).min(MMAP_ALLOC_END);
+        let start = addr.max(self.mmap_start);
+        let end = addr.saturating_add(aligned_len).min(self.mmap_alloc_end);
         if start >= end {
             return;
         }
@@ -301,6 +310,7 @@ pub struct TtyState {
     pub cols: u16,
     pub fg_pgid: i32,
     pub termios: [u8; 36],
+    pub canon_buf: Vec<u8>,
 }
 
 impl TtyState {
@@ -321,7 +331,48 @@ impl TtyState {
             cols: 80,
             fg_pgid: MAIN_PID,
             termios,
+            canon_buf: Vec::new(),
         }
+    }
+
+    #[inline]
+    pub fn c_iflag(&self) -> u32 {
+        u32::from_le_bytes(self.termios[0..4].try_into().unwrap())
+    }
+
+    #[inline]
+    pub fn c_oflag(&self) -> u32 {
+        u32::from_le_bytes(self.termios[4..8].try_into().unwrap())
+    }
+
+    #[inline]
+    pub fn c_lflag(&self) -> u32 {
+        u32::from_le_bytes(self.termios[12..16].try_into().unwrap())
+    }
+
+    #[inline]
+    pub fn is_icrnl(&self) -> bool {
+        (self.c_iflag() & 0x0100) != 0
+    }
+
+    #[inline]
+    pub fn is_onlcr(&self) -> bool {
+        (self.c_oflag() & 0x0004) != 0
+    }
+
+    #[inline]
+    pub fn is_isig(&self) -> bool {
+        (self.c_lflag() & 0x0001) != 0
+    }
+
+    #[inline]
+    pub fn is_icanon(&self) -> bool {
+        (self.c_lflag() & 0x0002) != 0
+    }
+
+    #[inline]
+    pub fn is_echo(&self) -> bool {
+        (self.c_lflag() & 0x0008) != 0
     }
 }
 
@@ -336,7 +387,10 @@ pub struct ProcessState {
     pub cwd: String,
     pub elf_path: String,
     pub so_entries: Vec<SoEntry>,
+    pub brk_start: u32,
     pub brk_curr: u32,
+    pub mmap_start: u32,
+    pub mmap_end: u32,
     pub mmap_alloc: MmapAllocator,
     pub scheduler: Scheduler,
     pub sig_handlers: BTreeMap<i32, u64>,
@@ -359,7 +413,10 @@ impl ProcessState {
             cwd: String::new(),
             elf_path: String::new(),
             so_entries: Vec::new(),
+            brk_start: BRK_START,
             brk_curr: BRK_START,
+            mmap_start: MMAP_START,
+            mmap_end: MMAP_END,
             mmap_alloc: MmapAllocator::new(),
             scheduler: Scheduler::new_with_tid(pid, 0, 0),
             sig_handlers: BTreeMap::new(),
@@ -390,7 +447,10 @@ pub enum PendingHostAction {
 pub struct HostState {
     pub vfs: VirtualFs,
     pub scheduler: Scheduler,
+    pub brk_start: u32,
     pub brk_curr: u32,
+    pub mmap_start: u32,
+    pub mmap_end: u32,
     pub mmap_alloc: MmapAllocator,
     pub prng_state: u64,
     pub active_pid: i32,
@@ -419,7 +479,10 @@ impl HostState {
         Self {
             vfs,
             scheduler: Scheduler::new(),
+            brk_start: BRK_START,
             brk_curr: BRK_START,
+            mmap_start: MMAP_START,
+            mmap_end: MMAP_END,
             mmap_alloc: MmapAllocator::new(),
             prng_state: 0x9e37_79b9_7f4a_7c15,
             active_pid: MAIN_PID,
@@ -439,6 +502,16 @@ impl HostState {
         }
     }
 
+    pub fn apply_meta_layout(&mut self, meta: &WasmMeta) {
+        let mmap_alloc_end = meta.mmap_end.saturating_sub(4096);
+        self.brk_start = meta.brk_start;
+        self.brk_curr = meta.brk_start;
+        self.mmap_start = meta.mmap_start;
+        self.mmap_end = meta.mmap_end;
+        self.mmap_alloc = MmapAllocator::new_with_bounds(meta.mmap_start, mmap_alloc_end);
+        self.scheduler.scratch_addr = mmap_alloc_end;
+    }
+
     pub fn set_uid_gid(&mut self, uid: u32, gid: u32) {
         self.uid = uid;
         self.euid = uid;
@@ -450,6 +523,10 @@ impl HostState {
     }
 
     pub fn set_tty_mode(&mut self, enabled: bool) {
+        if !enabled && !self.tty.canon_buf.is_empty() {
+            let pending = core::mem::take(&mut self.tty.canon_buf);
+            self.vfs.push_stdin(&pending);
+        }
         self.tty.enabled = enabled;
         self.vfs.stdin_eof = !(self.tty.enabled || self.stdin_open);
     }
@@ -464,20 +541,139 @@ impl HostState {
         self.tty.cols = cols.clamp(1, u16::MAX as u32) as u16;
     }
 
+    /// Push host stdin bytes through the POSIX TTY line discipline when `tty.enabled`,
+    /// or directly into the raw stdin queue in batch/pipe mode.
+    pub fn push_stdin(&mut self, data: &[u8]) {
+        if !self.tty.enabled {
+            self.vfs.push_stdin(data);
+            self.wake_ready_waiters();
+            return;
+        }
+        let icanon = self.tty.is_icanon();
+        let echo = self.tty.is_echo();
+        let icrnl = self.tty.is_icrnl();
+        let onlcr = self.tty.is_onlcr();
+        let isig = self.tty.is_isig();
+        let vintr = self.tty.termios[17];
+        let verase = self.tty.termios[19];
+        let vkill = self.tty.termios[20];
+        let veof = self.tty.termios[21];
+
+        let echo_nl = |stdout: &mut Vec<u8>| {
+            if onlcr {
+                stdout.extend_from_slice(b"\r\n");
+            } else {
+                stdout.push(b'\n');
+            }
+        };
+
+        if !icanon {
+            if !self.tty.canon_buf.is_empty() {
+                let pending = core::mem::take(&mut self.tty.canon_buf);
+                self.vfs.push_stdin(&pending);
+            }
+            for &raw_b in data {
+                if isig && vintr != 0 && raw_b == vintr {
+                    if echo {
+                        self.vfs.stdout.extend_from_slice(b"^C");
+                        echo_nl(&mut self.vfs.stdout);
+                    }
+                    self.send_sigint();
+                    continue;
+                }
+                let b = if icrnl && raw_b == b'\r' { b'\n' } else { raw_b };
+                if echo {
+                    if b == b'\n' {
+                        echo_nl(&mut self.vfs.stdout);
+                    } else if (b >= 0x20 && b != 0x7f) || b == b'\t' {
+                        self.vfs.stdout.push(b);
+                    }
+                }
+                self.vfs.push_stdin(&[b]);
+            }
+            self.wake_ready_waiters();
+            return;
+        }
+
+        // Canonical mode (ICANON)
+        for &raw_b in data {
+            if isig && vintr != 0 && raw_b == vintr {
+                self.tty.canon_buf.clear();
+                if echo {
+                    self.vfs.stdout.extend_from_slice(b"^C");
+                    echo_nl(&mut self.vfs.stdout);
+                }
+                self.send_sigint();
+                continue;
+            }
+            let b = if icrnl && raw_b == b'\r' { b'\n' } else { raw_b };
+            if b == 0x7f || b == 0x08 || (verase != 0 && b == verase) {
+                if self.tty.canon_buf.pop().is_some() && echo {
+                    self.vfs.stdout.extend_from_slice(b"\x08 \x08");
+                }
+                continue;
+            }
+            if vkill != 0 && b == vkill {
+                let n = self.tty.canon_buf.len();
+                self.tty.canon_buf.clear();
+                if echo {
+                    for _ in 0..n {
+                        self.vfs.stdout.extend_from_slice(b"\x08 \x08");
+                    }
+                }
+                continue;
+            }
+            if veof != 0 && b == veof {
+                if !self.tty.canon_buf.is_empty() {
+                    let line = core::mem::take(&mut self.tty.canon_buf);
+                    self.vfs.push_stdin(&line);
+                } else {
+                    self.vfs.close_stdin();
+                }
+                continue;
+            }
+            if b == b'\n' {
+                self.tty.canon_buf.push(b'\n');
+                if echo {
+                    echo_nl(&mut self.vfs.stdout);
+                }
+                let line = core::mem::take(&mut self.tty.canon_buf);
+                self.vfs.push_stdin(&line);
+                continue;
+            }
+            self.tty.canon_buf.push(b);
+            if echo && ((b >= 0x20 && b != 0x7f) || b == b'\t') {
+                self.vfs.stdout.push(b);
+            }
+        }
+        self.wake_ready_waiters();
+    }
+
+    pub fn close_stdin(&mut self) {
+        if !self.tty.canon_buf.is_empty() {
+            let pending = core::mem::take(&mut self.tty.canon_buf);
+            self.vfs.push_stdin(&pending);
+        }
+        self.vfs.close_stdin();
+        self.wake_ready_waiters();
+    }
+
     pub fn take_reaped_pids(&mut self) -> Vec<i32> {
         core::mem::take(&mut self.reaped_pids)
     }
 
     pub fn alloc_pid(&mut self) -> i32 {
-        let pid = self.next_pid;
-        self.next_pid += 1;
-        pid
+        let id = self.next_pid.max(self.next_tid);
+        self.next_pid = id + 1;
+        self.next_tid = id + 1;
+        id
     }
 
     pub fn alloc_tid(&mut self) -> i32 {
-        let tid = self.next_tid;
-        self.next_tid += 1;
-        tid
+        let id = self.next_pid.max(self.next_tid);
+        self.next_pid = id + 1;
+        self.next_tid = id + 1;
+        id
     }
 
     fn next_rand_u64(&mut self) -> u64 {
@@ -497,7 +693,10 @@ impl HostState {
             core::mem::swap(&mut self.vfs.cwd, &mut old_p.cwd);
             core::mem::swap(&mut self.vfs.elf_path, &mut old_p.elf_path);
             core::mem::swap(&mut self.vfs.so_entries, &mut old_p.so_entries);
+            old_p.brk_start = self.brk_start;
             old_p.brk_curr = self.brk_curr;
+            old_p.mmap_start = self.mmap_start;
+            old_p.mmap_end = self.mmap_end;
             core::mem::swap(&mut self.mmap_alloc, &mut old_p.mmap_alloc);
             core::mem::swap(&mut self.scheduler, &mut old_p.scheduler);
         }
@@ -508,7 +707,10 @@ impl HostState {
             core::mem::swap(&mut self.vfs.cwd, &mut new_p.cwd);
             core::mem::swap(&mut self.vfs.elf_path, &mut new_p.elf_path);
             core::mem::swap(&mut self.vfs.so_entries, &mut new_p.so_entries);
+            self.brk_start = new_p.brk_start;
             self.brk_curr = new_p.brk_curr;
+            self.mmap_start = new_p.mmap_start;
+            self.mmap_end = new_p.mmap_end;
             core::mem::swap(&mut self.mmap_alloc, &mut new_p.mmap_alloc);
             core::mem::swap(&mut self.scheduler, &mut new_p.scheduler);
             self.scheduler.virtual_mono_ns = mono;
@@ -1746,11 +1948,16 @@ impl HostState {
             // POSIX exec resets all caught signal handlers to SIG_DFL, preserving SIG_IGN (1)
             p.sig_handlers.retain(|_, &mut h| h == 1);
         }
-        self.brk_curr = BRK_START;
-        self.mmap_alloc = MmapAllocator::new();
+        let mmap_alloc_end = meta.mmap_end.saturating_sub(4096);
+        self.brk_start = meta.brk_start;
+        self.brk_curr = meta.brk_start;
+        self.mmap_start = meta.mmap_start;
+        self.mmap_end = meta.mmap_end;
+        self.mmap_alloc = MmapAllocator::new_with_bounds(meta.mmap_start, mmap_alloc_end);
         let mono = self.scheduler.virtual_mono_ns;
         let rt_base = self.scheduler.realtime_base_ns;
         self.scheduler = Scheduler::new_with_tid(pid, mono, rt_base);
+        self.scheduler.scratch_addr = mmap_alloc_end;
 
         let rsp = setup_guest_stack_ctx_with_ids(ctx, meta, args, env, self.uid, self.gid)
             .map_err(|_| -ENOMEM)?;
@@ -1770,12 +1977,17 @@ impl HostState {
         self.pending_action = None;
         self.reaped_pids.clear();
         self.tty.fg_pgid = MAIN_PID;
+        self.tty.canon_buf.clear();
+        self.tty.termios = TtyState::new().termios;
         self.processes.clear();
         self.processes.insert(
             MAIN_PID,
             ProcessState::empty_slot(MAIN_PID, 1, MAIN_PID, MAIN_PID),
         );
+        self.brk_start = BRK_START;
         self.brk_curr = BRK_START;
+        self.mmap_start = MMAP_START;
+        self.mmap_end = MMAP_END;
         self.mmap_alloc = MmapAllocator::new();
         self.scheduler = Scheduler::new_with_tid(MAIN_PID, mono, rt_base);
         self.vfs.reset_fds_and_stdio();
@@ -2412,10 +2624,10 @@ fn handle_syscall_inner(
         SYS_BRK => {
             let req = a0 as u64;
             let curr = state.brk_curr;
-            if req == 0 || req < BRK_START as u64 {
+            if req == 0 || req < state.brk_start as u64 {
                 return curr as i64;
             }
-            if req >= MMAP_START as u64 {
+            if req >= state.mmap_start as u64 {
                 return curr as i64;
             }
             let new_brk = req as u32;
@@ -2634,7 +2846,9 @@ fn handle_syscall_inner(
             if advice == MADV_DONTNEED && len > 0 {
                 if let (Ok(start), Ok(len_u32)) = (u32::try_from(addr), u32::try_from(len)) {
                     if let Some(end) = start.checked_add(len_u32) {
-                        if start >= MMAP_START && end <= MMAP_ALLOC_END {
+                        if start >= state.mmap_alloc.mmap_start
+                            && end <= state.mmap_alloc.mmap_alloc_end
+                        {
                             let _ = ctx.mem_zero(addr, len);
                         }
                     }
@@ -2685,7 +2899,7 @@ fn handle_syscall_inner(
             let old_limit = a3 as u64;
             if old_limit != 0 {
                 let (cur, max) = match resource {
-                    3 => (8u64 * 1024 * 1024, u64::MAX), // RLIMIT_STACK
+                    3 => (2u64 * 1024 * 1024, u64::MAX), // RLIMIT_STACK
                     7 => (1024u64, 4096u64),            // RLIMIT_NOFILE
                     _ => (u64::MAX, u64::MAX),
                 };
@@ -2703,7 +2917,7 @@ fn handle_syscall_inner(
             let rlim = a1 as u64;
             if rlim != 0 {
                 let (cur, max) = match resource {
-                    3 => (8u64 * 1024 * 1024, u64::MAX),
+                    3 => (2u64 * 1024 * 1024, u64::MAX), // RLIMIT_STACK
                     7 => (1024u64, 4096u64),
                     _ => (u64::MAX, u64::MAX),
                 };
@@ -3337,8 +3551,18 @@ fn handle_syscall_inner(
             if fd == epfd {
                 return -EINVAL;
             }
-            if state.vfs.get_fd(fd).is_none() {
+            let Some(target_f) = state.vfs.get_fd(fd) else {
                 return -EBADF;
+            };
+            let supports_epoll = target_f.is_pipe
+                || target_f.pipe_id.is_some()
+                || target_f.sock_write_pipe_id.is_some()
+                || target_f.eventfd_id.is_some()
+                || target_f.epoll_id.is_some()
+                || target_f.is_std.is_some()
+                || target_f.dev == Some(VirtualDevice::Tty);
+            if !supports_epoll {
+                return -EPERM;
             }
             match op {
                 EPOLL_CTL_DEL => {
@@ -3736,6 +3960,11 @@ fn handle_syscall_inner(
                         Err(e) => return e,
                     };
                     state.tty.termios.copy_from_slice(&raw);
+                    if !state.tty.is_icanon() && !state.tty.canon_buf.is_empty() {
+                        let pending = core::mem::take(&mut state.tty.canon_buf);
+                        state.vfs.push_stdin(&pending);
+                        state.wake_ready_waiters();
+                    }
                     0
                 }
                 TIOCGWINSZ => {
@@ -3965,14 +4194,58 @@ fn handle_syscall_inner(
             let info_addr = a0 as u64;
             let mut buf = [0u8; 112];
             let uptime = (state.scheduler.virtual_mono_ns / 1_000_000_000).max(1) as i64;
+            let totalram = (ctx.mem_len() as u64).max(256 * 1024 * 1024);
+            let freeram = totalram / 2;
             buf[0..8].copy_from_slice(&uptime.to_le_bytes());
-            buf[32..40].copy_from_slice(&(256u64 * 1024 * 1024).to_le_bytes()); // totalram
-            buf[40..48].copy_from_slice(&(128u64 * 1024 * 1024).to_le_bytes()); // freeram
+            buf[32..40].copy_from_slice(&totalram.to_le_bytes()); // totalram
+            buf[40..48].copy_from_slice(&freeram.to_le_bytes()); // freeram
             buf[80..82].copy_from_slice(&(state.scheduler.live_thread_count().max(1) as u16).to_le_bytes());
             buf[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit
             match write_bytes(ctx, info_addr, &buf) {
                 Ok(()) => 0,
                 Err(e) => e,
+            }
+        }
+        SYS_CAPGET => {
+            const LINUX_CAP_V1: u32 = 0x1998_0330;
+            const LINUX_CAP_V2: u32 = 0x2007_1026;
+            const LINUX_CAP_V3: u32 = 0x2008_0522;
+            let hdr_addr = a0 as u64;
+            let data_addr = a1 as u64;
+            if hdr_addr == 0 {
+                return -EFAULT;
+            }
+            let version = match read_u32(ctx, hdr_addr) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            match version {
+                LINUX_CAP_V1 => {
+                    if data_addr != 0 {
+                        if let Err(e) = write_bytes(ctx, data_addr, &[0u8; 12]) {
+                            return e;
+                        }
+                    }
+                    0
+                }
+                LINUX_CAP_V2 | LINUX_CAP_V3 => {
+                    if data_addr != 0 {
+                        if let Err(e) = write_bytes(ctx, data_addr, &[0u8; 24]) {
+                            return e;
+                        }
+                    }
+                    0
+                }
+                _ => {
+                    if let Err(e) = write_bytes(ctx, hdr_addr, &LINUX_CAP_V3.to_le_bytes()) {
+                        return e;
+                    }
+                    if data_addr == 0 {
+                        0
+                    } else {
+                        -EINVAL
+                    }
+                }
             }
         }
         SYS_SIGALTSTACK => {
@@ -4186,6 +4459,7 @@ fn do_fork(
         state.scheduler.virtual_mono_ns,
         state.scheduler.realtime_base_ns,
     );
+    child_sched.scratch_addr = state.scheduler.scratch_addr;
     {
         let child_thread = child_sched.threads.get_mut(&child_pid).unwrap();
         child_thread.regs = parent_regs;
@@ -4219,7 +4493,10 @@ fn do_fork(
         cwd: state.vfs.cwd.clone(),
         elf_path: state.vfs.elf_path.clone(),
         so_entries: state.vfs.so_entries.clone(),
+        brk_start: state.brk_start,
         brk_curr: state.brk_curr,
+        mmap_start: state.mmap_start,
+        mmap_end: state.mmap_end,
         mmap_alloc: state.mmap_alloc.clone(),
         scheduler: child_sched,
         sig_handlers: parent_sig_handlers,

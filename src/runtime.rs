@@ -340,6 +340,7 @@ pub fn run_wasm(wasm_bytes: &[u8], config: RunConfig) -> Result<RunOutput> {
     vfs.inherit_stdin = config.inherit_stdin;
     vfs.elf_path = meta.elf_path.clone();
     let mut host_state = HostState::new(vfs);
+    host_state.apply_meta_layout(&meta);
     host_state.multiproc_enabled = true;
     let mut store = Store::new(&engine, Some(host_state));
 

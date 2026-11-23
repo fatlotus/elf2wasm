@@ -925,4 +925,210 @@ mod tests {
             big
         );
     }
+
+    #[test]
+    fn test_f17_canonical_tty_echo_line_editing_and_modes() {
+        let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+        let mut ctx = MockCtx::new(0x0B00_0000);
+        state.set_tty_mode(true);
+
+        // 1. Canonical mode: echo + backspace + CR->NL + line buffering
+        state.push_stdin(b"ab\x7fc");
+        assert_eq!(state.vfs.stdout, b"ab\x08 \x08c");
+        assert_eq!(state.vfs.stdin_available(), 0, "unterminated line must stay buffered");
+
+        state.push_stdin(b"\r");
+        assert_eq!(state.vfs.stdout, b"ab\x08 \x08c\r\n");
+        let n = handle_syscall(&mut ctx, &mut state, 0 /* read */, 0, 0x2000, 16, 0, 0, 0);
+        assert_eq!(n, 3);
+        let mut out = [0u8; 3];
+        ctx.mem_read(0x2000, &mut out).unwrap();
+        assert_eq!(&out, b"ac\n");
+
+        // 2. Ctrl-U kills line and erases echoed chars
+        state.vfs.stdout.clear();
+        state.push_stdin(b"xyz\x15ok\n");
+        assert_eq!(state.vfs.stdout, b"xyz\x08 \x08\x08 \x08\x08 \x08ok\r\n");
+        let n = handle_syscall(&mut ctx, &mut state, 0, 0, 0x2000, 16, 0, 0, 0);
+        assert_eq!(n, 3);
+        ctx.mem_read(0x2000, &mut out).unwrap();
+        assert_eq!(&out, b"ok\n");
+
+        // 3. Ctrl-D flushes partial line without EOF; second Ctrl-D on empty sets EOF
+        state.vfs.stdout.clear();
+        state.push_stdin(b"hi\x04");
+        assert!(!state.vfs.stdin_eof);
+        let n = handle_syscall(&mut ctx, &mut state, 0, 0, 0x2000, 16, 0, 0, 0);
+        assert_eq!(n, 2);
+        let mut hi = [0u8; 2];
+        ctx.mem_read(0x2000, &mut hi).unwrap();
+        assert_eq!(&hi, b"hi");
+
+        state.push_stdin(b"\x04");
+        assert!(state.vfs.stdin_eof);
+        let eof_n = handle_syscall(&mut ctx, &mut state, 0, 0, 0x2000, 16, 0, 0, 0);
+        assert_eq!(eof_n, 0);
+
+        // 4. Switch to raw mode via TCSETS (clear ICANON | ECHO) flushes pending canon_buf
+        state.reset_for_new_run();
+        state.vfs.stdin_data.clear();
+        state.set_tty_mode(true);
+        state.push_stdin(b"pre");
+        assert_eq!(state.vfs.stdin_available(), 0);
+        let mut raw_termios = state.tty.termios;
+        let lflag = u32::from_le_bytes(raw_termios[12..16].try_into().unwrap()) & !(0x0002 | 0x0008);
+        raw_termios[12..16].copy_from_slice(&lflag.to_le_bytes());
+        ctx.mem_write(0x3000, &raw_termios).unwrap();
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 16 /* ioctl */, 0, 0x5402 /* TCSETS */, 0x3000, 0, 0, 0),
+            0
+        );
+        assert_eq!(state.vfs.stdin_available(), 3, "switching to raw mode must flush canon_buf");
+        state.vfs.stdout.clear();
+        state.push_stdin(b"q");
+        assert!(state.vfs.stdout.is_empty(), "raw mode with ECHO cleared must not echo");
+        assert_eq!(state.vfs.stdin_available(), 4);
+
+        // 5. Batch mode (tty.enabled == false): direct passthrough with zero echo
+        state.reset_for_new_run();
+        state.vfs.stdin_data.clear();
+        state.set_tty_mode(false);
+        state.set_stdin_open(true);
+        state.push_stdin(b"raw\r");
+        assert!(state.vfs.stdout.is_empty());
+        let n = handle_syscall(&mut ctx, &mut state, 0, 0, 0x2000, 16, 0, 0, 0);
+        assert_eq!(n, 4);
+        let mut raw_out = [0u8; 4];
+        ctx.mem_read(0x2000, &mut raw_out).unwrap();
+        assert_eq!(&raw_out, b"raw\r");
+    }
+
+    #[test]
+    fn test_f18_rlimit_stack_capget_and_epoll_regular_file_eperm() {
+        let mut vfs = VirtualFs::new_in_memory(&[]);
+        vfs.vfs_write_file("/tmp/regular.txt", b"hello", 0o644);
+        let mut state = HostState::new(vfs);
+        let mut ctx = MockCtx::new(0x0B00_0000);
+
+        // 1. RLIMIT_STACK = 2 MiB in both prlimit64 (302) and getrlimit (97)
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 302 /* prlimit64 */, 0, 3, 0, 0x2000, 0, 0),
+            0
+        );
+        let mut rlim = [0u8; 16];
+        ctx.mem_read(0x2000, &mut rlim).unwrap();
+        assert_eq!(u64::from_le_bytes(rlim[0..8].try_into().unwrap()), 2 * 1024 * 1024);
+
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 97 /* getrlimit */, 3, 0x2020, 0, 0, 0, 0),
+            0
+        );
+        ctx.mem_read(0x2020, &mut rlim).unwrap();
+        assert_eq!(u64::from_le_bytes(rlim[0..8].try_into().unwrap()), 2 * 1024 * 1024);
+
+        // 2. SYS_CAPGET (125): version probe with NULL data writes v3 and returns 0
+        ctx.mem_write(0x2100, &[0u8; 8]).unwrap();
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 125 /* capget */, 0x2100, 0, 0, 0, 0, 0),
+            0
+        );
+        let mut ver = [0u8; 4];
+        ctx.mem_read(0x2100, &mut ver).unwrap();
+        assert_eq!(u32::from_le_bytes(ver), 0x2008_0522);
+
+        // v3 query zeroes 24 bytes of cap_user_data_t and returns 0
+        ctx.mem_write(0x2120, &[0xFFu8; 24]).unwrap();
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 125 /* capget */, 0x2100, 0x2120, 0, 0, 0, 0),
+            0
+        );
+        let mut cap_data = [0u8; 24];
+        ctx.mem_read(0x2120, &mut cap_data).unwrap();
+        assert!(cap_data.iter().all(|&b| b == 0));
+
+        // 3. SYS_EPOLL_CTL (233): returns -EPERM (-1) on regular files, 0 on eventfd/stdin
+        let epfd = handle_syscall(&mut ctx, &mut state, 291 /* epoll_create1 */, 0, 0, 0, 0, 0, 0);
+        assert!(epfd >= 3);
+        ctx.mem_write(0x2200, b"/tmp/regular.txt\0").unwrap();
+        let reg_fd = handle_syscall(
+            &mut ctx,
+            &mut state,
+            257, /* openat */
+            -100,
+            0x2200,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert!(reg_fd >= 3);
+        let mut ev = [0u8; 12];
+        ev[0..4].copy_from_slice(&1u32.to_le_bytes()); // EPOLLIN
+        ctx.mem_write(0x2240, &ev).unwrap();
+        assert_eq!(
+            handle_syscall(
+                &mut ctx,
+                &mut state,
+                233, /* epoll_ctl */
+                epfd,
+                1, /* EPOLL_CTL_ADD */
+                reg_fd,
+                0x2240,
+                0,
+                0,
+            ),
+            -1 // -EPERM
+        );
+        // stdin (fd 0) is supported
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 233, epfd, 1, 0, 0x2240, 0, 0),
+            0
+        );
+    }
+
+    #[test]
+    fn test_alloc_pid_tid_unified_namespace_and_reset() {
+        use crate::scheduler::MAIN_PID;
+        let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+
+        // Interleaved alloc_pid() and alloc_tid() must share one strictly
+        // monotonic, disjoint namespace starting at MAIN_PID + 1.
+        let p1 = state.alloc_pid();
+        let p2 = state.alloc_pid();
+        let t1 = state.alloc_tid();
+        let t2 = state.alloc_tid();
+        let p3 = state.alloc_pid();
+        let t3 = state.alloc_tid();
+
+        assert_eq!(
+            [p1, p2, t1, t2, p3, t3],
+            [
+                MAIN_PID + 1,
+                MAIN_PID + 2,
+                MAIN_PID + 3,
+                MAIN_PID + 4,
+                MAIN_PID + 5,
+                MAIN_PID + 6,
+            ]
+        );
+        assert_eq!(state.next_pid, MAIN_PID + 7);
+        assert_eq!(state.next_tid, MAIN_PID + 7);
+
+        // reset_for_new_run() must reset both counters cleanly to MAIN_PID + 1
+        // and subsequent interleaved allocations must remain disjoint.
+        state.reset_for_new_run();
+        assert_eq!(state.next_pid, MAIN_PID + 1);
+        assert_eq!(state.next_tid, MAIN_PID + 1);
+
+        let rt1 = state.alloc_tid();
+        let rp1 = state.alloc_pid();
+        let rt2 = state.alloc_tid();
+        let rp2 = state.alloc_pid();
+        assert_eq!(
+            [rt1, rp1, rt2, rp2],
+            [MAIN_PID + 1, MAIN_PID + 2, MAIN_PID + 3, MAIN_PID + 4]
+        );
+        assert_eq!(state.next_pid, MAIN_PID + 5);
+        assert_eq!(state.next_tid, MAIN_PID + 5);
+    }
 }

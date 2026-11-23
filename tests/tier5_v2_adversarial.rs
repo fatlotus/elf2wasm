@@ -104,6 +104,11 @@ fn synth_image(entry_rip: u32, code: Vec<u8>) -> LoadedImage {
         so_files: vec![],
         symbols: HashMap::new(),
         elf_path: "synth".to_string(),
+        brk_start: elf2wasm_core::meta::DEFAULT_BRK_START,
+        mmap_start: elf2wasm_core::meta::DEFAULT_MMAP_START,
+        mmap_end: elf2wasm_core::meta::DEFAULT_MMAP_END,
+        stack_top: elf2wasm_core::meta::DEFAULT_STACK_TOP,
+        dispatch_hash_addr: elf2wasm_core::meta::DEFAULT_DISPATCH_HASH_ADDR,
     }
 }
 
@@ -374,6 +379,11 @@ fn test_t5_v2_decoder_pt_dynamic_dt_init_fini_and_malformed_offset() {
         ],
         symbols: HashMap::new(),
         elf_path: "main".to_string(),
+        brk_start: elf2wasm_core::meta::DEFAULT_BRK_START,
+        mmap_start: elf2wasm_core::meta::DEFAULT_MMAP_START,
+        mmap_end: elf2wasm_core::meta::DEFAULT_MMAP_END,
+        stack_top: elf2wasm_core::meta::DEFAULT_STACK_TOP,
+        dispatch_hash_addr: elf2wasm_core::meta::DEFAULT_DISPATCH_HASH_ADDR,
     };
 
     let prog = discover_code(&image).unwrap();
@@ -417,6 +427,11 @@ fn test_t5_v2_decoder_split_indirect_targets_jump_table_and_endbr64() {
         so_files: vec![],
         symbols: HashMap::new(),
         elf_path: "main".to_string(),
+        brk_start: elf2wasm_core::meta::DEFAULT_BRK_START,
+        mmap_start: elf2wasm_core::meta::DEFAULT_MMAP_START,
+        mmap_end: elf2wasm_core::meta::DEFAULT_MMAP_END,
+        stack_top: elf2wasm_core::meta::DEFAULT_STACK_TOP,
+        dispatch_hash_addr: elf2wasm_core::meta::DEFAULT_DISPATCH_HASH_ADDR,
     };
 
     let mut prog = discover_code(&image).unwrap();
@@ -513,7 +528,7 @@ fn test_t5_v2_emit_wasm_empty_program_validates() {
         blocks: BTreeMap::new(),
         functions: BTreeMap::new(),
         indirect_targets: vec![],
-        instr_to_block: Default::default(),
+        instr_bitmap: Default::default(),
     };
     let wasm_bytes = emit_wasm(&image, &prog).unwrap();
     let engine = Engine::default();
@@ -865,6 +880,11 @@ fn test_t5_v2_runtime_wasm_pre_init_and_null_bounds() {
         so_files: vec![],
         symbols: vec![],
         elf_path: "/bin/test".to_string(),
+        brk_start: elf2wasm_core::meta::DEFAULT_BRK_START,
+        mmap_start: elf2wasm_core::meta::DEFAULT_MMAP_START,
+        mmap_end: elf2wasm_core::meta::DEFAULT_MMAP_END,
+        stack_top: elf2wasm_core::meta::DEFAULT_STACK_TOP,
+        dispatch_hash_addr: elf2wasm_core::meta::DEFAULT_DISPATCH_HASH_ADDR,
     }
     .encode();
     let meta_ptr = alloc.call(&mut store, meta.len() as i32).unwrap();
@@ -909,6 +929,11 @@ fn test_t5_v2_runtime_wasm_fork_exec_and_syscall_bounds() {
         so_files: vec![],
         symbols: vec![],
         elf_path: "/bin/parent".to_string(),
+        brk_start: elf2wasm_core::meta::DEFAULT_BRK_START,
+        mmap_start: elf2wasm_core::meta::DEFAULT_MMAP_START,
+        mmap_end: elf2wasm_core::meta::DEFAULT_MMAP_END,
+        stack_top: elf2wasm_core::meta::DEFAULT_STACK_TOP,
+        dispatch_hash_addr: elf2wasm_core::meta::DEFAULT_DISPATCH_HASH_ADDR,
     }
     .encode();
     let meta_ptr = alloc.call(&mut store, meta.len() as i32).unwrap();
@@ -1460,6 +1485,11 @@ fn test_v2_adv_multiproc_fork_pipe_refcount_wait4_and_vfork() {
         so_files: vec![],
         symbols: vec![],
         elf_path: "/tmp/child_elf".to_string(),
+        brk_start: elf2wasm_core::meta::DEFAULT_BRK_START,
+        mmap_start: elf2wasm_core::meta::DEFAULT_MMAP_START,
+        mmap_end: elf2wasm_core::meta::DEFAULT_MMAP_END,
+        stack_top: elf2wasm_core::meta::DEFAULT_STACK_TOP,
+        dispatch_hash_addr: elf2wasm_core::meta::DEFAULT_DISPATCH_HASH_ADDR,
     };
     state.complete_exec(&mut ctx, vchild, &meta, &["/tmp/child_elf".into()], &[]).unwrap();
     assert!(state.pending_action.is_none());

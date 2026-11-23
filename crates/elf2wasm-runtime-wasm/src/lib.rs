@@ -584,6 +584,7 @@ pub extern "C" fn runtime_init_guest_stack(
     let (args, env) = decode_args_and_env(args_bytes, &meta.elf_path);
 
     state.reset_for_new_run();
+    state.apply_meta_layout(&meta);
     state.vfs.set_so_files(&meta.so_files);
     state.vfs.elf_path = meta.elf_path.clone();
     state.vfs.cmdline = args.clone();
@@ -868,17 +869,17 @@ pub extern "C" fn runtime_push_stdin(ptr: *const u8, len: usize) -> i32 {
             return -1;
         }
         let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
-        state.vfs.push_stdin(bytes);
+        state.push_stdin(bytes);
+    } else {
+        state.wake_ready_waiters();
     }
-    state.wake_ready_waiters();
     0
 }
 
 #[no_mangle]
 pub extern "C" fn runtime_close_stdin() {
     if let Some(state) = state_mut() {
-        state.vfs.close_stdin();
-        state.wake_ready_waiters();
+        state.close_stdin();
     }
 }
 

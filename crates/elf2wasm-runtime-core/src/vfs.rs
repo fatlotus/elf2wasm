@@ -895,7 +895,11 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
                 return true;
             }
         }
-        for key in self.overlay.keys() {
+        if let Some((key, _)) = self
+            .overlay
+            .range::<str, _>((std::ops::Bound::Included(prefix_slash.as_str()), std::ops::Bound::Unbounded))
+            .next()
+        {
             if key.starts_with(&prefix_slash) {
                 return true;
             }
@@ -977,22 +981,26 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
             format!("{}/", norm_path)
         };
 
-        // 1. Overlay direct children
-        for (path, node) in &self.overlay {
-            if let Some(rest) = path.strip_prefix(&prefix_slash) {
-                if !rest.is_empty() && !rest.contains('/') && !seen.contains(rest) {
-                    seen.insert(rest.to_string());
-                    let d_type = match node {
-                        OverlayNode::Dir { .. } => DT_DIR,
-                        OverlayNode::File { .. } => DT_REG,
-                        OverlayNode::Symlink { .. } => DT_LNK,
-                    };
-                    entries.push(DirEntry {
-                        d_ino: path_hash(path),
-                        d_type,
-                        name: rest.to_string(),
-                    });
-                }
+        // 1. Overlay direct children (O(log N) range scan)
+        for (path, node) in self.overlay.range::<str, _>((
+            std::ops::Bound::Included(prefix_slash.as_str()),
+            std::ops::Bound::Unbounded,
+        )) {
+            let Some(rest) = path.strip_prefix(&prefix_slash) else {
+                break;
+            };
+            if !rest.is_empty() && !rest.contains('/') && !seen.contains(rest) {
+                seen.insert(rest.to_string());
+                let d_type = match node {
+                    OverlayNode::Dir { .. } => DT_DIR,
+                    OverlayNode::File { .. } => DT_REG,
+                    OverlayNode::Symlink { .. } => DT_LNK,
+                };
+                entries.push(DirEntry {
+                    d_ino: path_hash(path),
+                    d_type,
+                    name: rest.to_string(),
+                });
             }
         }
 
@@ -2548,7 +2556,15 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
                     return -EISDIR;
                 }
                 let prefix = format!("{}/", norm_path);
-                if self.overlay.keys().any(|k| k.starts_with(&prefix)) {
+                if self
+                    .overlay
+                    .range::<str, _>((
+                        std::ops::Bound::Included(prefix.as_str()),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .next()
+                    .is_some_and(|(k, _)| k.starts_with(&prefix))
+                {
                     return -ENOTEMPTY;
                 }
             }
@@ -2628,7 +2644,15 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
                 ) => return -EISDIR,
                 (OverlayNode::Dir { .. }, OverlayNode::Dir { .. }) => {
                     let new_prefix = format!("{}/", new_norm);
-                    if self.overlay.keys().any(|k| k.starts_with(&new_prefix)) {
+                    if self
+                        .overlay
+                        .range::<str, _>((
+                            std::ops::Bound::Included(new_prefix.as_str()),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .next()
+                        .is_some_and(|(k, _)| k.starts_with(&new_prefix))
+                    {
                         return -ENOTEMPTY;
                     }
                 }

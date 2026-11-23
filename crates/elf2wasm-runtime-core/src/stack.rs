@@ -1,7 +1,5 @@
 use crate::context::GuestContext;
-use crate::syscalls::MMAP_END;
 use anyhow::{bail, Context, Result};
-use elf2wasm_core::elf_loader::STACK_TOP;
 use elf2wasm_core::meta::WasmMeta;
 
 #[derive(Debug, Clone, Default)]
@@ -75,10 +73,15 @@ pub fn extract_elf2wasm_meta(wasm_bytes: &[u8]) -> Result<WasmMeta> {
     bail!("Missing elf2wasm_meta custom section in WASM module");
 }
 
-fn push_bytes_ctx(ctx: &mut dyn GuestContext, sp: &mut u32, data: &[u8]) -> Result<u32> {
+fn push_bytes_ctx(
+    ctx: &mut dyn GuestContext,
+    sp: &mut u32,
+    stack_min: u32,
+    data: &[u8],
+) -> Result<u32> {
     let len = u32::try_from(data.len()).context("Guest stack item too large")?;
     let new_sp = sp.checked_sub(len).context("Guest stack underflow")?;
-    if new_sp < MMAP_END {
+    if new_sp < stack_min {
         bail!("Guest stack overflow into mmap region");
     }
     *sp = new_sp;
@@ -87,10 +90,15 @@ fn push_bytes_ctx(ctx: &mut dyn GuestContext, sp: &mut u32, data: &[u8]) -> Resu
     Ok(*sp)
 }
 
-fn push_cstr_ctx(ctx: &mut dyn GuestContext, sp: &mut u32, s: &str) -> Result<u32> {
+fn push_cstr_ctx(
+    ctx: &mut dyn GuestContext,
+    sp: &mut u32,
+    stack_min: u32,
+    s: &str,
+) -> Result<u32> {
     let mut bytes = s.as_bytes().to_vec();
     bytes.push(0);
-    push_bytes_ctx(ctx, sp, &bytes)
+    push_bytes_ctx(ctx, sp, stack_min, &bytes)
 }
 
 fn write_u64_ctx(ctx: &mut dyn GuestContext, addr: u32, val: u64) -> Result<()> {
@@ -115,35 +123,36 @@ pub fn setup_guest_stack_ctx_with_ids(
     uid: u32,
     gid: u32,
 ) -> Result<u32> {
-    let mut sp = STACK_TOP;
+    let stack_min = meta.mmap_end;
+    let mut sp = meta.stack_top;
 
     let rand_bytes: [u8; 16] = [
         0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8,
         0x09,
     ];
-    let _random_addr = push_bytes_ctx(ctx, &mut sp, &rand_bytes)?;
+    let _random_addr = push_bytes_ctx(ctx, &mut sp, stack_min, &rand_bytes)?;
     sp &= !0xF;
     ctx.mem_write(sp as u64, &rand_bytes)
         .map_err(|e| anyhow::anyhow!("mem_write failed for AT_RANDOM: {}", e))?;
     let random_addr = sp;
 
-    let platform_addr = push_cstr_ctx(ctx, &mut sp, "x86_64")?;
+    let platform_addr = push_cstr_ctx(ctx, &mut sp, stack_min, "x86_64")?;
     let execfn_str = if !meta.elf_path.is_empty() {
         meta.elf_path.as_str()
     } else {
         args.first().map(|s| s.as_str()).unwrap_or("app")
     };
-    let execfn_addr = push_cstr_ctx(ctx, &mut sp, execfn_str)?;
+    let execfn_addr = push_cstr_ctx(ctx, &mut sp, stack_min, execfn_str)?;
 
     let mut env_ptrs = Vec::with_capacity(env.len());
     for e in env.iter().rev() {
-        env_ptrs.push(push_cstr_ctx(ctx, &mut sp, e)?);
+        env_ptrs.push(push_cstr_ctx(ctx, &mut sp, stack_min, e)?);
     }
     env_ptrs.reverse();
 
     let mut arg_ptrs = Vec::with_capacity(args.len());
     for a in args.iter().rev() {
-        arg_ptrs.push(push_cstr_ctx(ctx, &mut sp, a)?);
+        arg_ptrs.push(push_cstr_ctx(ctx, &mut sp, stack_min, a)?);
     }
     arg_ptrs.reverse();
 
@@ -192,7 +201,7 @@ pub fn setup_guest_stack_ctx_with_ids(
             .checked_sub(8)
             .context("Guest stack alignment underflow")?;
     }
-    if rsp < MMAP_END {
+    if rsp < stack_min {
         bail!("Guest stack overflow into mmap region");
     }
 
