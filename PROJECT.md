@@ -95,6 +95,16 @@ Every Survey feature from Explorers 1, 2, and 3 is assigned a milestone below (z
 | F12 | Interactive Web Shell Home Page (Default Alpine Linux) & VT100 Terminal UI | Build self-hosted (zero CDN) `web/index.html`, `web/app.mjs`, `web/terminal.mjs`, `web/styles.css`: image input defaulting to `alpine:latest` with presets, optional cmd/env/workdir overrides, live client-side fetch/unpack/compile/run progress indicator, interactive ANSI/VT100 terminal (Ctrl+C, Ctrl+D, Ctrl+L, backspace, resize, paste, scrolling), `window.Elf2WasmDocker` & `window.runDockerImage` global hooks, and optional manual file-upload drawer. | M4 | Survey 1 (F5), Survey 3 (W5) |
 | F13 | Cloudflare Workers Full-App Deployment (OCI Proxy + Static Assets + WASM) | Extract pure ESM `server/proxy_core.mjs` shared by Node (`server/registry_proxy.mjs`) and Cloudflare Workers (`worker/src/index.mjs`); implement streaming Web-standard `fetch()` proxy (`/api/health`, `/api/v2/*`), SSRF checks, Bearer token exchange/cache, cross-origin redirect `Authorization` stripping, same-origin / configurable `ALLOWED_ORIGINS` CORS, COOP/COEP/CORP/nosniff headers, `worker/scripts/build_assets.mjs` staging `web/`, `js/`, and `/wasm/*.wasm` + `_headers` into `worker/dist/` for Workers Static Assets (`name: elf2wasm`), optional runtime `registryProxyBase` override in `web/app.mjs`, and automated Worker tests. | M6 | Survey 1, Survey 2, Survey 3, User Update |
 | F14 | GitHub Actions Rust/WASM Build & Auto-Deploy Pipeline | Add `.github/workflows/deploy-worker.yml` building `wasm32-unknown-unknown` release WASM binaries, staging static assets, running Node & Worker tests + `wrangler deploy --dry-run` on PRs, and auto-deploying via `cloudflare/wrangler-action@v4` (`CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID`) on `push` to `main` (and `workflow_dispatch`), with concurrency guard and `.gitignore` updates. | M6 | Survey 2, Survey 3, User Update |
+| F15 | WASM Toolchain Build (`wasm32-unknown-unknown`) | Install `wasm32-unknown-unknown` Rust target and build release `elf2wasm_compiler_wasm.wasm` and `elf2wasm_runtime_wasm.wasm` artifacts. | M7 | Survey 1 (1.1–1.2), Survey 2 (1.2), Survey 3 (3) |
+| F16 | Dynamic Guest VA Layout & Expanded Guest Memory (>256 MiB) | Add `brk_start`, `mmap_start`, `mmap_end`, `stack_top`, `dispatch_hash_addr` to `WasmMeta` (`meta.rs`); compute dynamic VA layout in `elf_loader.rs` and `wasm_emit.rs` so >108 MiB `ET_EXEC`/`ET_DYN` binaries (`node:22-slim`) load without `BRK_START` overflow while preserving 256 MiB footprint for small binaries; consume `WasmMeta` layout fields in `syscalls.rs`, `stack.rs`, `scheduler.rs`. | M7 | Survey 1 (1.4), Survey 3 (1.5, 4.2 Phase 1) |
+| F17 | Compiler Peak Memory & `.wasm` Size Scaling for Large Binaries (`node`) | Optimize `decoder.rs` and `wasm_emit.rs` (compact block representation + on-the-fly chunk decoding/emission, avoid redundant allocations) so `elf2wasm_compiler_wasm.wasm` (wasm32) compiles `node:22-slim`'s 38.5 MiB `.text` without OOM and V8 `WebAssembly.compile` succeeds. | M7 | Survey 3 (1.7, 4.2 Phase 3) |
+| F18 | 64 KiB `.so` VA Alignment & Quantum/VFS Performance | Change `.so` VA span alignment in `elf_loader.rs` from 1 MiB to 64 KiB so dozens of Python `lib-dynload/*.so` extensions fit easily; raise `DEFAULT_QUANTUM` (`lifter.rs` + `wasm_emit.rs` test); optimize `vfs.rs` `is_virtual_parent_dir` and `build_dir_entries` with `BTreeMap::range`. | M7 | Survey 2 (1.6, 4.2, 4.3) |
+| F19 | Canonical TTY Echo & Line Editing (`ICANON | ECHO`) | Implement canonical TTY input echo (`\r` → `\r\n` with `ICRNL`, `\x7f`/`\x08` → `\x08 \x08`) and line buffering in `vfs.rs`/`syscalls.rs` when `tty.enabled` and `ECHO`/`ICANON` are set, preserving raw mode passthrough for shells like `ash`. | M7 | Survey 2 (1.3, 4.4) |
+| F20 | Node.js / V8 / libuv Runtime Syscalls & Instruction Coverage | Lower `RLIMIT_STACK` (`syscalls.rs`) from 8 MiB to 2 MiB; stub `SYS_CAPGET` (125); return `-EPERM` in `SYS_EPOLL_CTL` on regular files; fix missing x86-64/SSE2 saturating instructions and runtime syscall/PID-TID allocation edge cases encountered when executing real `node:22-slim` (`--jitless`) and `python:3.12-slim` binaries. | M7 | Survey 3 (1.6, 4.2 Phase 2) |
+| F21 | Non-Blocking Time-Based Macrotask Yielding & `NeedStdin` Race Fix | Replace `setTimeout(0)` with `MessageChannel` (with fallback) in `js/elf2wasm_shim.mjs`; remove unconditional `steps % yieldEvery === 0` macrotask yield in favor of 16 ms wall-clock yielding (eliminating 81.2s Chrome startup hang on `python:3.12-slim`); fix `NeedStdin` lost-wakeup race via `_inputSignaled`. | M8 | Survey 2 (1.4, 1.6, 4.1) |
+| F22 | Python `lib-dynload/*.so` Core Stdlib Auto-Bundling | Update `_resolveElfSos()` in `js/elf2wasm_shim.mjs` to auto-discover and bundle core Python `lib-dynload/*.so` C extensions (and their transitive `DT_NEEDED` libraries) for `python3*` executables so `math`, `random`, `datetime`, `pathlib`, `zlib`, `base64`, `struct`, `csv`, `hashlib`, `urllib.parse`, `subprocess`, `tempfile`, `readline`, etc. import cleanly. | M8 | Survey 1 (1.5), Survey 2 (1.5, 4.3) |
+| F23 | Node.js Default `--jitless` Env Injection & Browser VFS Memory Hygiene | In `js/docker_sdk.mjs`, inject overridable defaults (`NODE_OPTIONS=--jitless --v8-pool-size=1 --no-experimental-strip-types`, `MALLOC_ARENA_MAX=1`, `UV_USE_IO_URING=0`, `UV_THREADPOOL_SIZE=1`) for Node.js images/executables; release raw `tarBytes` after VFS extraction in `js/elf2wasm_shim.mjs` to minimize browser RAM usage on 232 MB images. | M8 | Survey 3 (1.6, 4.2 Phase 2–3) |
+| F24 | Web UI Presets for `python:3.12-slim` and `node:22-slim` | Add `<button type="button" class="preset-chip" data-image="python:3.12-slim">python:3.12-slim</button>` and `<button type="button" class="preset-chip" data-image="node:22-slim">node:22-slim</button>` to `.presets-row` in `web/index.html` (and wire `web/app.mjs` if needed); verify both presets end-to-end in Node SDK and headless Chrome Web UI. | M8 | Survey 1 (1.3), Survey 2 (4.5), Survey 3 (4.1–4.2) |
 
 ## Milestones
 
@@ -106,6 +116,9 @@ Every Survey feature from Explorers 1, 2, and 3 is assigned a milestone below (z
 | M4 | Interactive Web Shell Home Page & VT100 Terminal UI | `web/index.html`, `web/app.mjs`, `web/terminal.mjs`, `web/styles.css`; feature F12 | M2, M3 | DONE (`sub_orch_m4` gate passed; 30/30 Chrome probes, T4.1–T4.4 pass, Auditor CLEAN) |
 | M5 | Final Milestone (E2E Pass Tiers 1–4 + Tier 5 Adversarial Hardening) | Pass 100% of `TEST_READY.md` E2E suite (Tiers 1–4) + Tier 5 adversarial hardening across all modules | M1, M2, M3, M4, TEST_READY.md | DONE (Phase 1 Tiers 1–4: 47/47 PASS; Phase 2 Tier 5: 10/10 PASS, 158/158 total tests, both Fresh Challengers `NO_GAPS`, Whole-Project Auditor `CLEAN`) |
 | M6 | Cloudflare Workers Full-App (Proxy + Static Assets + WASM) & GitHub Auto-Deploy | `server/proxy_core.mjs`, `server/registry_proxy.mjs`, `worker/**`, `.github/workflows/deploy-worker.yml`, `.gitignore`, `web/app.mjs`; features F13–F14 | M1, M2, M4 | DONE (Iteration 2 gate passed: 26/26 server tests, 25/25 worker tests, WASM 0.81+0.52 MiB staged, `wrangler deploy --dry-run` PASS, 2/2 Reviewers APPROVE, 2/2 Challengers APPROVE, Auditor CLEAN) |
+| M7 | Rust Core, Compiler & Runtime Upgrades for `python:3.12-slim` and `node:22-slim` | `crates/elf2wasm-core`, `crates/elf2wasm-compiler-wasm`, `crates/elf2wasm-runtime-core`, `crates/elf2wasm-runtime-wasm`, `src/runtime.rs`; features F15–F20; verify native & wasm32 compilation + execution of both `python:3.12-slim` and `node:22-slim` | none | DONE (`sub_orch_m6` Iter 2 gate passed 5/5 unanimous; 65/65 Rust unit tests, wasm32 release builds, live `python:3.12-slim` & `node:22-slim` verified native + wasm32 + V8 compile, Auditor CLEAN) |
+| M8 | JS Shim, Docker SDK & Web UI Presets for `python:3.12-slim` and `node:22-slim` | `js/elf2wasm_shim.mjs`, `js/docker_sdk.mjs`, `js/test_docker_sdk.mjs`, `web/index.html`, `web/app.mjs`; features F21–F24; verify Node SDK + Chrome Web UI presets & interactive REPLs | M7 | DONE (`sub_orch_m7` Iter 1 gate passed 5/5 unanimous; 20/20 SDK tests, 26/26 server tests, 65/65 Rust tests, live Python & Node Chrome UI presets + REPLs verified, Auditor CLEAN) |
+| M9 | Final Milestone — Python & Node E2E Suite Pass (Tiers 1–4) + Tier 5 Adversarial Hardening | Pass 100% of updated `TEST_READY.md` E2E suite (existing + Python/Node Tiers 1–4) + Tier 5 adversarial hardening | M7, M8, TEST_READY.md | DONE (Phase 1 Tiers 1–4: 71/71 E2E PASS + 5/5 self-test; Phase 2 Tier 5: 14/14 PASS, 67/67 Rust lib, 24/24 SDK, 26/26 Server = 207/207 total tests PASS, both Fresh Challengers `NO_GAPS`, Whole-Project Forensic Auditor `CLEAN`) |
 
 ## Interface Contracts
 
@@ -174,7 +187,7 @@ Exported from `/js/docker_sdk.mjs`:
   - `stop() -> Promise<void>`
 - `runDockerImage(imageRef, options?)` → `Promise<{ exitCode: number, stdout: string, stderr: string }>` (high-level one-shot helper)
 
-### 4. Web UI DOM & Global Hooks (`M4` ↔ `E2E`)
+### 4. Web UI DOM & Global Hooks (`M4` / `M7` ↔ `E2E`)
 - `window.Elf2WasmDocker` and `window.runDockerImage` exposed on `window`.
 - Key stable DOM `id` attributes in `web/index.html`:
   - `#image-input` (input defaulting to `alpine:latest`)
@@ -184,3 +197,20 @@ Exported from `/js/docker_sdk.mjs`:
   - `#clear-btn` (button to clear terminal)
   - `#status-text` / `#progress-bar` (live client-side stage & progress display)
   - `#terminal` (interactive VT100 terminal container with accessible output text and keyboard focus)
+- `.presets-row` quick-preset chips (`button.preset-chip[data-image]`):
+  - `alpine:latest`
+  - `busybox:latest`
+  - `debian:bookworm-slim`
+  - `python:3.12-slim` (added in M7)
+  - `node:22-slim` (added in M7)
+
+### 5. `WasmMeta` Dynamic Guest VA Layout (`M6` ↔ `M7`)
+- `WasmMeta` (`crates/elf2wasm-core/src/meta.rs`) carries dynamic guest layout fields (`brk_start: u32`, `mmap_start: u32`, `mmap_end: u32`, `stack_top: u32`, `dispatch_hash_addr: u32`) with backward-compatible defaults matching the legacy 256 MiB map (`0x0500_0000`, `0x0800_0000`, `0x0B00_0000`, `0x0BFF_0000`, `0x0C00_0000`) when binaries fit in 256 MiB, and dynamically expanding for large binaries (`node:22-slim`, ~108 MiB `ET_EXEC`).
+- `elf2wasm-runtime-core` reads these fields from `WasmMeta` instead of hardcoded constants.
+
+### 6. Node.js Default Runtime Environment (`M7` ↔ `E2E`)
+- When `createContainer()` (`js/docker_sdk.mjs`) runs a Node.js image (detected via `NODE_VERSION` in image env or `node` executable basename), it injects default environment variables (strictly overridable by user-supplied `options.env`):
+  - `NODE_OPTIONS=--jitless --v8-pool-size=1`
+  - `MALLOC_ARENA_MAX=1`
+  - `UV_USE_IO_URING=0`
+  - `UV_THREADPOOL_SIZE=1`
