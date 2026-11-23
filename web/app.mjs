@@ -4,6 +4,13 @@
 
 import { Elf2WasmDocker, runDockerImage, parseImageRef } from "/js/docker_sdk.mjs";
 import { VT100Terminal } from "/web/terminal.mjs";
+import {
+  DEFAULT_UI_STATE,
+  parseEnvLines,
+  parseStateFromSearch,
+  serializeStateToSearch,
+  matchProjectPreset,
+} from "./url_state.mjs";
 
 // Immediately expose JS SDK globals on window (before any async work)
 window.Elf2WasmDocker = Elf2WasmDocker;
@@ -95,6 +102,7 @@ const repoRefInput = document.getElementById("repo-ref-input");
 const repoMountInput = document.getElementById("repo-mount-input");
 const envInput = document.getElementById("env-input");
 const cwdInput = document.getElementById("cwd-input");
+const advancedOptionsEl = document.getElementById("advanced-options");
 const startBtn = document.getElementById("start-btn");
 const stopBtn = document.getElementById("stop-btn");
 const clearBtn = document.getElementById("clear-btn");
@@ -421,19 +429,6 @@ function splitShellArgs(str) {
   return args;
 }
 
-function parseEnvLines(text) {
-  const result = [];
-  for (const rawLine of String(text || "").split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-    const eq = line.indexOf("=");
-    if (eq > 0) {
-      result.push(line);
-    }
-  }
-  return result;
-}
-
 async function stopActiveSession({ updateUi = true } = {}) {
   if (activeAbortController) {
     try {
@@ -653,9 +648,87 @@ async function bootImage({ imageRef, tarball = null, cmdStr = null, envList = nu
   }
 }
 
+let isHydrating = false;
+
+function readStateFromControls() {
+  return {
+    image: imageInput.value.trim() || DEFAULT_UI_STATE.image,
+    cmd: cmdInput.value.trim(),
+    repo: repoInput ? repoInput.value.trim() : "",
+    ref: repoRefInput ? repoRefInput.value.trim() : "",
+    mount: (repoMountInput ? repoMountInput.value.trim() : "") || DEFAULT_UI_STATE.mount,
+    cwd: cwdInput.value.trim(),
+    env: parseEnvLines(envInput.value),
+  };
+}
+
+function setActiveProjectPreset(activePresetId) {
+  for (const c of projectPresetChips) {
+    c.dataset.active = activePresetId && c.dataset.preset === activePresetId ? "true" : "false";
+  }
+}
+
+function updateIdleDisplayFromState(state) {
+  if (activeContainer || activeAbortController || !containerExited) {
+    return;
+  }
+  if (statusText && statusPill?.dataset.state === "idle") {
+    statusText.textContent = `Idle — click Start Shell to boot ${state.image}`;
+  }
+  if (terminalTitleEl) {
+    const repoSuffix = state.repo ? ` + ${state.repo}@${state.ref || "HEAD"}` : "";
+    const displayCmd = state.cmd || "/bin/sh";
+    terminalTitleEl.textContent = `${state.image}${repoSuffix} — ${displayCmd}`;
+  }
+}
+
+function syncUrlFromControls({ push = false } = {}) {
+  if (isHydrating) return;
+  const nextSearch = serializeStateToSearch(readStateFromControls(), {
+    existingSearch: window.location.search,
+  });
+  if (nextSearch === window.location.search) return;
+  const nextUrl = `${window.location.pathname}${nextSearch}${window.location.hash}`;
+  try {
+    if (push) {
+      window.history.pushState(null, "", nextUrl);
+    } else {
+      window.history.replaceState(null, "", nextUrl);
+    }
+  } catch {
+    // Ignore History API errors in restricted environments
+  }
+}
+
+function applyStateToControls(state, activePresetId) {
+  isHydrating = true;
+  try {
+    imageInput.value = state.image;
+    cmdInput.value = state.cmd;
+    if (repoInput) repoInput.value = state.repo;
+    if (repoRefInput) repoRefInput.value = state.ref;
+    if (repoMountInput) repoMountInput.value = state.mount;
+    cwdInput.value = state.cwd;
+    envInput.value = state.env.join("\n");
+    setActiveProjectPreset(activePresetId);
+    if (advancedOptionsEl) {
+      advancedOptionsEl.open = state.cwd.length > 0 || state.env.length > 0;
+    }
+    updateIdleDisplayFromState(state);
+  } finally {
+    isHydrating = false;
+  }
+}
+
+function applyStateFromUrl() {
+  const { state, activePresetId } = parseStateFromSearch(window.location.search, PROJECT_PRESETS);
+  applyStateToControls(state, activePresetId);
+}
+
 async function startFromControls() {
   const imageRef = imageInput.value.trim() || "alpine:latest";
   imageInput.value = imageRef;
+  syncUrlFromControls({ push: false });
   await bootImage({ imageRef });
 }
 
@@ -697,10 +770,30 @@ for (const inputEl of [repoInput, repoRefInput, repoMountInput]) {
   });
 }
 
+function handleControlChange() {
+  if (isHydrating) return;
+  const state = readStateFromControls();
+  setActiveProjectPreset(matchProjectPreset(state, PROJECT_PRESETS));
+  updateIdleDisplayFromState(state);
+  syncUrlFromControls({ push: false });
+}
+
+for (const controlEl of [
+  imageInput,
+  cmdInput,
+  repoInput,
+  repoRefInput,
+  repoMountInput,
+  envInput,
+  cwdInput,
+]) {
+  if (!controlEl) continue;
+  controlEl.addEventListener("input", handleControlChange);
+  controlEl.addEventListener("change", handleControlChange);
+}
+
 function clearActiveProjectPreset() {
-  for (const c of projectPresetChips) {
-    c.dataset.active = "false";
-  }
+  setActiveProjectPreset(null);
 }
 
 for (const chip of presetChips) {
@@ -716,6 +809,8 @@ for (const chip of presetChips) {
       cwdInput.value = "";
       envInput.value = "";
       imageInput.focus();
+      updateIdleDisplayFromState(readStateFromControls());
+      syncUrlFromControls({ push: true });
     }
   });
 }
@@ -734,8 +829,17 @@ for (const chip of projectPresetChips) {
     cwdInput.value = preset.cwd || preset.mountPath || "/workspace";
     envInput.value = Array.isArray(preset.env) ? preset.env.join("\n") : "";
     startBtn.focus();
+    updateIdleDisplayFromState(readStateFromControls());
+    syncUrlFromControls({ push: true });
   });
 }
+
+window.addEventListener("popstate", () => {
+  applyStateFromUrl();
+});
+
+// Synchronously hydrate UI controls from URL query parameters on initial load (never auto-boot)
+applyStateFromUrl();
 
 // ---------------------------------------------------------------------------
 // Secondary Manual Local Archive / ELF64 Upload Drawer
