@@ -148,6 +148,26 @@ Open `http://127.0.0.1:8080/` in your browser:
 2. Run interactive shell commands in the built-in VT100 web terminal — all layer decompression, ELF64-to-WASM compilation, and execution happen 100% client-side.
 3. Call `window.Elf2WasmDocker` or `window.runDockerImage("alpine:latest", { cmd: ["/bin/sh", "-c", "uname -a"] })` directly from JavaScript (or import `/js/docker_sdk.mjs`).
 
+#### URL Query-Parameter Deep-Linking
+
+All shareable Web UI options automatically sync with the browser URL query string (`?query`) so you can copy and share a direct link to any container + Git repository coding project (for security, opening a deep link populates the form without auto-booting the container):
+
+| Parameter | Default (omitted) | Description |
+|---|---|---|
+| `image` | `alpine:latest` | Docker / OCI image reference (e.g. `python:3.12-slim`) |
+| `cmd` | *(image default)* | Optional command override |
+| `repo` | *(none)* | Git repository overlay (`owner/repo` or forge URL) |
+| `ref` | `HEAD` | Branch, tag, or commit SHA (only serialized when `repo` is set; `repoRef` also accepted on read) |
+| `mount` | `/workspace` | Guest mount path for the Git repo (only serialized when `repo` is set; `repoMount` also accepted on read) |
+| `cwd` | *(image default)* | Working directory (auto-opens Advanced Options on load) |
+| `env` | *(none)* | Repeatable `KEY=VALUE` parameter (e.g. `?env=FOO=1&env=BAR=2`; auto-opens Advanced Options on load) |
+| `preset` | *(none)* | Read-only shorthand (`python-bottle`, `js-nanoid`, `rust-nushell`) expanded on load; any explicit parameter overrides the preset |
+
+Example shareable link:
+```
+/?image=python:3.12-slim&repo=bottlepy/bottle&ref=0.13.4&cmd=python3+-m+unittest+discover+-s+test+-t+.&cwd=/workspace&env=PYTHONUNBUFFERED=1
+```
+
 ---
 
 ## Exhaustive WASM ABI Documentation
