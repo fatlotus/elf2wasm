@@ -807,3 +807,268 @@ describe("Static Assets Staging Script (worker/scripts/build_assets.mjs)", () =>
     }
   });
 });
+
+describe("Cloudflare Worker: Docker Hub 429 Mirror Fallback", () => {
+  it("falls back to mirror.gcr.io when registry-1.docker.io returns 429 and uses cooldown", async () => {
+    const requestedUrls = [];
+    const tracked429 = makeTrackedResponse(["toomanyrequests"], { status: 429 });
+    const manifestPayload = JSON.stringify({ schemaVersion: 2, mirrored: true });
+
+    const worker = createWorkerHandler({
+      fetchImpl: async (url) => {
+        requestedUrls.push(url);
+        if (url.startsWith("https://registry-1.docker.io/")) {
+          return tracked429.response;
+        }
+        if (url.startsWith("https://mirror.gcr.io/")) {
+          return new Response(manifestPayload, {
+            status: 200,
+            headers: {
+              "Content-Type": "application/vnd.oci.image.index.v1+json",
+              "Docker-Content-Digest": VALID_DIGEST,
+            },
+          });
+        }
+        return new Response("unexpected", { status: 500 });
+      },
+    });
+
+    // First request hits Docker Hub -> 429 -> falls back to mirror.gcr.io -> 200
+    const res1 = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/v2/registry-1.docker.io/library/alpine/manifests/latest`)
+    );
+    assert.equal(res1.status, 200);
+    assert.equal(await res1.text(), manifestPayload);
+    assert.equal(tracked429.wasCanceled(), true, "429 response body must be canceled");
+    assert.deepEqual(requestedUrls, [
+      "https://registry-1.docker.io/v2/library/alpine/manifests/latest",
+      "https://mirror.gcr.io/v2/library/alpine/manifests/latest",
+    ]);
+
+    // Second request within cooldown goes directly to mirror.gcr.io
+    const res2 = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/v2/registry-1.docker.io/library/alpine/blobs/${VALID_DIGEST}`)
+    );
+    assert.equal(res2.status, 200);
+    assert.equal(requestedUrls.length, 3);
+    assert.equal(
+      requestedUrls[2],
+      `https://mirror.gcr.io/v2/library/alpine/blobs/${VALID_DIGEST}`
+    );
+  });
+
+  it("falls back to mirror.gcr.io when Docker Hub auth server returns 429", async () => {
+    const requestedUrls = [];
+    const worker = createWorkerHandler({
+      fetchImpl: async (url) => {
+        requestedUrls.push(url);
+        if (url.startsWith("https://registry-1.docker.io/")) {
+          return new Response("unauthorized", {
+            status: 401,
+            headers: {
+              "WWW-Authenticate":
+                'Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/alpine:pull"',
+            },
+          });
+        }
+        if (url.startsWith("https://auth.docker.io/token")) {
+          return new Response("rate limited", { status: 429 });
+        }
+        if (url.startsWith("https://mirror.gcr.io/")) {
+          return new Response('{"mirrored":true}', {
+            status: 200,
+            headers: { "Content-Type": "application/vnd.oci.image.index.v1+json" },
+          });
+        }
+        return new Response("unexpected", { status: 500 });
+      },
+    });
+
+    const res = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/v2/registry-1.docker.io/library/alpine/manifests/latest`)
+    );
+    assert.equal(res.status, 200);
+    assert.equal(await res.text(), '{"mirrored":true}');
+    assert.equal(requestedUrls.length, 3);
+    assert.equal(requestedUrls[2], "https://mirror.gcr.io/v2/library/alpine/manifests/latest");
+  });
+
+  it("does not fall back for non-Docker-Hub registries or when DOCKER_HUB_MIRROR is empty", async () => {
+    const requestedUrls = [];
+    const worker = createWorkerHandler({
+      fetchImpl: async (url) => {
+        requestedUrls.push(url);
+        return new Response("rate limited", { status: 429 });
+      },
+    });
+
+    // Non-Docker-Hub registry returns 429 directly
+    const ghcrRes = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/v2/ghcr.io/owner/app/manifests/latest`)
+    );
+    assert.equal(ghcrRes.status, 429);
+    assert.deepEqual(requestedUrls, ["https://ghcr.io/v2/owner/app/manifests/latest"]);
+
+    // Docker Hub with mirror disabled via env returns 429 directly
+    const disabledRes = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/v2/registry-1.docker.io/library/alpine/manifests/latest`),
+      { DOCKER_HUB_MIRROR: "" }
+    );
+    assert.equal(disabledRes.status, 429);
+    assert.equal(requestedUrls.length, 2);
+  });
+});
+
+describe("Cloudflare Worker: Edge Cache (caches.default)", () => {
+  function createMemoryCache() {
+    const store = new Map();
+    return {
+      store,
+      async match(req) {
+        const key = typeof req === "string" ? req : req.url;
+        const entry = store.get(key);
+        if (!entry) return undefined;
+        return new Response(entry.body.slice(0), {
+          status: entry.status,
+          headers: new Headers(entry.headers),
+        });
+      },
+      async put(req, res) {
+        const key = typeof req === "string" ? req : req.url;
+        const buf = new Uint8Array(await res.arrayBuffer());
+        store.set(key, {
+          status: res.status,
+          headers: new Headers(res.headers),
+          body: buf,
+        });
+      },
+    };
+  }
+
+  it("caches blobs with immutable TTL, re-applies per-origin CORS headers, and serves HEAD hits", async () => {
+    const cache = createMemoryCache();
+    let upstreamCalls = 0;
+    const blobBytes = new Uint8Array([1, 2, 3, 4, 5, 6]);
+    const waitUntilPromises = [];
+    const ctx = { waitUntil: (p) => waitUntilPromises.push(p) };
+
+    const worker = createWorkerHandler({
+      cache,
+      allowedOrigins: "https://a.example.com,https://b.example.com",
+      fetchImpl: async () => {
+        upstreamCalls++;
+        return new Response(blobBytes, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": String(blobBytes.byteLength),
+            "Docker-Content-Digest": VALID_DIGEST,
+          },
+        });
+      },
+    });
+
+    const blobUrl = `${WORKER_ORIGIN}/api/v2/registry-1.docker.io/library/alpine/blobs/${VALID_DIGEST}`;
+
+    // 1. Cache miss from origin A
+    const res1 = await worker.fetch(
+      new Request(blobUrl, { headers: { Origin: "https://a.example.com" } }),
+      {},
+      ctx
+    );
+    assert.equal(res1.status, 200);
+    assert.equal(res1.headers.get("access-control-allow-origin"), "https://a.example.com");
+    assert.deepEqual(Array.from(new Uint8Array(await res1.arrayBuffer())), Array.from(blobBytes));
+    await Promise.all(waitUntilPromises);
+
+    assert.equal(upstreamCalls, 1);
+    assert.equal(cache.store.size, 1);
+    const cachedEntry = Array.from(cache.store.values())[0];
+    assert.equal(cachedEntry.headers.get("cache-control"), "public, max-age=604800, immutable");
+    assert.equal(cachedEntry.headers.get("access-control-allow-origin"), null);
+    assert.equal(cachedEntry.headers.get("vary"), null);
+
+    // 2. Cache hit from origin B gets origin B's CORS header without hitting upstream
+    const res2 = await worker.fetch(
+      new Request(blobUrl, { headers: { Origin: "https://b.example.com" } }),
+      {},
+      ctx
+    );
+    assert.equal(res2.status, 200);
+    assert.equal(upstreamCalls, 1);
+    assert.equal(res2.headers.get("access-control-allow-origin"), "https://b.example.com");
+    assert.equal(res2.headers.get("cross-origin-resource-policy"), "cross-origin");
+    assert.deepEqual(Array.from(new Uint8Array(await res2.arrayBuffer())), Array.from(blobBytes));
+
+    // 3. HEAD request hits cache and returns empty body with Content-Length
+    const res3 = await worker.fetch(new Request(blobUrl, { method: "HEAD" }), {}, ctx);
+    assert.equal(res3.status, 200);
+    assert.equal(upstreamCalls, 1);
+    assert.equal(res3.headers.get("content-length"), "6");
+    assert.equal(await res3.text(), "");
+  });
+
+  it("caches mutable tag manifests with 5-minute TTL and separates cache keys by Accept header", async () => {
+    const cache = createMemoryCache();
+    let upstreamCalls = 0;
+    const waitUntilPromises = [];
+    const ctx = { waitUntil: (p) => waitUntilPromises.push(p) };
+
+    const worker = createWorkerHandler({
+      cache,
+      fetchImpl: async (_url, init) => {
+        upstreamCalls++;
+        const accept = new Headers(init.headers).get("accept");
+        return new Response(JSON.stringify({ accept }), {
+          status: 200,
+          headers: { "Content-Type": "application/vnd.oci.image.index.v1+json" },
+        });
+      },
+    });
+
+    const manifestUrl = `${WORKER_ORIGIN}/api/v2/registry-1.docker.io/library/alpine/manifests/latest`;
+
+    const r1 = await worker.fetch(
+      new Request(manifestUrl, {
+        headers: { Accept: "application/vnd.oci.image.index.v1+json" },
+      }),
+      {},
+      ctx
+    );
+    assert.equal(r1.status, 200);
+    assert.deepEqual(await r1.json(), { accept: "application/vnd.oci.image.index.v1+json" });
+    await Promise.all(waitUntilPromises);
+
+    const r2 = await worker.fetch(
+      new Request(manifestUrl, {
+        headers: { Accept: "application/vnd.docker.distribution.manifest.v2+json" },
+      }),
+      {},
+      ctx
+    );
+    assert.equal(r2.status, 200);
+    assert.deepEqual(await r2.json(), {
+      accept: "application/vnd.docker.distribution.manifest.v2+json",
+    });
+    await Promise.all(waitUntilPromises);
+
+    assert.equal(upstreamCalls, 2);
+    assert.equal(cache.store.size, 2);
+    for (const entry of cache.store.values()) {
+      assert.equal(entry.headers.get("cache-control"), "public, max-age=300");
+    }
+
+    // Repeat first Accept -> cache hit
+    const r3 = await worker.fetch(
+      new Request(manifestUrl, {
+        headers: { Accept: "application/vnd.oci.image.index.v1+json" },
+      }),
+      {},
+      ctx
+    );
+    assert.equal(r3.status, 200);
+    assert.equal(upstreamCalls, 2);
+    assert.deepEqual(await r3.json(), { accept: "application/vnd.oci.image.index.v1+json" });
+  });
+});
+
