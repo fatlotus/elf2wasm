@@ -44,28 +44,32 @@ Node.js Web Server & Thin Streaming OCI Registry Proxy (server/server.mjs + serv
 ├── src/
 │   ├── main.rs                        # Native CLI (translate, run)
 │   └── runtime.rs                     # Native wasmtime 27 host
-├── server/                            # Node.js 22 ESM web server & thin OCI registry proxy
+├── server/                            # Node.js 22 ESM web server & thin OCI/Git streaming proxy
 │   ├── proxy_core.mjs                 # Pure ESM shared OCI proxy validation, SSRF, auth & cache core
-│   ├── server.mjs                     # HTTP server (static assets + /wasm/* + /api/v2/* proxy)
+│   ├── git_core.mjs                   # Pure ESM shared git repo/ref parser, validator & forge tarball URL resolver
+│   ├── server.mjs                     # HTTP server (static assets + /wasm/* + /api/v2/* + /api/git/archive)
 │   ├── registry_proxy.mjs             # Node OCI v2 proxy (uses proxy_core.mjs + dns.lookup pinning)
+│   ├── git_proxy.mjs                  # Node streaming git repo archive proxy (uses git_core.mjs + SSRF pinning)
 │   ├── mock_registry.mjs              # Local mock OCI v2 registry for deterministic testing
-│   └── test_server.mjs                # Unit/integration tests for server & proxy
-├── worker/                            # Cloudflare Workers full-app deployment (OCI proxy + Static Assets)
+│   ├── mock_git_server.mjs            # Local mock git archive HTTP server for deterministic offline testing
+│   └── test_server.mjs                # Unit/integration tests for server, OCI proxy & git proxy
+├── worker/                            # Cloudflare Workers full-app deployment (OCI/Git proxy + Static Assets)
 │   ├── wrangler.jsonc                 # Wrangler config (name: elf2wasm, workers_dev: true, assets: ./dist)
 │   ├── package.json                   # Isolated manifest pinning wrangler + scripts
 │   ├── package-lock.json              # Reproducible lockfile for CI
 │   ├── scripts/build_assets.mjs       # Stages web/, js/, /wasm/*.wasm + _headers into worker/dist/
-│   ├── src/index.mjs                  # Web-standard Cloudflare Worker fetch() handler (/api/health, /api/v2/*)
+│   ├── src/index.mjs                  # Web-standard Cloudflare Worker fetch() handler (/api/health, /api/v2/*, /api/git/archive)
 │   └── test/worker.test.mjs           # Automated Worker unit/integration tests
 ├── .github/workflows/
 │   └── deploy-worker.yml              # GitHub Actions: Rust/WASM build + tests + cloudflare/wrangler-action@v4
 ├── js/                                # Browser & Node ESM client-side SDK and shim
-│   ├── elf2wasm_shim.mjs              # Core WASM compiler/runtime shim, VFS tar/OCI extraction, async CPS loop
+│   ├── elf2wasm_shim.mjs              # Core WASM compiler/runtime shim, VFS tar/OCI/git overlay extraction, async CPS loop
 │   ├── oci_client.mjs                 # Image ref parser, multi-arch linux/amd64 index/manifest/blob client
-│   ├── docker_sdk.mjs                 # Public JS API: Elf2WasmDocker, runDockerImage, pullImage, createContainer
+│   ├── git_client.mjs                 # Client-side git repo snapshot fetcher (.tar.gz streaming + decompression)
+│   ├── docker_sdk.mjs                 # Public JS API: Elf2WasmDocker, runDockerImage, pullImage, createContainer (with gitRepo overlay)
 │   ├── container_worker.mjs           # Dedicated Web Worker host for non-blocking client-side compilation & execution
 │   ├── cli.mjs                        # Node CLI wrapper
-│   └── test_docker_sdk.mjs            # Unit/integration tests for OCI client & Docker SDK
+│   └── test_docker_sdk.mjs            # Unit/integration tests for OCI client, git overlay & Docker SDK
 ├── web/                               # Self-hosted HTML home page & interactive web terminal (zero CDN deps)
 │   ├── index.html                     # Home page (default alpine:latest interactive shell + JS SDK exposure)
 │   ├── app.mjs                        # UI controller connecting terminal, image selector, progress, and SDK
@@ -105,6 +109,13 @@ Every Survey feature from Explorers 1, 2, and 3 is assigned a milestone below (z
 | F22 | Python `lib-dynload/*.so` Core Stdlib Auto-Bundling | Update `_resolveElfSos()` in `js/elf2wasm_shim.mjs` to auto-discover and bundle core Python `lib-dynload/*.so` C extensions (and their transitive `DT_NEEDED` libraries) for `python3*` executables so `math`, `random`, `datetime`, `pathlib`, `zlib`, `base64`, `struct`, `csv`, `hashlib`, `urllib.parse`, `subprocess`, `tempfile`, `readline`, etc. import cleanly. | M8 | Survey 1 (1.5), Survey 2 (1.5, 4.3) |
 | F23 | Node.js Default `--jitless` Env Injection & Browser VFS Memory Hygiene | In `js/docker_sdk.mjs`, inject overridable defaults (`NODE_OPTIONS=--jitless --v8-pool-size=1 --no-experimental-strip-types`, `MALLOC_ARENA_MAX=1`, `UV_USE_IO_URING=0`, `UV_THREADPOOL_SIZE=1`) for Node.js images/executables; release raw `tarBytes` after VFS extraction in `js/elf2wasm_shim.mjs` to minimize browser RAM usage on 232 MB images. | M8 | Survey 3 (1.6, 4.2 Phase 2–3) |
 | F24 | Web UI Presets for `python:3.12-slim` and `node:22-slim` | Add `<button type="button" class="preset-chip" data-image="python:3.12-slim">python:3.12-slim</button>` and `<button type="button" class="preset-chip" data-image="node:22-slim">node:22-slim</button>` to `.presets-row` in `web/index.html` (and wire `web/app.mjs` if needed); verify both presets end-to-end in Node SDK and headless Chrome Web UI. | M8 | Survey 1 (1.3), Survey 2 (4.5), Survey 3 (4.1–4.2) |
+| F25 | Shared Pure-ESM Git Repo Spec & Forge Archive URL Core (`server/git_core.mjs`) | Pure ESM (zero `node:*` deps) parser and validator for `repo` (GitHub `owner/repo` shorthand, `https://github.com/...`, `https://gitlab.com/...`, `https://codeberg.org/...`, plus loopback `http://127.0.0.1:<port>/...` under `allowLocalRegistries`) and `ref` (commit SHA, branch, or tag, default `HEAD`, rejecting control chars, whitespace, `..`, leading `-`, etc.), resolving canonical forge `.tar.gz` snapshot URLs and `isImmutableRef` / `stripComponents`. | M10 | Survey 2 (1.4, 4.1) |
+| F26 | Dual-Runtime Backend Git Snapshot Endpoint (`GET\|HEAD /api/git/archive`) & Mock Server | Implement streaming single-file `.tar.gz` git repo snapshot endpoint in BOTH Node.js (`server/git_proxy.mjs` + `server/server.mjs`) and Cloudflare Worker (`worker/src/index.mjs` with `caches.default` + CORS), with SSRF protection, DNS-rebinding pinning (Node), cross-origin redirect `Authorization` stripping, `X-Git-Strip-Components` & `Cache-Control` headers, COOP/COEP/CORP headers, `server/mock_git_server.mjs`, and comprehensive Node + Worker unit tests. | M10 | Survey 1 (1.1, 2.2), Survey 2 (1.1, 1.4, 4.2) |
+| F27 | WASM Toolchain Build & VFS Tar Overlay Extraction (`mountPath` + `stripComponents`) | Install `wasm32-unknown-unknown` target and build release `elf2wasm_{compiler,runtime}_wasm.wasm`; extend `extractTarToVfs` and `extractTarGzToVfs` in `js/elf2wasm_shim.mjs` with `{ mountPath = "/", stripComponents = 0, ignoreWhiteouts = false }` including path-escape scoping to `mountPath` and hardlink target rebasing. | M11 | Survey 1 (1.4, 2.2, 4.1), Survey 2 (1.3, 4.3), Survey 3 (1.1, 1.2) |
+| F28 | Client Git Snapshot Fetcher (`js/git_client.mjs`), Docker SDK Overlay Integration & Worker Asset Allowlist | Create `js/git_client.mjs` (`fetchGitArchive`, streaming `.tar.gz` + client-side `DecompressionStream("gzip")` + progress stages + `AbortSignal`), register `git_client.mjs` in `worker/scripts/build_assets.mjs:BROWSER_JS_FILES`, and extend `Elf2WasmDocker`/`ContainerEngine`/`WorkerBackend`/`DirectBackend`/`DockerImage`/`runDockerImage`/`container_worker.mjs` with `gitProxyBase` and `gitRepo: { repo, ref, mountPath, stripComponents }` (and `overlayTarBytes`), overlaying onto container VFS after OCI layers, defaulting `cwd`/`PWD` to `mountPath`, and releasing `tarBytes` after extraction. | M11 | Survey 1 (1.1, 1.4, 4.2), Survey 2 (1.3, 4.4) |
+| F29 | Live Runtime Verification of 3 Large Project Presets (Python, JavaScript, Rust) | Empirically verify 3 well-known projects' test suites running offline inside `elf2wasm` (Node SDK) via Docker container + git repo overlay: (1) Python (`python:3.12-slim`, e.g. `Python-Markdown/markdown` or `hukkin/tomli`, adding missing stdlib `PYTHON_CORE_LIB_DYNLOAD` modules like `pyexpat`/`_elementtree` if required), (2) JavaScript (`node:22-slim`, e.g. `ai/nanoid` via `node --test --test-isolation=none`), (3) Rust (e.g. `nushell/nushell` on `ghcr.io/nushell/nushell:*-alpine` running `crates/nu-std/tests/`, or another verified well-known Rust project runnable within `elf2wasm`'s 176 MiB ELF ceiling). Record exact verified `{ image, repo, ref, mountPath, cmd, cwd, env }` in `PROJECT.md`. | M11 | Survey 1 (2.4), Survey 3 (1.1, 1.4, 3.1–3.3) |
+| F30 | Web UI Git Repo Overlay Controls & Progress/Terminal Integration | Add Git Repository Overlay controls after Docker image selection in `web/index.html`, `web/app.mjs`, `web/styles.css` (`#repo-input`, `#repo-ref-input`, `#repo-mount-input` defaulting to `/workspace`), wire `gitRepo` into `bootImage()`, handle git download/decompress/overlay progress stages in `handleProgressEvent()`, and display active repo/ref in `#terminal-title`. | M12 | Survey 1 (1.2, 2.1, 4.3) |
+| F31 | Web UI Project Test Presets (Python, JavaScript, Rust) & Backward-Compatible Image Presets | Preserve the 5 existing `button.preset-chip[data-image]` chips in `.presets-row` (clearing repo/cmd/cwd/env fields on click and focusing `#image-input` for full E2E compatibility); add a separate `.project-presets-row` with `.project-preset-chip[data-preset]` buttons for the 3 verified large Python, JavaScript, and Rust projects (populating image, repo, ref, mountPath, cmd, cwd, env in one click); run `cd worker && npm run build:assets && npm run deploy:dry-run`. | M12 | Survey 1 (1.3, 2.3, 4.3), Survey 3 (3.1–3.3) |
 
 ## Milestones
 
@@ -119,6 +130,10 @@ Every Survey feature from Explorers 1, 2, and 3 is assigned a milestone below (z
 | M7 | Rust Core, Compiler & Runtime Upgrades for `python:3.12-slim` and `node:22-slim` | `crates/elf2wasm-core`, `crates/elf2wasm-compiler-wasm`, `crates/elf2wasm-runtime-core`, `crates/elf2wasm-runtime-wasm`, `src/runtime.rs`; features F15–F20; verify native & wasm32 compilation + execution of both `python:3.12-slim` and `node:22-slim` | none | DONE (`sub_orch_m6` Iter 2 gate passed 5/5 unanimous; 65/65 Rust unit tests, wasm32 release builds, live `python:3.12-slim` & `node:22-slim` verified native + wasm32 + V8 compile, Auditor CLEAN) |
 | M8 | JS Shim, Docker SDK & Web UI Presets for `python:3.12-slim` and `node:22-slim` | `js/elf2wasm_shim.mjs`, `js/docker_sdk.mjs`, `js/test_docker_sdk.mjs`, `web/index.html`, `web/app.mjs`; features F21–F24; verify Node SDK + Chrome Web UI presets & interactive REPLs | M7 | DONE (`sub_orch_m7` Iter 1 gate passed 5/5 unanimous; 20/20 SDK tests, 26/26 server tests, 65/65 Rust tests, live Python & Node Chrome UI presets + REPLs verified, Auditor CLEAN) |
 | M9 | Final Milestone — Python & Node E2E Suite Pass (Tiers 1–4) + Tier 5 Adversarial Hardening | Pass 100% of updated `TEST_READY.md` E2E suite (existing + Python/Node Tiers 1–4) + Tier 5 adversarial hardening | M7, M8, TEST_READY.md | DONE (Phase 1 Tiers 1–4: 71/71 E2E PASS + 5/5 self-test; Phase 2 Tier 5: 14/14 PASS, 67/67 Rust lib, 24/24 SDK, 26/26 Server = 207/207 total tests PASS, both Fresh Challengers `NO_GAPS`, Whole-Project Forensic Auditor `CLEAN`) |
+| M10 | Backend Git Repo Snapshot Proxy (Node.js + Cloudflare Worker) | `server/git_core.mjs`, `server/git_proxy.mjs`, `server/server.mjs`, `server/mock_git_server.mjs`, `server/test_server.mjs`, `worker/src/index.mjs`, `worker/test/worker.test.mjs`; features F25–F26 | none | DONE (`sub_orch_m10` Iter 1 gate passed 5/5 unanimous; 36/36 worker tests, 15/15 server git tests, 258/258 adversarial probes, Auditor CLEAN) |
+| M11 | VFS Tar Overlay, Git Client, Docker SDK Integration & Live Project Verification | `js/elf2wasm_shim.mjs`, `js/git_client.mjs`, `js/docker_sdk.mjs`, `js/container_worker.mjs`, `js/test_docker_sdk.mjs`, `worker/scripts/build_assets.mjs`, WASM build (`wasm32-unknown-unknown`); features F27–F29 | M10 | DONE (`sub_orch_m11` Iter 1 gate passed 5/5 unanimous; 172/172 unit/integration tests + 46/46 adversarial probes PASS; WASM built; all 3 live presets verified exit 0: Bottle 359/359, Nano ID 13/13, Nushell 35/35; Auditor CLEAN) |
+| M12 | Web UI Git Repo Overlay Controls & Project Test Presets | `web/index.html`, `web/app.mjs`, `web/styles.css`, `worker/scripts/build_assets.mjs` asset staging + `wrangler deploy --dry-run`; features F30–F31 | M10, M11 | DONE (`sub_orch_m12` Iter 2 gate passed 5/5 unanimous; 154/154 full-suite tests + 89/89 adversarial Chrome/JS probes PASS; `worker` build/test/dry-run PASS; Auditor CLEAN) |
+| M13 | Final Milestone — Git Repo Overlay & Project Presets E2E Pass (Tiers 1–4) + Tier 5 Hardening | Pass 100% of updated `TEST_READY.md` E2E suite (existing + Git Repo Overlay & Project Presets Tiers 1–4) + Tier 5 adversarial hardening | M10, M11, M12, TEST_READY.md | DONE (Phase 1 Tiers 1–4: 88/92 E2E PASS + 4 `--skip-live` + 6/6 self-test; Phase 2 Tier 5: 20/20 PASS + 13 bugs/parity gaps fixed; 304/304 total automated tests PASS + `wrangler deploy --dry-run` PASS; both Fresh Challengers `NO_GAPS`, both Final Reviewers `APPROVE`, Whole-Project Forensic Auditor `CLEAN`) |
 
 ## Interface Contracts
 
@@ -214,3 +229,76 @@ Exported from `/js/docker_sdk.mjs`:
   - `MALLOC_ARENA_MAX=1`
   - `UV_USE_IO_URING=0`
   - `UV_THREADPOOL_SIZE=1`
+
+### 7. Backend Git Repo Snapshot Proxy (`M10` ↔ `M11` / `M12` / `E2E`)
+Implemented identically in BOTH `server/server.mjs` (via `server/git_proxy.mjs`) and `worker/src/index.mjs`, sharing pure-ESM `server/git_core.mjs` (zero `node:*` imports):
+- **Route**: `GET|HEAD /api/git/archive?repo=<owner/repo-or-url>&ref=<commit|branch|tag>`
+- **Input parsing & validation (`server/git_core.mjs`)**:
+  - `repo` (required): accepts GitHub shorthand `owner/repo` (with optional `.git`), `https://github.com/<owner>/<repo>[.git]`, `https://gitlab.com/<group...>/<repo>[.git]`, `https://codeberg.org/<owner>/<repo>[.git]`, or (ONLY when `allowLocalRegistries` is enabled) loopback `http://127.0.0.1:<port>/...` / `http://[::1]:<port>/...` for offline tests. Rejects credentials, control chars, `..`, null bytes, non-HTTPS (except loopback under `allowLocalRegistries`), and private/link-local/metadata IPs.
+  - `ref` (optional, default `"HEAD"`): commit SHA (short or 40-char hex), branch name, or tag name (also accepts `refs/heads/<branch>` or `refs/tags/<tag>`). Rejects control chars, whitespace, `..`, `~`, `^`, `:`, `?`, `*`, `[`, `\`, leading `-`, leading/trailing `/`, length > 255.
+  - Upstream forge tarball URL resolution:
+    - GitHub: `https://github.com/<owner>/<repo>/archive/<ref>.tar.gz` (follows 302 to `codeload.github.com`, avoiding unauthenticated REST API 60 req/hr limit).
+    - GitLab: `https://gitlab.com/<group...>/<repo>/-/archive/<ref>/<repo>-<ref>.tar.gz`.
+    - Codeberg: `https://codeberg.org/<owner>/<repo>/archive/<ref>.tar.gz`.
+    - Local mock (when `allowLocalRegistries`): `<baseUrl>/archive/<encodedRef>.tar.gz` (or direct mock archive URL convention).
+- **Security**:
+  - Reuses `validateUrlPolicy` / `isBlockedIp` from `server/proxy_core.mjs` (and DNS-rebinding pinning in Node).
+  - Validates every redirect hop (max 5); strips `Authorization` on cross-origin redirect.
+  - Sets COOP/COEP/CORP/`X-Content-Type-Options: nosniff` headers on all responses.
+- **Response headers**:
+  - `Content-Type: application/gzip`
+  - `Content-Length` (when provided upstream)
+  - `X-Git-Archive-Format: tar.gz`
+  - `X-Git-Strip-Components: 1` (or `0` if upstream header specifies)
+  - `Cache-Control`: `public, max-age=604800, immutable` for 40-char hex SHAs; `public, max-age=300` for branches/tags/short SHAs.
+- **Error semantics**: Invalid `repo`/`ref` → `400`, SSRF/blocked host → `403`, upstream 404 → `404`, upstream 429 → `429`, upstream failure/timeout → `502` with JSON `{ "error": "..." }`.
+
+### 8. VFS Tar Overlay Extraction (`M11`)
+Extended `extractTarToVfs(arg1, arg2, options?)` and `extractTarGzToVfs(arg1, arg2, options?)` in `js/elf2wasm_shim.mjs`:
+- Backward-compatible with existing `(sys, bytes)` and `(bytes)` signatures.
+- Optional `options = { mountPath = "/", stripComponents = 0, ignoreWhiteouts = false }`:
+  - Strips `stripComponents` leading path segments from each tar entry (entries with `<= stripComponents` segments are skipped).
+  - Resolves and prefixes remaining path under `normalizeGuestPath(mountPath)` while rejecting/clamping any `..` traversal that would escape `mountPath` when `mountPath !== "/"`.
+  - Applies the same `stripComponents` + `mountPath` rebasing to hardlink (`typeFlag === "1"`) targets; preserves relative symlink (`typeFlag === "2"`) targets as-is.
+
+### 9. Client Git Snapshot Fetcher & Extended Docker SDK (`M11` ↔ `M12` / `E2E`)
+- **`js/git_client.mjs`** (also registered in `worker/scripts/build_assets.mjs:BROWSER_JS_FILES`):
+  - `fetchGitArchive({ repo, ref, gitProxyBase = "/api/git/archive", onProgress, signal })` → `Promise<{ tarBytes: Uint8Array, stripComponents: number, repo: string, ref: string }>`
+  - Streams `.tar.gz` from `${gitProxyBase}?repo=...&ref=...`, emits progress stages (`"git-download"`, `"git-decompress"`), decompresses client-side via `DecompressionStream("gzip")` (with `node:zlib` fallback).
+- **`js/docker_sdk.mjs` & `js/container_worker.mjs`**:
+  - `Elf2WasmDocker.create(options?)` accepts `gitProxyBase = "/api/git/archive"`.
+  - `image.createContainer(options?)` and `runDockerImage(imageRef, options?)` accept:
+    - `gitRepo?: { repo: string, ref?: string, mountPath?: string, stripComponents?: number }` (default `mountPath = "/workspace"`, `ref = "HEAD"`).
+    - `overlayTarBytes?: Uint8Array` + `overlayMountPath?: string` + `overlayStripComponents?: number` (for pre-fetched/offline tar overlays).
+  - `WorkerBackend.createContainer()` forwards `gitRepo` (and transfers `overlayTarBytes` if provided) in `cleanOptions` to `js/container_worker.mjs`.
+  - In `ContainerEngine.createContainer()`: after extracting all `image.layers`, fetches (if `gitRepo`) and extracts the repo tar onto `sys` at `mountPath` with `stripComponents`, releases repo `tarBytes` immediately after extraction, and defaults `cwd` (and `PWD`) to `mountPath` when `options.cwd` is not explicitly provided.
+
+### 10. Web UI Git Repo Controls & Project Test Presets DOM Contracts (`M12` ↔ `E2E`)
+- **Existing `.presets-row` preserved intact**: All 5 `button.preset-chip[data-image="..."]` chips remain unchanged; clicking any plain image `.preset-chip` populates `#image-input`, clears `#repo-input`, `#repo-ref-input`, `#cmd-input`, `#cwd-input`, `#env-input` (and resets `#repo-mount-input` to `/workspace`), and focuses `#image-input`.
+- **Git Repo Overlay controls** (placed after Docker image selection in `web/index.html`):
+  - `#repo-input`: text input for GitHub `owner/repo` or repo URL (optional; empty = no repo overlay).
+  - `#repo-ref-input`: text input for commit SHA, branch, or tag (optional; defaults to `HEAD` when repo is set).
+  - `#repo-mount-input`: text input for container mount path (default `/workspace`).
+- **Project Test Presets** (separate row `.project-presets-row`):
+  - 3 `button.project-preset-chip[data-preset="..."]` buttons (one Python project, one JavaScript project, one Rust project — exact pinned `{ id, label, language, image, repo, ref, mountPath, cmd, cwd, env }` populated from M11's verified live runs).
+  - Clicking a `.project-preset-chip` populates `#image-input`, `#repo-input`, `#repo-ref-input`, `#repo-mount-input`, `#cmd-input`, `#cwd-input`, `#env-input` in one click.
+
+#### Verified Project Test Presets (from M11 F29)
+1. **`python-bottle`** (Python):
+   - `label`: `"Python: Bottle (359 tests)"`
+   - `image`: `"python:3.12-slim"`
+   - `repo`: `"bottlepy/bottle"`, `ref`: `"0.13.4"`, `mountPath`: `"/workspace"`
+   - `cmd`: `python3 -m unittest discover -s test -t .`
+   - `cwd`: `"/workspace"`, `env`: `["PYTHONUNBUFFERED=1"]`
+2. **`js-nanoid`** (JavaScript):
+   - `label`: `"JavaScript: Nano ID (13 tests)"`
+   - `image`: `"node:22-slim"`
+   - `repo`: `"ai/nanoid"`, `ref`: `"6.0.2"`, `mountPath`: `"/workspace"`
+   - `cmd`: `node test/non-secure.test.js`
+   - `cwd`: `"/workspace"`, `env`: `[]`
+3. **`rust-nushell`** (Rust):
+   - `label`: `"Rust: Nushell stdlib (35 tests)"`
+   - `image`: `"ghcr.io/nushell/nushell:0.117.0-alpine"`
+   - `repo`: `"nushell/nushell"`, `ref`: `"0.117.0"`, `mountPath`: `"/workspace"`
+   - `cmd`: `--no-config-file -c "source crates/nu-std/tests/test_asserts.nu; source crates/nu-std/tests/test_iter.nu; source crates/nu-std/tests/test_formats.nu; assert_basic; assert_not; assert_equal; assert_not_equal; assert_error; assert_length; assert_less; assert_less_or_equal; assert_greater; assert_greater_or_equal; iter_find; iter_intersperse; iter_scan; iter_filter_map; iter_find_index; iter_zip_with; iter_flat_map; iter_zip_into_record; from_ndjson_multiple_objects; from_ndjson_single_object; from_ndjson_invalid_object; from_jsonl_multiple_objects; from_jsonl_single_object; from_jsonl_invalid_object; to_ndjson_multiple_objects; to_ndjson_single_object; to_jsonl_multiple_objects; to_jsonl_single_object; from_ndnuon_multiple_objects; from_ndnuon_single_object; from_ndnuon_invalid_object; to_ndnuon_multiple_objects; to_ndnuon_single_object; to_ndnuon_multiline_strings; from_ndnuon_multiline_strings; print 'OK: 35 nu-std tests passed'"`
+   - `cwd`: `"/workspace"`, `env`: `["HOME=/tmp"]`

@@ -41,3 +41,52 @@ For strictly offline verification (skipping live Docker Hub `T4.5` & `T4.9`):
 ```bash
 node e2e_docker_web/run_all.mjs --tier all --skip-live --verbose
 ```
+
+## Git Repo Overlay & Project Presets E2E Ready
+
+The opaque-box 4-tier E2E test suite (`e2e_docker_web/`) has been expanded to cover **Git Repo Overlay & Project Test Presets** (Features F25–F31, Contracts §7–§10) with **+21 new E2E tests** and **+1 new infrastructure self-test** (**92 E2E tests + 6 self-tests = 98 total**), preserving 100% of all 71 existing E2E tests and 5 existing self-tests untouched.
+
+### Coverage Summary
+- **New Helper (`e2e_docker_web/helpers/mock_git_server.mjs`)**: Dual-origin mock git archive server (primary forge + separate-origin CDN with strict `Authorization` leak rejection, commit/branch/tag/HEAD ref resolution, `HEAD` method, custom `X-Git-Strip-Components`, deterministic error triggers, and 6 built-in synthetic `.tar.gz` repo fixtures).
+- **Updated Helper (`e2e_docker_web/helpers/cdp_browser.mjs`)**: Backward-compatible `getInputValue`, `getProjectPresetChips`, and `clickProjectPresetChip` methods.
+- **Self-Test (`e2e_docker_web/self_test.mjs`, 6 tests = 5 existing + `ST-6`)**: `ST-6` verifies `mock_git_server.mjs` ref resolution, `HEAD`, 302 cross-origin auth-stripping, `X-Git-Strip-Components: 0`, error triggers, and fixture archive integrity.
+- **Tier 1 (`e2e_docker_web/tier1_features.mjs`, 40 tests = 32 existing + `T1.9.1`–`T1.9.8`)**:
+  - `T1.9.1`–`T1.9.2`: `GET`/`HEAD /api/git/archive` for 40-char SHA, branch, tag, and default `HEAD` with `X-Git-Archive-Format`, `X-Git-Strip-Components`, immutable/mutable `Cache-Control`, COOP/COEP/CORP/`nosniff`, and 302 auth-stripping.
+  - `T1.9.3`: `GET /js/git_client.mjs` + dynamic import `fetchGitArchive` streaming, client-side gzip decompression, and `"git-download"` / `"git-decompress"` progress stages.
+  - `T1.9.4`–`T1.9.5`: Static HTML & headless Chrome DOM contract for `#repo-input`, `#repo-ref-input`, `#repo-mount-input` (`/workspace`), 3 `.project-preset-chip` (Python, JavaScript, Rust), and backward-compatible 5 `.preset-chip` image presets with full field reset.
+  - `T1.9.6`–`T1.9.8`: `createContainer({ gitRepo })` (`/workspace` & custom `mountPath`, default `cwd`/`PWD`, hardlink rebasing, relative symlink preservation), `runDockerImage(..., { gitRepo })`, and offline `overlayTarBytes` with zero git network calls.
+- **Tier 2 (`e2e_docker_web/tier2_boundaries.mjs`, 26 tests = 21 existing + `T2.22`–`T2.26`)**:
+  - `T2.22`: Input validation `400` JSON matrix for missing/invalid `repo` and `ref`.
+  - `T2.23`: SSRF `403` matrix on hardened `/api/git/archive` (loopback, private, link-local, live mock URL).
+  - `T2.24`: Upstream error propagation (`404`, `429`, `500 -> 502`, connection refused `-> 502`) & SDK rejection.
+  - `T2.25`–`T2.26`: Tar overlay `..` path traversal containment to `mountPath`, `stripComponents` root-entry skipping, explicit `cwd` override, and 4 KiB binary + UTF-8 byte-for-byte integrity.
+- **Tier 3 (`e2e_docker_web/tier3_combinations.mjs`, 13 tests = 9 existing + `T3.10`–`T3.13`)**:
+  - `T3.10`: Alpine + git repo overlay (branch `main` vs pinned 40-char SHA) running shell test script in `/workspace`.
+  - `T3.11`: `python:3.12-slim` + synthetic Python project git repo overlay running `python3 -m unittest discover -s tests -v`.
+  - `T3.12`: `node:22-slim` + synthetic JavaScript project git repo overlay running `node --test --experimental-test-isolation=none`.
+  - `T3.13`: Custom `mountPath` + `env`/`cmd` overrides + host `readFile`/`writeFile` + zero `/workspace` bleed on plain container.
+- **Tier 4 (`e2e_docker_web/tier4_scenarios.mjs`, 13 scenarios = 9 existing + `T4.10`–`T4.13`)**:
+  - `T4.10` (offline): Web UI Git Repo Overlay workflow, `#terminal-title`, and CDP network audit (same-origin, zero POST, `/api/git/archive` 200, `.wasm` 200).
+  - `T4.11` (offline): Web UI `.project-presets-row` (3 ecosystems) & `.presets-row` (5 preserved image presets + field reset) DOM contract.
+  - `T4.12` (live, `--skip-live`): Real GitHub repo `octocat/Hello-World` @ pinned SHA streamed through hardened `/api/git/archive` (plus SSRF 403 check) and overlaid on live `alpine:latest` via `window.runDockerImage`.
+  - `T4.13` (live, `--skip-live`): Dynamically discovers all 3 `.project-preset-chip[data-preset]` buttons (Python, JavaScript, Rust) and runs each sequentially in a fresh headless Chrome instance on a hardened server.
+
+### Git Repo Overlay & Project Presets Feature Checklist
+- [x] **F25–F26 / Contract §7**: `GET|HEAD /api/git/archive` ref/repo parsing, validation (`400`), SSRF guard (`403`), upstream error mapping (`404`/`429`/`502`), 302 auth-stripping, `X-Git-Strip-Components`, immutable/mutable `Cache-Control`, COOP/COEP/CORP/`nosniff` (`ST-6`, `T1.9.1`–`T1.9.2`, `T2.22`–`T2.24`, `T4.10`, `T4.12`)
+- [x] **F27 / Contract §8**: VFS tar overlay with `mountPath`, `stripComponents`, `..` traversal clamping, hardlink rebasing, relative symlink preservation, binary/UTF-8 integrity (`T1.9.6`, `T1.9.8`, `T2.25`–`T2.26`, `T3.10`–`T3.13`)
+- [x] **F28 / Contract §9**: `js/git_client.mjs` `fetchGitArchive` + client-side gzip + progress stages, `Elf2WasmDocker` `gitProxyBase`, `gitRepo` & offline `overlayTarBytes`, default `cwd`/`PWD` & container isolation (`T1.9.3`, `T1.9.6`–`T1.9.8`, `T2.24`, `T2.26`, `T3.10`–`T3.13`, `T4.10`, `T4.12`)
+- [x] **F29–F31 / Contract §10**: Web UI `#repo-input`/`#repo-ref-input`/`#repo-mount-input`, `#terminal-title`, 3 Python/JS/Rust `.project-preset-chip` buttons, backward-compatible 5 `.preset-chip` buttons with reset, and live execution of all 3 project test presets (`T1.9.4`–`T1.9.5`, `T4.10`–`T4.11`, `T4.13`)
+
+### M13 Sequential Execution Commands
+```bash
+node e2e_docker_web/run_all.mjs --self-test --verbose
+node e2e_docker_web/run_all.mjs --tier 1 --verbose
+node e2e_docker_web/run_all.mjs --tier 2 --verbose
+node e2e_docker_web/run_all.mjs --tier 3 --verbose
+node e2e_docker_web/run_all.mjs --tier 4 --verbose
+```
+
+For strictly offline verification (skipping live Docker Hub & GitHub scenarios `T4.5`, `T4.9`, `T4.12`, `T4.13`):
+```bash
+node e2e_docker_web/run_all.mjs --tier all --skip-live --verbose
+```
