@@ -1874,12 +1874,35 @@ export class Elf2WasmSystem {
 
           const parentMem = parentEntry.instance.exports.memory;
           const childMem = childInst.exports.memory;
-          if (childMem.buffer.byteLength < parentMem.buffer.byteLength) {
+          const parentByteLen = parentMem.buffer.byteLength;
+          if (childMem.buffer.byteLength < parentByteLen) {
             const pagesNeeded =
-              (parentMem.buffer.byteLength - childMem.buffer.byteLength + 65535) >>> 16;
+              (parentByteLen - childMem.buffer.byteLength + 65535) >>> 16;
             childMem.grow(pagesNeeded);
           }
-          new Uint8Array(childMem.buffer).set(new Uint8Array(parentMem.buffer));
+          const parentView = new Uint8Array(parentMem.buffer);
+          const childView = new Uint8Array(childMem.buffer);
+          let copiedSparse = false;
+          if (typeof rExp.runtime_get_fork_copy_ranges === "function" && parentByteLen > 0) {
+            const raw = this._readOwnedRtBytes((p) =>
+              rExp.runtime_get_fork_copy_ranges(parentByteLen >>> 0, p)
+            );
+            if (raw.length >= 8 && (raw.length & 7) === 0) {
+              const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+              const count = raw.length >>> 3;
+              for (let i = 0; i < count; i++) {
+                const start = dv.getUint32(i * 8, true);
+                const end = dv.getUint32(i * 8 + 4, true);
+                if (end > start && end <= parentByteLen) {
+                  childView.set(parentView.subarray(start, end), start);
+                }
+              }
+              copiedSparse = true;
+            }
+          }
+          if (!copiedSparse) {
+            childView.set(parentView);
+          }
 
           for (const [name, exp] of Object.entries(parentEntry.instance.exports)) {
             if (exp instanceof WebAssembly.Global && childInst.exports[name]) {

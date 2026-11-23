@@ -561,8 +561,19 @@ pub fn run_wasm(wasm_bytes: &[u8], config: RunConfig) -> Result<RunOutput> {
                     let pages = ((parent_bytes - child_bytes) + 65535) / 65536;
                     child_mem.grow(&mut store, pages as u64)?;
                 }
-                let mem_copy = mem.data(&store).to_vec();
-                child_mem.data_mut(&mut store)[..mem_copy.len()].copy_from_slice(&mem_copy);
+                let copy_ranges = host_state.fork_copy_ranges(parent_bytes);
+                const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+                let mut chunk_buf = Vec::new();
+                for (start, end) in copy_ranges {
+                    let mut off = start;
+                    while off < end {
+                        let chunk_end = (off + CHUNK_SIZE).min(end);
+                        chunk_buf.clear();
+                        chunk_buf.extend_from_slice(&mem.data(&store)[off..chunk_end]);
+                        child_mem.data_mut(&mut store)[off..chunk_end].copy_from_slice(&chunk_buf);
+                        off = chunk_end;
+                    }
+                }
 
                 let export_names: Vec<String> = module
                     .exports()

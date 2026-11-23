@@ -196,6 +196,9 @@ pub struct MmapAllocator {
     /// Any bump allocation starting at `>= high_clean_watermark` is guaranteed freshly zeroed by Wasm `memory.grow`.
     pub high_clean_watermark: u32,
     pub high_free_regions: BTreeMap<u32, u32>,
+    /// Sorted, disjoint, coalesced half-open `[start, end)` intervals of known-zero
+    /// untouched `PROT_NONE` anonymous mappings that can be skipped on fork.
+    pub prot_none_ranges: Vec<(u32, u32)>,
 }
 
 impl MmapAllocator {
@@ -214,6 +217,7 @@ impl MmapAllocator {
             high_limit: HIGH_MMAP_LIMIT,
             high_clean_watermark: 0,
             high_free_regions: BTreeMap::new(),
+            prot_none_ranges: Vec::new(),
         }
     }
 
@@ -331,6 +335,7 @@ impl MmapAllocator {
         if aligned_len == 0 {
             return;
         }
+        self.remove_prot_none_range(addr, addr.saturating_add(aligned_len));
         Self::free_in_region(
             self.mmap_start,
             &mut self.cursor,
@@ -463,6 +468,84 @@ impl MmapAllocator {
         let in_primary = start >= self.mmap_start && end <= self.mmap_alloc_end;
         let in_high = self.high_start != 0 && start >= self.high_start && end <= self.high_cursor;
         in_primary || in_high
+    }
+
+    /// Record `[start, end)` as a known-zero untouched `PROT_NONE` anonymous range.
+    /// Maintains sorted, disjoint, coalesced intervals.
+    pub fn add_prot_none_range(&mut self, start: u32, end: u32) {
+        if start >= end {
+            return;
+        }
+        let mut new_start = start;
+        let mut new_end = end;
+        let mut out = Vec::with_capacity(self.prot_none_ranges.len() + 1);
+        let mut inserted = false;
+        for &(r_start, r_end) in &self.prot_none_ranges {
+            if r_end < new_start {
+                out.push((r_start, r_end));
+            } else if r_start > new_end {
+                if !inserted {
+                    out.push((new_start, new_end));
+                    inserted = true;
+                }
+                out.push((r_start, r_end));
+            } else {
+                new_start = new_start.min(r_start);
+                new_end = new_end.max(r_end);
+            }
+        }
+        if !inserted {
+            out.push((new_start, new_end));
+        }
+        self.prot_none_ranges = out;
+    }
+
+    /// Subtract `[start, end)` from tracked `PROT_NONE` ranges, splitting any containing interval.
+    pub fn remove_prot_none_range(&mut self, start: u32, end: u32) {
+        if start >= end || self.prot_none_ranges.is_empty() {
+            return;
+        }
+        let mut out = Vec::with_capacity(self.prot_none_ranges.len() + 1);
+        for &(r_start, r_end) in &self.prot_none_ranges {
+            if r_end <= start || r_start >= end {
+                out.push((r_start, r_end));
+            } else {
+                if r_start < start {
+                    out.push((r_start, start));
+                }
+                if r_end > end {
+                    out.push((end, r_end));
+                }
+            }
+        }
+        self.prot_none_ranges = out;
+    }
+
+    /// Return sorted, disjoint byte ranges in `[0, total_len)` that must be copied on fork,
+    /// skipping tracked known-zero `PROT_NONE` ranges.
+    pub fn fork_copy_ranges(&self, total_len: usize) -> Vec<(usize, usize)> {
+        if total_len == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(self.prot_none_ranges.len() + 1);
+        let mut pos: usize = 0;
+        for &(r_start, r_end) in &self.prot_none_ranges {
+            let s = (r_start as usize).min(total_len);
+            let e = (r_end as usize).min(total_len);
+            if s > pos {
+                out.push((pos, s));
+            }
+            if e > pos {
+                pos = e;
+            }
+            if pos >= total_len {
+                break;
+            }
+        }
+        if pos < total_len {
+            out.push((pos, total_len));
+        }
+        out
     }
 }
 
@@ -2031,6 +2114,10 @@ impl HostState {
         }
     }
 
+    pub fn fork_copy_ranges(&self, total_len: usize) -> Vec<(usize, usize)> {
+        self.mmap_alloc.fork_copy_ranges(total_len)
+    }
+
     pub fn ack_fork(&mut self, child_pid: i32) -> bool {
         match &self.pending_action {
             Some(PendingHostAction::Fork {
@@ -2859,6 +2946,15 @@ fn handle_syscall_inner(
                     }
                     return -ENOMEM;
                 }
+                if prot == PROT_NONE {
+                    state
+                        .mmap_alloc
+                        .add_prot_none_range(target, target.saturating_add(aligned));
+                } else {
+                    state
+                        .mmap_alloc
+                        .remove_prot_none_range(target, target.saturating_add(aligned));
+                }
                 return target as i64;
             }
 
@@ -2924,9 +3020,26 @@ fn handle_syscall_inner(
                     return e;
                 }
             }
+            state
+                .mmap_alloc
+                .remove_prot_none_range(target, target.saturating_add(aligned));
             target as i64
         }
-        SYS_MPROTECT => 0,
+        SYS_MPROTECT => {
+            let addr_u64 = a0 as u64;
+            let len_u64 = a1 as u64;
+            let prot = a2 as i32;
+            // Only subtract on prot != PROT_NONE; do NOT add on prot == PROT_NONE because
+            // Linux preserves page contents across mprotect(PROT_NONE) -> mprotect(PROT_RW).
+            if prot != PROT_NONE && len_u64 > 0 {
+                if let (Ok(addr), Ok(len_u32)) = (u32::try_from(addr_u64), u32::try_from(len_u64)) {
+                    let start = addr & !0xfff;
+                    let end = align_up_4k(addr.saturating_add(len_u32)).unwrap_or(u32::MAX);
+                    state.mmap_alloc.remove_prot_none_range(start, end);
+                }
+            }
+            0
+        }
         SYS_MUNMAP => {
             let addr_u64 = a0 as u64;
             let len_u64 = a1 as u64;
@@ -2997,6 +3110,9 @@ fn handle_syscall_inner(
                 state.mmap_alloc.free(target, new_aligned);
                 return e;
             }
+            state
+                .mmap_alloc
+                .remove_prot_none_range(target, target.saturating_add(new_aligned));
             if old_aligned > 0 {
                 state.mmap_alloc.free(old_addr, old_aligned);
             }
@@ -5402,5 +5518,178 @@ mod tests {
         );
         assert_eq!(r, -ENOMEM);
     }
+
+    #[test]
+    fn test_prot_none_ranges_mmap_map_fixed_mprotect_munmap_and_complement() {
+        let initial = 256 * 1024 * 1024;
+        let max_2gib = 2 * 1024 * 1024 * 1024;
+        let mut ctx = MockGuestContext::new(initial, max_2gib);
+        let mut state = make_state();
+
+        // 1. Two adjacent PROT_NONE mappings in high region coalesce into one range.
+        let r1 = sys_mmap(
+            &mut ctx,
+            &mut state,
+            0,
+            64 * 1024 * 1024,
+            PROT_NONE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+        ) as u32;
+        let r2 = sys_mmap(
+            &mut ctx,
+            &mut state,
+            0,
+            64 * 1024 * 1024,
+            PROT_NONE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+        ) as u32;
+        assert_eq!(r1, initial as u32);
+        assert_eq!(r2, r1 + 64 * 1024 * 1024);
+        assert_eq!(
+            state.mmap_alloc.prot_none_ranges,
+            vec![(r1, r1 + 128 * 1024 * 1024)]
+        );
+
+        // 2. MAP_FIXED(PROT_READ|PROT_WRITE) in the middle splits the PROT_NONE range.
+        let fixed_addr = r1 + 16 * 1024 * 1024;
+        let fixed_res = sys_mmap(
+            &mut ctx,
+            &mut state,
+            fixed_addr as u64,
+            8192,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+        );
+        assert_eq!(fixed_res, fixed_addr as i64);
+        assert_eq!(
+            state.mmap_alloc.prot_none_ranges,
+            vec![
+                (r1, fixed_addr),
+                (fixed_addr + 8192, r1 + 128 * 1024 * 1024),
+            ]
+        );
+
+        // 3. mprotect(PROT_READ|PROT_WRITE) further splits the right-hand PROT_NONE range.
+        let mprot_addr = r1 + 64 * 1024 * 1024;
+        let rc = handle_syscall(
+            &mut ctx,
+            &mut state,
+            SYS_MPROTECT,
+            mprot_addr as i64,
+            4096,
+            (PROT_READ | PROT_WRITE) as i64,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(rc, 0);
+        assert_eq!(
+            state.mmap_alloc.prot_none_ranges,
+            vec![
+                (r1, fixed_addr),
+                (fixed_addr + 8192, mprot_addr),
+                (mprot_addr + 4096, r1 + 128 * 1024 * 1024),
+            ]
+        );
+
+        // 4. mprotect(PROT_NONE) on a writable dirty slice must NOT re-add it to prot_none_ranges
+        //    (Linux preserves page contents across mprotect(PROT_NONE) -> mprotect(PROT_RW)).
+        ctx.mem_write(fixed_addr as u64, b"DIRTY").unwrap();
+        let rc = handle_syscall(
+            &mut ctx,
+            &mut state,
+            SYS_MPROTECT,
+            fixed_addr as i64,
+            8192,
+            PROT_NONE as i64,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(rc, 0);
+        assert_eq!(
+            state.mmap_alloc.prot_none_ranges,
+            vec![
+                (r1, fixed_addr),
+                (fixed_addr + 8192, mprot_addr),
+                (mprot_addr + 4096, r1 + 128 * 1024 * 1024),
+            ]
+        );
+
+        // Verify fork_copy_ranges includes [0, r1), [fixed_addr, fixed_addr+8192), [mprot_addr, mprot_addr+4096).
+        let total = ctx.mem_len();
+        assert_eq!(
+            state.fork_copy_ranges(total),
+            vec![
+                (0, r1 as usize),
+                (fixed_addr as usize, (fixed_addr + 8192) as usize),
+                (mprot_addr as usize, (mprot_addr + 4096) as usize),
+            ]
+        );
+
+        // 5. munmap removes the unmapped region from prot_none_ranges.
+        let rc = handle_syscall(
+            &mut ctx,
+            &mut state,
+            SYS_MUNMAP,
+            (mprot_addr + 4096) as i64,
+            (64 * 1024 * 1024 - 4096) as i64,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(rc, 0);
+        assert_eq!(
+            state.mmap_alloc.prot_none_ranges,
+            vec![(r1, fixed_addr), (fixed_addr + 8192, mprot_addr)]
+        );
+    }
+
+    #[test]
+    fn test_go_style_512m_prot_none_with_256m_map_fixed_skips_512m_on_fork() {
+        let initial = 256 * 1024 * 1024;
+        let max_2gib = 2 * 1024 * 1024 * 1024;
+        let mut ctx = MockGuestContext::new(initial, max_2gib);
+        let mut state = make_state();
+
+        let size_512m = 512 * 1024 * 1024u64;
+        let base = sys_mmap(
+            &mut ctx,
+            &mut state,
+            0,
+            size_512m,
+            PROT_NONE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+        ) as usize;
+        assert_eq!(base, initial);
+        assert_eq!(ctx.mem_len(), initial + size_512m as usize);
+
+        // Commit 4 KiB at +256 MiB (Go arenaBaseOffset midpoint pattern).
+        let midpoint = base + 256 * 1024 * 1024;
+        let commit_res = sys_mmap(
+            &mut ctx,
+            &mut state,
+            midpoint as u64,
+            4096,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+        );
+        assert_eq!(commit_res, midpoint as i64);
+
+        let ranges = state.fork_copy_ranges(ctx.mem_len());
+        assert_eq!(ranges, vec![(0, base), (midpoint, midpoint + 4096)]);
+
+        let total_copied: usize = ranges.iter().map(|(s, e)| e - s).sum();
+        assert_eq!(total_copied, initial + 4096);
+        let total_skipped = ctx.mem_len() - total_copied;
+        assert_eq!(total_skipped, (512 * 1024 * 1024) - 4096);
+
+        // Reset clears prot_none_ranges.
+        state.reset_for_new_run();
+        assert!(state.mmap_alloc.prot_none_ranges.is_empty());
+        assert_eq!(state.fork_copy_ranges(initial), vec![(0, initial)]);
+    }
 }
+
 

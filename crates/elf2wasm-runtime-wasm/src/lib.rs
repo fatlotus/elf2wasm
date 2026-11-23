@@ -713,6 +713,31 @@ pub extern "C" fn runtime_get_pending_scratch_addr() -> u32 {
 }
 
 #[no_mangle]
+pub extern "C" fn runtime_get_fork_copy_ranges(
+    total_len: u32,
+    out_len_ptr: *mut usize,
+) -> *mut u8 {
+    if out_len_ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    let Some(state) = state_ref() else {
+        unsafe { *out_len_ptr = 0 };
+        return core::ptr::null_mut();
+    };
+    let ranges = state.fork_copy_ranges(total_len as usize);
+    if ranges.is_empty() {
+        unsafe { *out_len_ptr = 0 };
+        return core::ptr::null_mut();
+    }
+    let mut out = Vec::with_capacity(ranges.len() * 8);
+    for (start, end) in ranges {
+        out.extend_from_slice(&(start as u32).to_le_bytes());
+        out.extend_from_slice(&(end as u32).to_le_bytes());
+    }
+    export_owned_bytes(out, out_len_ptr)
+}
+
+#[no_mangle]
 pub extern "C" fn runtime_ack_fork(child_pid: i32) -> i32 {
     let Some(state) = state_mut() else {
         return -1;
