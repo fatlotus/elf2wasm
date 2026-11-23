@@ -17,6 +17,7 @@ export const BROWSER_JS_FILES = [
   "container_worker.mjs",
   "docker_sdk.mjs",
   "elf2wasm_shim.mjs",
+  "git_client.mjs",
   "oci_client.mjs",
 ];
 

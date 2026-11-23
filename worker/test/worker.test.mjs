@@ -1072,3 +1072,808 @@ describe("Cloudflare Worker: Edge Cache (caches.default)", () => {
   });
 });
 
+describe("Cloudflare Worker: /api/git/archive Proxy", () => {
+  const FULL_SHA = "0123456789abcdef0123456789abcdef01234567";
+  const FAKE_GZIP = new Uint8Array([0x1f, 0x8b, 0x08, 0x00, 0x01, 0x02, 0x03, 0x04]);
+
+  function createMemoryCache() {
+    const store = new Map();
+    return {
+      store,
+      async match(req) {
+        const key = typeof req === "string" ? req : req.url;
+        const entry = store.get(key);
+        if (!entry) return undefined;
+        return new Response(entry.body.slice(0), {
+          status: entry.status,
+          headers: new Headers(entry.headers),
+        });
+      },
+      async put(req, res) {
+        const key = typeof req === "string" ? req : req.url;
+        const buf = new Uint8Array(await res.arrayBuffer());
+        store.set(key, {
+          status: res.status,
+          headers: new Headers(res.headers),
+          body: buf,
+        });
+      },
+    };
+  }
+
+  it("streams GitHub archive across 302 codeload redirect, normalizes headers, and cancels redirect body", async () => {
+    const seen = [];
+    const redirectTracked = makeTrackedResponse("redirect body", {
+      status: 302,
+      headers: { Location: "https://codeload.github.com/octocat/Hello-World/tar.gz/HEAD" },
+    });
+
+    const worker = createWorkerHandler({
+      fetchImpl: async (url, init) => {
+        seen.push({ url, method: init.method, headers: new Headers(init.headers) });
+        if (url === "https://github.com/octocat/Hello-World/archive/HEAD.tar.gz") {
+          return redirectTracked.response;
+        }
+        if (url === "https://codeload.github.com/octocat/Hello-World/tar.gz/HEAD") {
+          return new Response(FAKE_GZIP, {
+            status: 200,
+            headers: {
+              "Content-Type": "application/x-gzip",
+              "Content-Length": String(FAKE_GZIP.byteLength),
+            },
+          });
+        }
+        throw new Error(`Unexpected upstream URL: ${url}`);
+      },
+    });
+
+    const res = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World`)
+    );
+    assert.equal(res.status, 200);
+    assert.equal(redirectTracked.wasCanceled(), true);
+    assert.equal(seen.length, 2);
+    assert.equal(seen[1].headers.get("authorization"), null);
+    assert.equal(res.headers.get("content-type"), "application/gzip");
+    assert.equal(res.headers.get("content-length"), String(FAKE_GZIP.byteLength));
+    assert.equal(res.headers.get("x-git-archive-format"), "tar.gz");
+    assert.equal(res.headers.get("x-git-strip-components"), "1");
+    assert.equal(res.headers.get("cache-control"), "public, max-age=300");
+    assert.equal(res.headers.get("cross-origin-opener-policy"), "same-origin");
+    assert.equal(res.headers.get("cross-origin-embedder-policy"), "require-corp");
+    assert.equal(res.headers.get("cross-origin-resource-policy"), "same-origin");
+    assert.equal(res.headers.get("x-content-type-options"), "nosniff");
+    assert.deepEqual(Array.from(new Uint8Array(await res.arrayBuffer())), Array.from(FAKE_GZIP));
+  });
+
+  it("resolves GitLab nested groups, Codeberg, 40-char SHA immutable TTL, strip-components=0, HEAD, and 405", async () => {
+    const seenUrls = [];
+    let headTracked = null;
+    const worker = createWorkerHandler({
+      fetchImpl: async (url, init) => {
+        seenUrls.push({ url, method: init.method });
+        if (init.method === "HEAD") {
+          headTracked = makeTrackedResponse("should be canceled", {
+            status: 200,
+            headers: {
+              "Content-Type": "application/gzip",
+              "Content-Length": "8",
+              "X-Git-Strip-Components": "0",
+            },
+          });
+          return headTracked.response;
+        }
+        return new Response(FAKE_GZIP, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "X-Git-Strip-Components": "0",
+          },
+        });
+      },
+    });
+
+    // GitLab nested group + slash ref
+    const glRes = await worker.fetch(
+      new Request(
+        `${WORKER_ORIGIN}/api/git/archive?repo=${encodeURIComponent(
+          "https://gitlab.com/org/sub/proj.git"
+        )}&ref=${encodeURIComponent("feature/foo")}`
+      )
+    );
+    assert.equal(glRes.status, 200);
+    assert.equal(
+      seenUrls[0].url,
+      "https://gitlab.com/org/sub/proj/-/archive/feature/foo/proj-feature-foo.tar.gz"
+    );
+    assert.equal(glRes.headers.get("x-git-strip-components"), "0");
+    assert.equal(glRes.headers.get("cache-control"), "public, max-age=300");
+
+    // Codeberg + 40-char SHA immutable
+    const cbRes = await worker.fetch(
+      new Request(
+        `${WORKER_ORIGIN}/api/git/archive?repo=${encodeURIComponent(
+          "https://codeberg.org/alice/demo"
+        )}&ref=${FULL_SHA}`
+      )
+    );
+    assert.equal(cbRes.status, 200);
+    assert.equal(
+      seenUrls[1].url,
+      `https://codeberg.org/alice/demo/archive/${FULL_SHA}.tar.gz`
+    );
+    assert.equal(cbRes.headers.get("cache-control"), "public, max-age=604800, immutable");
+
+    // HEAD cancels upstream body and returns empty response
+    const headRes = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World&ref=main`, {
+        method: "HEAD",
+      })
+    );
+    assert.equal(headRes.status, 200);
+    assert.equal(headTracked.wasCanceled(), true);
+    assert.equal(headRes.headers.get("content-length"), "8");
+    assert.equal(headRes.headers.get("x-git-strip-components"), "0");
+    assert.equal(await headRes.text(), "");
+
+    // POST -> 405
+    const postRes = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World`, {
+        method: "POST",
+      })
+    );
+    assert.equal(postRes.status, 405);
+    assert.equal(postRes.headers.get("allow"), "GET, HEAD, OPTIONS");
+  });
+
+  it("enforces 400 validation, 403 SSRF, ALLOW_LOCAL_REGISTRIES env toggle, and redirect SSRF", async () => {
+    let fetchCalls = 0;
+    const ssrfRedirect = makeTrackedResponse("ssrf", {
+      status: 302,
+      headers: { Location: "http://169.254.169.254/latest/meta-data" },
+    });
+
+    const worker = createWorkerHandler({
+      fetchImpl: async (url) => {
+        fetchCalls++;
+        if (url === "https://github.com/evil/repo/archive/HEAD.tar.gz") {
+          return ssrfRedirect.response;
+        }
+        return new Response(FAKE_GZIP, { status: 200 });
+      },
+    });
+
+    // 400 invalid inputs (must not call fetchImpl)
+    for (const q of [
+      "",
+      "?repo=onlyowner",
+      "?repo=https%3A%2F%2Fexample.com%2Fa%2Fb",
+      "?repo=octocat/Hello-World&ref=-bad",
+      "?repo=octocat/Hello-World&ref=a..b",
+      `?repo=${encodeURIComponent("https://user:pass@github.com/a/b")}`,
+      `?repo=${encodeURIComponent("http://github.com/a/b")}`,
+      `?repo=${encodeURIComponent("ftp://github.com/a/b")}`,
+      `?repo=${encodeURIComponent("file:///etc/passwd")}`,
+      `?repo=${encodeURIComponent("javascript:alert(1)")}`,
+    ]) {
+      const r = await worker.fetch(new Request(`${WORKER_ORIGIN}/api/git/archive${q}`));
+      assert.equal(r.status, 400, `Expected 400 for query ${q}`);
+    }
+    assert.equal(fetchCalls, 0);
+
+    // 403 SSRF when ALLOW_LOCAL_REGISTRIES is unset
+    for (const repo of [
+      "http://127.0.0.1:5050/org/demo",
+      "https://169.254.169.254/org/demo",
+    ]) {
+      const r = await worker.fetch(
+        new Request(`${WORKER_ORIGIN}/api/git/archive?repo=${encodeURIComponent(repo)}`)
+      );
+      assert.equal(r.status, 403, `Expected 403 for repo ${repo}`);
+    }
+    assert.equal(fetchCalls, 0);
+
+    // Loopback allowed with env.ALLOW_LOCAL_REGISTRIES="1", IMDS still 403
+    const rLocal = await worker.fetch(
+      new Request(
+        `${WORKER_ORIGIN}/api/git/archive?repo=${encodeURIComponent("http://127.0.0.1:5050/org/demo")}`
+      ),
+      { ALLOW_LOCAL_REGISTRIES: "1" }
+    );
+    assert.equal(rLocal.status, 200);
+    assert.equal(fetchCalls, 1);
+
+    const rImds = await worker.fetch(
+      new Request(
+        `${WORKER_ORIGIN}/api/git/archive?repo=${encodeURIComponent("https://169.254.169.254/org/demo")}`
+      ),
+      { ALLOW_LOCAL_REGISTRIES: "1" }
+    );
+    assert.equal(rImds.status, 403);
+
+    // Redirect to IMDS -> 403 and redirect body canceled
+    const rRedirSsrf = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=evil/repo`)
+    );
+    assert.equal(rRedirSsrf.status, 403);
+    assert.equal(ssrfRedirect.wasCanceled(), true);
+  });
+
+  it("maps upstream 404, 429, 500, network failure, and redirect loop with body cancellation", async () => {
+    const tracked404 = makeTrackedResponse("not found", { status: 404 });
+    const tracked429 = makeTrackedResponse("rate limited", {
+      status: 429,
+      headers: { "Retry-After": "45" },
+    });
+    const tracked500 = makeTrackedResponse("boom", { status: 500 });
+
+    const worker = createWorkerHandler({
+      maxRedirects: 2,
+      fetchImpl: async (url) => {
+        if (url.includes("/archive/missing.tar.gz")) return tracked404.response;
+        if (url.includes("/archive/ratelimit.tar.gz")) return tracked429.response;
+        if (url.includes("/archive/fail500.tar.gz")) return tracked500.response;
+        if (url.includes("/archive/neterr.tar.gz")) throw new Error("ECONNRESET");
+        if (url.includes("/archive/loop.tar.gz")) {
+          return new Response(null, { status: 302, headers: { Location: url } });
+        }
+        return new Response(FAKE_GZIP, { status: 200 });
+      },
+    });
+
+    const r404 = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World&ref=missing`)
+    );
+    assert.equal(r404.status, 404);
+    assert.equal(tracked404.wasCanceled(), true);
+
+    const r429 = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World&ref=ratelimit`)
+    );
+    assert.equal(r429.status, 429);
+    assert.equal(r429.headers.get("retry-after"), "45");
+    assert.equal(tracked429.wasCanceled(), true);
+
+    const r500 = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World&ref=fail500`)
+    );
+    assert.equal(r500.status, 502);
+    assert.equal(tracked500.wasCanceled(), true);
+
+    const rNet = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World&ref=neterr`)
+    );
+    assert.equal(rNet.status, 502);
+
+    const rLoop = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World&ref=loop`)
+    );
+    assert.equal(rLoop.status, 502);
+  });
+
+  it("handles CORS, CORP, exposed git headers, and OPTIONS preflight on /api/git/archive", async () => {
+    const worker = createWorkerHandler({
+      allowedOrigins: "https://app.example.com",
+      fetchImpl: async () => new Response(FAKE_GZIP, { status: 200 }),
+    });
+
+    // Allowed cross-origin OPTIONS -> 204
+    const optOk = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World`, {
+        method: "OPTIONS",
+        headers: { Origin: "https://app.example.com" },
+      })
+    );
+    assert.equal(optOk.status, 204);
+    assert.equal(optOk.headers.get("access-control-allow-origin"), "https://app.example.com");
+    assert.equal(optOk.headers.get("cross-origin-resource-policy"), "cross-origin");
+    const exposed = optOk.headers.get("access-control-expose-headers") || "";
+    assert.ok(exposed.includes("X-Git-Archive-Format"));
+    assert.ok(exposed.includes("X-Git-Strip-Components"));
+
+    // Disallowed cross-origin OPTIONS -> 403
+    const optDenied = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World`, {
+        method: "OPTIONS",
+        headers: { Origin: "https://evil.example.com" },
+      })
+    );
+    assert.equal(optDenied.status, 403);
+
+    // Disallowed GET omits ACAO and keeps CORP same-origin
+    const getDenied = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World`, {
+        headers: { Origin: "https://evil.example.com" },
+      })
+    );
+    assert.equal(getDenied.status, 200);
+    assert.equal(getDenied.headers.get("access-control-allow-origin"), null);
+    assert.equal(getDenied.headers.get("cross-origin-resource-policy"), "same-origin");
+  });
+
+  it("caches immutable/mutable git archives in caches.default with multi-origin isolation and HEAD semantics", async () => {
+    const cache = createMemoryCache();
+    let upstreamCalls = 0;
+    const waitUntilPromises = [];
+    const ctx = { waitUntil: (p) => waitUntilPromises.push(p) };
+
+    const worker = createWorkerHandler({
+      cache,
+      allowedOrigins: "https://a.example.com,https://b.example.com",
+      fetchImpl: async () => {
+        upstreamCalls++;
+        return new Response(FAKE_GZIP, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/x-gzip",
+            "Content-Length": String(FAKE_GZIP.byteLength),
+          },
+        });
+      },
+    });
+
+    // 1. HEAD miss must NOT populate cache
+    const headMiss = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World&ref=${FULL_SHA}`, {
+        method: "HEAD",
+      }),
+      {},
+      ctx
+    );
+    assert.equal(headMiss.status, 200);
+    assert.equal(upstreamCalls, 1);
+    assert.equal(cache.store.size, 0);
+
+    // 2. GET miss from Origin A populates cache with immutable TTL and no ACAO/Vary in cache
+    const res1 = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World&ref=${FULL_SHA}`, {
+        headers: { Origin: "https://a.example.com" },
+      }),
+      {},
+      ctx
+    );
+    assert.equal(res1.status, 200);
+    assert.equal(res1.headers.get("access-control-allow-origin"), "https://a.example.com");
+    assert.deepEqual(Array.from(new Uint8Array(await res1.arrayBuffer())), Array.from(FAKE_GZIP));
+    await Promise.all(waitUntilPromises);
+
+    assert.equal(upstreamCalls, 2);
+    assert.equal(cache.store.size, 1);
+    const cachedEntry = Array.from(cache.store.values())[0];
+    assert.equal(cachedEntry.headers.get("cache-control"), "public, max-age=604800, immutable");
+    assert.equal(cachedEntry.headers.get("access-control-allow-origin"), null);
+    assert.equal(cachedEntry.headers.get("vary"), null);
+
+    // 3. Equivalent full GitHub URL from Origin B hits same cache key and gets Origin B's CORS headers
+    const res2 = await worker.fetch(
+      new Request(
+        `${WORKER_ORIGIN}/api/git/archive?repo=${encodeURIComponent(
+          "https://github.com/octocat/Hello-World.git"
+        )}&ref=${FULL_SHA.toUpperCase()}`,
+        { headers: { Origin: "https://b.example.com" } }
+      ),
+      {},
+      ctx
+    );
+    assert.equal(res2.status, 200);
+    assert.equal(upstreamCalls, 2);
+    assert.equal(res2.headers.get("access-control-allow-origin"), "https://b.example.com");
+    assert.equal(res2.headers.get("x-git-strip-components"), "1");
+    assert.deepEqual(Array.from(new Uint8Array(await res2.arrayBuffer())), Array.from(FAKE_GZIP));
+
+    // 4. HEAD hits cached GET entry
+    const headHit = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World&ref=${FULL_SHA}`, {
+        method: "HEAD",
+      }),
+      {},
+      ctx
+    );
+    assert.equal(headHit.status, 200);
+    assert.equal(upstreamCalls, 2);
+    assert.equal(headHit.headers.get("content-length"), String(FAKE_GZIP.byteLength));
+    assert.equal(await headHit.text(), "");
+
+    // 5. Mutable branch ref cached with 5-minute TTL
+    const resBranch = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World&ref=main`),
+      {},
+      ctx
+    );
+    assert.equal(resBranch.status, 200);
+    await resBranch.arrayBuffer();
+    await Promise.all(waitUntilPromises);
+    assert.equal(upstreamCalls, 3);
+    assert.equal(cache.store.size, 2);
+    const branchEntry = Array.from(cache.store.values())[1];
+    assert.equal(branchEntry.headers.get("cache-control"), "public, max-age=300");
+  });
+});
+
+describe("Cloudflare Worker: M13 Phase 2 Adversarial Regressions (BUG-A1, A2, A3)", () => {
+  const FAKE_GZIP = new Uint8Array([0x1f, 0x8b, 0x08, 0x00, 0xca, 0xfe]);
+  const FULL_SHA = "0123456789abcdef0123456789abcdef01234567";
+
+  it("BUG-A1: strips #fragment from Request URLs on /api/git/archive for both repo and ref", async () => {
+    const requestedUrls = [];
+    const worker = createWorkerHandler({
+      fetchImpl: async (url) => {
+        requestedUrls.push(String(url));
+        return new Response(FAKE_GZIP, { status: 200 });
+      },
+    });
+
+    const r1 = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World#frag`)
+    );
+    assert.equal(r1.status, 200);
+    assert.equal(requestedUrls[0], "https://github.com/octocat/Hello-World/archive/HEAD.tar.gz");
+
+    const r2 = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World&ref=main#frag`)
+    );
+    assert.equal(r2.status, 200);
+    assert.equal(requestedUrls[1], "https://github.com/octocat/Hello-World/archive/main.tar.gz");
+  });
+
+  it("BUG-A2: emits Vary: Origin even when Origin header is absent if ALLOWED_ORIGINS is configured", async () => {
+    const workerWithAllowed = createWorkerHandler({
+      allowedOrigins: "https://app.example.com",
+      fetchImpl: async () => new Response(FAKE_GZIP, { status: 200 }),
+    });
+
+    const noOriginRes = await workerWithAllowed.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World&ref=${FULL_SHA}`)
+    );
+    assert.equal(noOriginRes.status, 200);
+    assert.equal(noOriginRes.headers.get("vary"), "Origin");
+    assert.equal(noOriginRes.headers.get("access-control-allow-origin"), null);
+    assert.equal(noOriginRes.headers.get("cross-origin-resource-policy"), "same-origin");
+
+    const withOriginRes = await workerWithAllowed.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World&ref=${FULL_SHA}`, {
+        headers: { Origin: "https://app.example.com" },
+      })
+    );
+    assert.equal(withOriginRes.status, 200);
+    assert.equal(withOriginRes.headers.get("vary"), "Origin");
+    assert.equal(withOriginRes.headers.get("access-control-allow-origin"), "https://app.example.com");
+    assert.equal(withOriginRes.headers.get("cross-origin-resource-policy"), "cross-origin");
+
+    // When ALLOWED_ORIGINS is unset and Origin is absent, Vary: Origin is not needed
+    const workerNoAllowed = createWorkerHandler({
+      fetchImpl: async () => new Response(FAKE_GZIP, { status: 200 }),
+    });
+    const plainRes = await workerNoAllowed.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World&ref=${FULL_SHA}`)
+    );
+    assert.equal(plainRes.status, 200);
+    assert.equal(plainRes.headers.get("vary"), null);
+  });
+
+  it("BUG-A3: maps upstream 204/206 to 502 JSON and cancels any upstream stream body", async () => {
+    // 1. 204 with null body
+    const wNull = createWorkerHandler({
+      fetchImpl: async () => new Response(null, { status: 204 }),
+    });
+    const rNull = await wNull.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World`)
+    );
+    assert.equal(rNull.status, 502);
+    const jNull = await rNull.json();
+    assert.match(jNull.error, /HTTP 204/);
+
+    // 2. 204-like object with tracked ReadableStream body -> must cancel stream & return 502
+    let streamCanceled = false;
+    const trackedStream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1, 2, 3]));
+      },
+      cancel() {
+        streamCanceled = true;
+      },
+    });
+    const wStream = createWorkerHandler({
+      fetchImpl: async () => ({ status: 204, headers: new Headers(), body: trackedStream }),
+    });
+    const rStream = await wStream.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World`)
+    );
+    assert.equal(rStream.status, 502);
+    assert.equal(streamCanceled, true, "Upstream 204 stream body must be canceled");
+
+    // 3. 206 Partial Content -> 502 with canceled body
+    const tracked206 = makeTrackedResponse([FAKE_GZIP], { status: 206 });
+    const w206 = createWorkerHandler({
+      fetchImpl: async () => tracked206.response,
+    });
+    const r206 = await w206.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World`)
+    );
+    assert.equal(r206.status, 502);
+    assert.equal(tracked206.wasCanceled(), true);
+  });
+
+  it("blocks adversarial redirect targets, sanitizes Retry-After/strip-components, enforces HEAD parity, and survives sync cache.put throws", async () => {
+    const blockedRedirects = [
+      "//169.254.169.254/latest/meta-data",
+      "file:///etc/passwd",
+      "ftp://evil.example/a.tar.gz",
+      "http://evil.example/a.tar.gz",
+      "https://user:pass@codeload.github.com/a/b",
+      "http://[::ffff:127.0.0.1]/secret",
+    ];
+    for (const loc of blockedRedirects) {
+      const worker = createWorkerHandler({
+        allowLocalRegistries: true,
+        fetchImpl: async () => new Response(null, { status: 302, headers: { Location: loc } }),
+      });
+      const res = await worker.fetch(
+        new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World`)
+      );
+      assert.equal(res.status, 403, `Expected 403 for redirect Location=${loc}, got ${res.status}`);
+    }
+
+    // 302 without Location -> 502
+    const wNoLoc = createWorkerHandler({
+      fetchImpl: async () => new Response(null, { status: 302 }),
+    });
+    const rNoLoc = await wNoLoc.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World`)
+    );
+    assert.equal(rNoLoc.status, 502);
+
+    // 429 unsafe Retry-After omitted
+    const wUnsafeRetry = createWorkerHandler({
+      fetchImpl: async () =>
+        new Response("rate limited", {
+          status: 429,
+          headers: { "Retry-After": "9".repeat(70) },
+        }),
+    });
+    const rUnsafeRetry = await wUnsafeRetry.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World`)
+    );
+    assert.equal(rUnsafeRetry.status, 429);
+    assert.equal(rUnsafeRetry.headers.get("retry-after"), null);
+
+    // Invalid X-Git-Strip-Components falls back to 1
+    for (const badStrip of ["-1", "99", "abc"]) {
+      const wStrip = createWorkerHandler({
+        fetchImpl: async () =>
+          new Response(FAKE_GZIP, {
+            status: 200,
+            headers: { "X-Git-Strip-Components": badStrip },
+          }),
+      });
+      const rStrip = await wStrip.fetch(
+        new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World`)
+      );
+      assert.equal(rStrip.status, 200);
+      assert.equal(rStrip.headers.get("x-git-strip-components"), "1");
+    }
+
+    // HEAD error parity (400, 403, 404, 429, 502)
+    const headSpecs = [
+      { url: `${WORKER_ORIGIN}/api/git/archive`, status: 400, upstream: 200 },
+      {
+        url: `${WORKER_ORIGIN}/api/git/archive?repo=${encodeURIComponent("https://0x7f000001/a/b")}`,
+        status: 403,
+        upstream: 200,
+      },
+      { url: `${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World`, status: 404, upstream: 404 },
+      { url: `${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World`, status: 429, upstream: 429 },
+      { url: `${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World`, status: 502, upstream: 204 },
+    ];
+    for (const spec of headSpecs) {
+      const w = createWorkerHandler({
+        fetchImpl: async () => new Response(null, { status: spec.upstream }),
+      });
+      const r = await w.fetch(new Request(spec.url, { method: "HEAD" }));
+      assert.equal(r.status, spec.status, `HEAD ${spec.url}`);
+      assert.equal(r.headers.get("cross-origin-opener-policy"), "same-origin");
+      assert.equal(r.headers.get("cross-origin-embedder-policy"), "require-corp");
+      assert.equal(r.headers.get("x-content-type-options"), "nosniff");
+      assert.ok(Number(r.headers.get("content-length")) > 0);
+      assert.equal(await r.text(), "");
+    }
+
+    // Synchronous throw in edgeCache.put must not break a 200 streaming response
+    const brokenCache = {
+      async match() {
+        return undefined;
+      },
+      put() {
+        throw new Error("cache storage quota exceeded synchronously");
+      },
+    };
+    const wSyncCache = createWorkerHandler({
+      cache: brokenCache,
+      fetchImpl: async () => new Response(FAKE_GZIP, { status: 200 }),
+    });
+    const rSyncCache = await wSyncCache.fetch(
+      new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World&ref=${FULL_SHA}`)
+    );
+    assert.equal(rSyncCache.status, 200);
+    assert.deepEqual(
+      Array.from(new Uint8Array(await rSyncCache.arrayBuffer())),
+      Array.from(FAKE_GZIP)
+    );
+  });
+
+  it("GAP-1: strips #fragment from edge cache keys on both /api/git/archive and /api/v2/*", async () => {
+    const store = new Map();
+    const cache = {
+      store,
+      async match(req) {
+        const key = typeof req === "string" ? req : req.url;
+        const entry = store.get(key);
+        if (!entry) return undefined;
+        return new Response(entry.body.slice(0), {
+          status: entry.status,
+          headers: new Headers(entry.headers),
+        });
+      },
+      async put(req, res) {
+        const key = typeof req === "string" ? req : req.url;
+        const buf = new Uint8Array(await res.arrayBuffer());
+        store.set(key, {
+          status: res.status,
+          headers: new Headers(res.headers),
+          body: buf,
+        });
+      },
+    };
+    let gitUpstreamCalls = 0;
+    let ociUpstreamCalls = 0;
+    const waitUntilPromises = [];
+    const ctx = { waitUntil: (p) => waitUntilPromises.push(p) };
+
+    const worker = createWorkerHandler({
+      cache,
+      fetchImpl: async (url) => {
+        if (url.startsWith("https://github.com/")) {
+          gitUpstreamCalls++;
+          return new Response(FAKE_GZIP, {
+            status: 200,
+            headers: {
+              "Content-Type": "application/gzip",
+              "Content-Length": String(FAKE_GZIP.byteLength),
+            },
+          });
+        }
+        ociUpstreamCalls++;
+        return new Response(JSON.stringify({ schemaVersion: 2 }), {
+          status: 200,
+          headers: { "Content-Type": "application/vnd.oci.image.manifest.v1+json" },
+        });
+      },
+    });
+
+    // 1. /api/git/archive with and without #fragment must hit the same cache entry
+    const gitBase = `${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World&ref=main`;
+    const g1 = await worker.fetch(new Request(gitBase), {}, ctx);
+    assert.equal(g1.status, 200);
+    await g1.arrayBuffer();
+    await Promise.all(waitUntilPromises.splice(0));
+
+    const g2 = await worker.fetch(new Request(`${gitBase}#frag`), {}, ctx);
+    assert.equal(g2.status, 200);
+    await g2.arrayBuffer();
+    await Promise.all(waitUntilPromises.splice(0));
+
+    assert.equal(gitUpstreamCalls, 1, "Fragment-bearing /api/git/archive URL must hit edge cache");
+    assert.equal(cache.store.size, 1);
+
+    // 2. /api/v2/* with and without #fragment must hit the same cache entry
+    const ociBase = `${WORKER_ORIGIN}/api/v2/ghcr.io/org/app/manifests/latest`;
+    const o1 = await worker.fetch(new Request(ociBase), {}, ctx);
+    assert.equal(o1.status, 200);
+    await o1.text();
+    await Promise.all(waitUntilPromises.splice(0));
+
+    const o2 = await worker.fetch(new Request(`${ociBase}#frag`), {}, ctx);
+    assert.equal(o2.status, 200);
+    await o2.text();
+    await Promise.all(waitUntilPromises.splice(0));
+
+    assert.equal(ociUpstreamCalls, 1, "Fragment-bearing /api/v2/* URL must hit edge cache");
+    assert.equal(cache.store.size, 2);
+  });
+
+  it("GAP-2: maps /api/v2/* upstream 204/206 to 502 and cancels upstream stream body", async () => {
+    // 1. 204-like response with a tracked ReadableStream body
+    let streamCanceled = false;
+    const trackedStream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1, 2, 3]));
+      },
+      cancel() {
+        streamCanceled = true;
+      },
+    });
+    const w204 = createWorkerHandler({
+      fetchImpl: async () => ({ status: 204, headers: new Headers(), body: trackedStream }),
+    });
+    const r204 = await w204.fetch(
+      new Request(`${WORKER_ORIGIN}/api/v2/ghcr.io/org/app/manifests/latest`)
+    );
+    assert.equal(r204.status, 502);
+    assert.equal(streamCanceled, true, "Upstream 204 stream body must be canceled on /api/v2/*");
+    const j204 = await r204.json();
+    assert.match(j204.error, /HTTP 204/);
+
+    // 2. 206 Partial Content -> 502 with canceled body
+    const tracked206 = makeTrackedResponse("partial", { status: 206 });
+    const w206 = createWorkerHandler({
+      fetchImpl: async () => tracked206.response,
+    });
+    const r206 = await w206.fetch(
+      new Request(`${WORKER_ORIGIN}/api/v2/ghcr.io/org/app/manifests/latest`)
+    );
+    assert.equal(r206.status, 502);
+    assert.equal(tracked206.wasCanceled(), true, "Upstream 206 stream body must be canceled");
+    const j206 = await r206.json();
+    assert.match(j206.error, /HTTP 206/);
+  });
+
+  it("GAP-3: returns empty bodies on HEAD error responses for /api/v2/* and fallback 404", async () => {
+    const cases = [
+      {
+        label: "invalid OCI path (400)",
+        url: `${WORKER_ORIGIN}/api/v2/invalid`,
+        expectedStatus: 400,
+        fetchImpl: async () => new Response("ok", { status: 200 }),
+      },
+      {
+        label: "SSRF blocked registry (403)",
+        url: `${WORKER_ORIGIN}/api/v2/127.0.0.1:5000/org/app/manifests/latest`,
+        expectedStatus: 403,
+        fetchImpl: async () => new Response("ok", { status: 200 }),
+      },
+      {
+        label: "upstream 404 on /api/v2/*",
+        url: `${WORKER_ORIGIN}/api/v2/ghcr.io/org/app/manifests/missing`,
+        expectedStatus: 404,
+        fetchImpl: async () => new Response("not found", { status: 404 }),
+      },
+      {
+        label: "upstream 429 on /api/v2/*",
+        url: `${WORKER_ORIGIN}/api/v2/ghcr.io/org/app/manifests/ratelimited`,
+        expectedStatus: 429,
+        fetchImpl: async () => new Response("slow down", { status: 429 }),
+      },
+      {
+        label: "upstream 204 -> 502 on /api/v2/*",
+        url: `${WORKER_ORIGIN}/api/v2/ghcr.io/org/app/manifests/empty`,
+        expectedStatus: 502,
+        fetchImpl: async () => new Response(null, { status: 204 }),
+      },
+      {
+        label: "upstream network error -> 502 on /api/v2/*",
+        url: `${WORKER_ORIGIN}/api/v2/ghcr.io/org/app/manifests/boom`,
+        expectedStatus: 502,
+        fetchImpl: async () => {
+          throw new Error("boom");
+        },
+      },
+      {
+        label: "fallback 404 without env.ASSETS",
+        url: `${WORKER_ORIGIN}/nonexistent`,
+        expectedStatus: 404,
+        fetchImpl: async () => new Response("ok", { status: 200 }),
+      },
+    ];
+
+    for (const c of cases) {
+      const worker = createWorkerHandler({ fetchImpl: c.fetchImpl });
+      const res = await worker.fetch(new Request(c.url, { method: "HEAD" }), {});
+      assert.equal(res.status, c.expectedStatus, c.label);
+      assert.ok(Number(res.headers.get("content-length")) > 0, `${c.label}: Content-Length`);
+      assert.equal(await res.text(), "", `${c.label}: HEAD body must be empty`);
+    }
+  });
+});
+
+
+

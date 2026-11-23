@@ -20,6 +20,11 @@ import {
   selectInitialScheme,
   createTokenCache,
 } from "../../server/proxy_core.mjs";
+import {
+  GIT_ARCHIVE_USER_AGENT,
+  parseGitArchiveQuery,
+  parseStripComponentsHeader,
+} from "../../server/git_core.mjs";
 
 const CORS_ALLOW_METHODS = "GET, HEAD, OPTIONS";
 const CORS_ALLOW_HEADERS = "Accept";
@@ -30,7 +35,19 @@ const CORS_EXPOSE_HEADERS = [
   "ETag",
   "Cache-Control",
   "Accept-Ranges",
+  "X-Git-Archive-Format",
+  "X-Git-Strip-Components",
 ].join(", ");
+
+const GIT_CACHED_HEADERS = [
+  "content-type",
+  "content-length",
+  "etag",
+  "cache-control",
+  "x-git-archive-format",
+  "x-git-strip-components",
+];
+const RETRY_AFTER_SAFE_RE = /^[A-Za-z0-9, :+-]{1,64}$/;
 
 const USER_AGENT = "elf2wasm-registry-proxy/1.0";
 
@@ -65,9 +82,19 @@ function getEdgeCacheControl(kind, target) {
 function buildEdgeCacheKey(requestUrl, kind, acceptHeader) {
   const keyUrl = new URL(requestUrl);
   keyUrl.search = "";
+  keyUrl.hash = "";
   if (kind === "manifests" && acceptHeader) {
     keyUrl.searchParams.set("__accept", acceptHeader);
   }
+  return new Request(keyUrl.toString(), { method: "GET" });
+}
+
+function buildGitEdgeCacheKey(requestUrl, canonicalUpstreamUrl) {
+  const keyUrl = new URL(requestUrl);
+  keyUrl.pathname = "/api/git/archive";
+  keyUrl.search = "";
+  keyUrl.hash = "";
+  keyUrl.searchParams.set("__upstream", canonicalUpstreamUrl);
   return new Request(keyUrl.toString(), { method: "GET" });
 }
 
@@ -99,6 +126,12 @@ function parseBoolEnv(val) {
  * Returns `{ allowed, isCrossOrigin, allowOriginHeader, varyOrigin }`.
  */
 function evaluateCors(request, env, defaultAllowedOrigins) {
+  const configuredRaw =
+    env && typeof env.ALLOWED_ORIGINS === "string"
+      ? env.ALLOWED_ORIGINS
+      : defaultAllowedOrigins;
+  const allowedSet = parseAllowedOrigins(configuredRaw);
+
   const requestOrigin = request.headers.get("origin");
   if (!requestOrigin) {
     return {
@@ -106,7 +139,7 @@ function evaluateCors(request, env, defaultAllowedOrigins) {
       allowed: true,
       isCrossOrigin: false,
       allowOriginHeader: null,
-      varyOrigin: false,
+      varyOrigin: allowedSet.size > 0,
     };
   }
 
@@ -126,12 +159,6 @@ function evaluateCors(request, env, defaultAllowedOrigins) {
       varyOrigin: true,
     };
   }
-
-  const configuredRaw =
-    env && typeof env.ALLOWED_ORIGINS === "string"
-      ? env.ALLOWED_ORIGINS
-      : defaultAllowedOrigins;
-  const allowedSet = parseAllowedOrigins(configuredRaw);
 
   if (allowedSet.has(requestOrigin)) {
     return {
@@ -440,6 +467,7 @@ export function createWorkerHandler(options = {}) {
 
   async function handleOciProxy(request, env, ctx, rawPathname, cors) {
     const method = (request.method || "GET").toUpperCase();
+    const headOnly = method === "HEAD";
 
     if (method === "OPTIONS") {
       if (!cors.allowed) {
@@ -567,15 +595,19 @@ export function createWorkerHandler(options = {}) {
       const status = upstreamRes.status || 502;
       if (status === 404) {
         await cancelBodySafely(upstreamRes);
-        return jsonResponse({ error: "Upstream OCI resource not found" }, 404, cors);
+        return jsonResponse({ error: "Upstream OCI resource not found" }, 404, cors, { headOnly });
       }
       if (status === 429) {
         await cancelBodySafely(upstreamRes);
-        return jsonResponse({ error: "Upstream registry rate-limited (HTTP 429)" }, 429, cors);
+        return jsonResponse({ error: "Upstream registry rate-limited (HTTP 429)" }, 429, cors, {
+          headOnly,
+        });
       }
-      if (status < 200 || status >= 300) {
+      if (status !== 200) {
         await cancelBodySafely(upstreamRes);
-        return jsonResponse({ error: `Upstream registry returned HTTP ${status}` }, 502, cors);
+        return jsonResponse({ error: `Upstream registry returned HTTP ${status}` }, 502, cors, {
+          headOnly,
+        });
       }
 
       const outHeaders = new Headers();
@@ -605,9 +637,9 @@ export function createWorkerHandler(options = {}) {
         if (upstreamRes.body && typeof upstreamRes.body.tee === "function") {
           const [clientStream, cacheStream] = upstreamRes.body.tee();
           const cacheRes = new Response(cacheStream, { status, headers: cacheHeaders });
-          const putPromise = Promise.resolve(edgeCache.put(edgeCacheKey, cacheRes)).catch(() =>
-            cancelBodySafely(cacheRes)
-          );
+          const putPromise = Promise.resolve()
+            .then(() => edgeCache.put(edgeCacheKey, cacheRes))
+            .catch(() => cancelBodySafely(cacheRes));
           if (ctx && typeof ctx.waitUntil === "function") {
             ctx.waitUntil(putPromise);
           }
@@ -615,7 +647,9 @@ export function createWorkerHandler(options = {}) {
         }
 
         const cacheRes = new Response(null, { status, headers: cacheHeaders });
-        const putPromise = Promise.resolve(edgeCache.put(edgeCacheKey, cacheRes)).catch(() => {});
+        const putPromise = Promise.resolve()
+          .then(() => edgeCache.put(edgeCacheKey, cacheRes))
+          .catch(() => {});
         if (ctx && typeof ctx.waitUntil === "function") {
           ctx.waitUntil(putPromise);
         }
@@ -625,12 +659,187 @@ export function createWorkerHandler(options = {}) {
       return new Response(upstreamRes.body, { status, headers: outHeaders });
     } catch (err) {
       if (err instanceof ProxyError) {
-        return jsonResponse({ error: err.message }, err.statusCode, cors);
+        return jsonResponse({ error: err.message }, err.statusCode, cors, { headOnly });
       }
       return jsonResponse(
         { error: `Registry proxy error: ${err?.message || "unknown error"}` },
         502,
-        cors
+        cors,
+        { headOnly }
+      );
+    }
+  }
+
+  async function handleGitArchiveProxy(request, env, ctx, cors) {
+    const method = (request.method || "GET").toUpperCase();
+    const headOnly = method === "HEAD";
+
+    if (method === "OPTIONS") {
+      if (!cors.allowed) {
+        return jsonResponse({ error: "Origin not allowed" }, 403, cors);
+      }
+      const headers = new Headers();
+      applyApiHeaders(headers, cors);
+      headers.set("Access-Control-Max-Age", "86400");
+      return new Response(null, { status: 204, headers });
+    }
+
+    if (method !== "GET" && method !== "HEAD") {
+      return jsonResponse({ error: "Method Not Allowed" }, 405, cors, {
+        extraHeaders: { Allow: "GET, HEAD, OPTIONS" },
+      });
+    }
+
+    const allowLocalRegistries =
+      defaultAllowLocalRegistries || parseBoolEnv(env?.ALLOW_LOCAL_REGISTRIES);
+
+    try {
+      const spec = parseGitArchiveQuery(request.url, { allowLocalRegistries });
+
+      const edgeCacheKey = edgeCache
+        ? buildGitEdgeCacheKey(request.url, spec.archiveUrl.toString())
+        : null;
+
+      if (edgeCache && edgeCacheKey) {
+        let cachedRes = null;
+        try {
+          cachedRes = await edgeCache.match(edgeCacheKey);
+        } catch {
+          cachedRes = null;
+        }
+        if (cachedRes) {
+          const outHeaders = new Headers();
+          applyApiHeaders(outHeaders, cors);
+          for (const headerName of GIT_CACHED_HEADERS) {
+            const val = cachedRes.headers.get(headerName);
+            if (val !== null) {
+              outHeaders.set(headerName, val);
+            }
+          }
+          if (!outHeaders.has("content-type")) {
+            outHeaders.set("Content-Type", "application/gzip");
+          }
+          if (!outHeaders.has("x-git-archive-format")) {
+            outHeaders.set("X-Git-Archive-Format", "tar.gz");
+          }
+          if (!outHeaders.has("x-git-strip-components")) {
+            outHeaders.set("X-Git-Strip-Components", String(spec.defaultStripComponents));
+          }
+          if (headOnly) {
+            await cancelBodySafely(cachedRes);
+            return new Response(null, { status: cachedRes.status, headers: outHeaders });
+          }
+          return new Response(cachedRes.body, { status: cachedRes.status, headers: outHeaders });
+        }
+      }
+
+      const upstreamRes = await requestWithRedirects(spec.archiveUrl, {
+        method,
+        baseHeaders: {
+          "User-Agent": GIT_ARCHIVE_USER_AGENT,
+          Accept: "application/gzip, application/octet-stream, */*",
+        },
+        authToken: null,
+        allowLocalRegistries,
+      });
+
+      const status = upstreamRes.status || 502;
+      if (status === 404) {
+        await cancelBodySafely(upstreamRes);
+        return jsonResponse({ error: "Upstream git repository or ref not found" }, 404, cors, {
+          headOnly,
+        });
+      }
+      if (status === 429) {
+        const rawRetryAfter = upstreamRes.headers.get("retry-after");
+        await cancelBodySafely(upstreamRes);
+        const extraHeaders =
+          typeof rawRetryAfter === "string" && RETRY_AFTER_SAFE_RE.test(rawRetryAfter.trim())
+            ? { "Retry-After": rawRetryAfter.trim() }
+            : null;
+        return jsonResponse({ error: "Upstream git host rate-limited (HTTP 429)" }, 429, cors, {
+          headOnly,
+          extraHeaders,
+        });
+      }
+      if (status !== 200) {
+        await cancelBodySafely(upstreamRes);
+        return jsonResponse({ error: `Upstream git host returned HTTP ${status}` }, 502, cors, {
+          headOnly,
+        });
+      }
+
+      const stripComponents = parseStripComponentsHeader(
+        upstreamRes.headers.get("x-git-strip-components"),
+        spec.defaultStripComponents
+      );
+
+      const contentLength = upstreamRes.headers.get("content-length");
+      const etag = upstreamRes.headers.get("etag");
+
+      const outHeaders = new Headers();
+      applyApiHeaders(outHeaders, cors);
+      outHeaders.set("Content-Type", "application/gzip");
+      if (contentLength !== null) {
+        outHeaders.set("Content-Length", contentLength);
+      }
+      if (etag !== null) {
+        outHeaders.set("ETag", etag);
+      }
+      outHeaders.set("X-Git-Archive-Format", "tar.gz");
+      outHeaders.set("X-Git-Strip-Components", String(stripComponents));
+      outHeaders.set("Cache-Control", spec.cacheControl);
+
+      if (headOnly) {
+        await cancelBodySafely(upstreamRes);
+        return new Response(null, { status, headers: outHeaders });
+      }
+
+      if (edgeCache && edgeCacheKey && status === 200) {
+        const cacheHeaders = new Headers();
+        cacheHeaders.set("Content-Type", "application/gzip");
+        if (contentLength !== null) {
+          cacheHeaders.set("Content-Length", contentLength);
+        }
+        if (etag !== null) {
+          cacheHeaders.set("ETag", etag);
+        }
+        cacheHeaders.set("X-Git-Archive-Format", "tar.gz");
+        cacheHeaders.set("X-Git-Strip-Components", String(stripComponents));
+        cacheHeaders.set("Cache-Control", spec.cacheControl);
+
+        if (upstreamRes.body && typeof upstreamRes.body.tee === "function") {
+          const [clientStream, cacheStream] = upstreamRes.body.tee();
+          const cacheRes = new Response(cacheStream, { status, headers: cacheHeaders });
+          const putPromise = Promise.resolve()
+            .then(() => edgeCache.put(edgeCacheKey, cacheRes))
+            .catch(() => cancelBodySafely(cacheRes));
+          if (ctx && typeof ctx.waitUntil === "function") {
+            ctx.waitUntil(putPromise);
+          }
+          return new Response(clientStream, { status, headers: outHeaders });
+        }
+
+        const cacheRes = new Response(null, { status, headers: cacheHeaders });
+        const putPromise = Promise.resolve()
+          .then(() => edgeCache.put(edgeCacheKey, cacheRes))
+          .catch(() => {});
+        if (ctx && typeof ctx.waitUntil === "function") {
+          ctx.waitUntil(putPromise);
+        }
+        return new Response(upstreamRes.body, { status, headers: outHeaders });
+      }
+
+      return new Response(upstreamRes.body, { status, headers: outHeaders });
+    } catch (err) {
+      if (err instanceof ProxyError) {
+        return jsonResponse({ error: err.message }, err.statusCode, cors, { headOnly });
+      }
+      return jsonResponse(
+        { error: `Git archive proxy error: ${err?.message || "unknown error"}` },
+        502,
+        cors,
+        { headOnly }
       );
     }
   }
@@ -661,11 +870,18 @@ export function createWorkerHandler(options = {}) {
         return handleOciProxy(request, env, ctx, rawPathname, cors);
       }
 
+      if (rawPathname === "/api/git/archive") {
+        return handleGitArchiveProxy(request, env, ctx, cors);
+      }
+
       if (env && env.ASSETS && typeof env.ASSETS.fetch === "function") {
         return env.ASSETS.fetch(request);
       }
 
-      return jsonResponse({ error: "Not Found" }, 404, cors);
+      const method = (request.method || "GET").toUpperCase();
+      return jsonResponse({ error: "Not Found" }, 404, cors, {
+        headOnly: method === "HEAD",
+      });
     },
   };
 }
