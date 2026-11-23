@@ -23,6 +23,7 @@ import {
   extractZipToVfs,
   runFromVfs,
   parseElf64Deps,
+  formatWasmTrapError,
 } from "./elf2wasm_shim.mjs";
 import {
   OCI_MEDIA_TYPES,
@@ -2749,6 +2750,42 @@ test("BUG-B5 & GAP-B3: WorkerBackend null overlayTarBytes/stdin parity, non-deta
     await srv.stop();
     await mockGit.stop();
   }
+});
+
+test("formatWasmTrapError annotates WebAssembly.RuntimeError with phase, elfPath, pid, and unsigned 64-bit hex regs", () => {
+  const orig = new WebAssembly.RuntimeError("unreachable");
+  // Simulate signed 64-bit WebAssembly.Global values (e.g. rip = 0xffffffffff600000 = -10485760n)
+  const fakeExports = {
+    rip: new WebAssembly.Global({ value: "i64", mutable: true }, -10485760n),
+    rsp: new WebAssembly.Global({ value: "i64", mutable: true }, 0xbfef908n),
+    rax: new WebAssembly.Global({ value: "i64", mutable: true }, -10485760n),
+  };
+  const annotated = formatWasmTrapError(orig, {
+    phase: "guest._start",
+    elfPath: "/usr/local/go/bin/go",
+    pid: 1001,
+    guestExports: fakeExports,
+  });
+
+  assert.ok(annotated instanceof WebAssembly.RuntimeError);
+  assert.equal(annotated.cause, orig);
+  assert.match(annotated.message, /unreachable/);
+  assert.match(annotated.message, /\/usr\/local\/go\/bin\/go/);
+  assert.match(annotated.message, /pid 1001/);
+  assert.match(annotated.message, /phase guest\._start/);
+  assert.match(annotated.message, /rip=0xffffffffff600000/);
+  assert.match(annotated.message, /rsp=0xbfef908/);
+  assert.match(annotated.message, /rax=0xffffffffff600000/);
+
+  // Non-guest compile phase without guestExports omits register suffix cleanly
+  const compileTrap = formatWasmTrapError(new WebAssembly.RuntimeError("unreachable"), {
+    phase: "needExec:compile",
+    elfPath: "/usr/local/go/bin/go",
+    pid: 1002,
+  });
+  assert.ok(compileTrap instanceof WebAssembly.RuntimeError);
+  assert.match(compileTrap.message, /needExec:compile/);
+  assert.doesNotMatch(compileTrap.message, /rip=/);
 });
 
 

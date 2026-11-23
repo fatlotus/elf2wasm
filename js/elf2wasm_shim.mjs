@@ -1710,7 +1710,7 @@ export class Elf2WasmSystem {
     const processes = new Map();
     this._processes = processes;
     let activePid = 1000;
-    processes.set(activePid, { instance: mainInst, module: mod });
+    processes.set(activePid, { instance: mainInst, module: mod, elfPath });
     this.activeGuest = mainInst;
 
     const effArgs =
@@ -1813,7 +1813,16 @@ export class Elf2WasmSystem {
         }
 
         if (!skipStart) {
-          lastCode = this.activeGuest.exports._start();
+          try {
+            lastCode = this.activeGuest.exports._start();
+          } catch (err) {
+            throw formatWasmTrapError(err, {
+              phase: "guest._start",
+              elfPath: processes.get(activePid)?.elfPath || elfPath,
+              pid: activePid,
+              guestExports: this.activeGuest?.exports,
+            });
+          }
         }
         skipStart = false;
 
@@ -1823,7 +1832,20 @@ export class Elf2WasmSystem {
           break;
         }
 
-        const yieldAction = rExp.runtime_on_yield();
+        let yieldAction;
+        try {
+          yieldAction = rExp.runtime_on_yield();
+        } catch (err) {
+          if (err instanceof WebAssembly.RuntimeError) {
+            throw formatWasmTrapError(err, {
+              phase: "runtime_on_yield",
+              elfPath: processes.get(activePid)?.elfPath || elfPath,
+              pid: activePid,
+              guestExports: this.activeGuest?.exports,
+            });
+          }
+          throw err;
+        }
         reapChildren();
 
         if (yieldAction === 0) {
@@ -1913,7 +1935,11 @@ export class Elf2WasmSystem {
             childInst.exports.load_ctx(scratchAddr);
           }
 
-          processes.set(childPid, { instance: childInst, module: parentEntry.module });
+          processes.set(childPid, {
+            instance: childInst,
+            module: parentEntry.module,
+            elfPath: parentEntry.elfPath,
+          });
           rExp.runtime_ack_fork(childPid);
           activePid = rExp.runtime_get_active_pid();
           this.activeGuest = processes.get(activePid).instance;
@@ -1948,7 +1974,19 @@ export class Elf2WasmSystem {
             elfPath: execInfo.path,
             env: execInfo.envp,
           });
-          const compiled = await this._compileCached(execElf, execSos, execInfo.path);
+          let compiled;
+          try {
+            compiled = await this._compileCached(execElf, execSos, execInfo.path);
+          } catch (err) {
+            if (err instanceof WebAssembly.RuntimeError) {
+              throw formatWasmTrapError(err, {
+                phase: "needExec:compile",
+                elfPath: execInfo.path,
+                pid: execInfo.pid,
+              });
+            }
+            throw err;
+          }
           if (this._aborted || signal?.aborted) {
             break;
           }
@@ -1957,7 +1995,11 @@ export class Elf2WasmSystem {
             break;
           }
 
-          processes.set(execInfo.pid, { instance: newInst, module: compiled.mod });
+          processes.set(execInfo.pid, {
+            instance: newInst,
+            module: compiled.mod,
+            elfPath: execInfo.path,
+          });
           activePid = execInfo.pid;
           this.activeGuest = newInst;
           this._completeExec(
@@ -2720,4 +2762,53 @@ export async function runFromVfs({
   });
   applyVfsOverlay(sys, vfs);
   return await sys.runFromVfs(command, args, { env });
+}
+
+function readGuestRegHex(guestExports, name) {
+  if (!guestExports || guestExports[name] == null) return null;
+  try {
+    const raw =
+      typeof guestExports[name] === "object" && "value" in guestExports[name]
+        ? guestExports[name].value
+        : guestExports[name];
+    if (typeof raw === "bigint") {
+      return `0x${BigInt.asUintN(64, raw).toString(16)}`;
+    }
+    if (typeof raw === "number" && Number.isFinite(raw)) {
+      return `0x${BigInt.asUintN(64, BigInt(Math.trunc(raw))).toString(16)}`;
+    }
+  } catch {
+    // Ignore errors while reading diagnostic registers
+  }
+  return null;
+}
+
+export function formatWasmTrapError(err, context = {}) {
+  const origMsg =
+    err && typeof err.message === "string" && err.message.length > 0
+      ? err.message
+      : String(err);
+  const phase = context.phase || "unknown";
+  const elfPath = context.elfPath || "unknown";
+  const pidPart = context.pid !== undefined && context.pid !== null ? `pid ${context.pid}, ` : "";
+
+  const regs = [];
+  if (context.guestExports) {
+    for (const reg of ["rip", "rsp", "rax"]) {
+      const hex = readGuestRegHex(context.guestExports, reg);
+      if (hex !== null) regs.push(`${reg}=${hex}`);
+    }
+  }
+  const regSuffix = regs.length > 0 ? ` at ${regs.join(" ")}` : "";
+  const message = `WASM trap (${origMsg}) in ${elfPath} (${pidPart}phase ${phase})${regSuffix}`;
+
+  const wrapped =
+    err instanceof WebAssembly.RuntimeError
+      ? new WebAssembly.RuntimeError(message)
+      : new Error(message);
+  wrapped.cause = err;
+  if (err && err.code !== undefined) {
+    wrapped.code = err.code;
+  }
+  return wrapped;
 }
