@@ -609,8 +609,11 @@ mod tests {
         assert!(handle_syscall(&mut ctx, &mut state, 100 /* times */, 0x1200, 0, 0, 0, 0, 0) >= 0);
         assert_eq!(handle_syscall(&mut ctx, &mut state, 98 /* getrusage */, 0, 0x1300, 0, 0, 0, 0), 0);
 
-        // socket(AF_INET) -> -EAFNOSUPPORT (-97)
-        assert_eq!(handle_syscall(&mut ctx, &mut state, 41 /* socket */, 2, 1, 0, 0, 0, 0), -97);
+        // socket(AF_INET6) -> -EAFNOSUPPORT (-97); socket(AF_INET, SOCK_STREAM) succeeds
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 41 /* socket */, 10, 1, 0, 0, 0, 0), -97);
+        let tcp_fd = handle_syscall(&mut ctx, &mut state, 41 /* socket */, 2, 1, 0, 0, 0, 0) as i32;
+        assert!(tcp_fd >= 3);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 3 /* close */, tcp_fd as i64, 0, 0, 0, 0, 0), 0);
 
         // socketpair(AF_UNIX) bidirectional + readv
         assert_eq!(handle_syscall(&mut ctx, &mut state, 53 /* socketpair */, 1, 1, 0, 0x1400, 0, 0), 0);
@@ -1130,5 +1133,687 @@ mod tests {
         );
         assert_eq!(state.next_pid, MAIN_PID + 5);
         assert_eq!(state.next_tid, MAIN_PID + 5);
+    }
+
+    fn insert_child_process(state: &mut HostState, child_pid: i32, zombie: bool, exit_status: i32) {
+        use crate::scheduler::{Scheduler, MAIN_PID};
+        use crate::syscalls::{MmapAllocator, ProcessState};
+        use std::collections::BTreeMap;
+        state.processes.insert(
+            child_pid,
+            ProcessState {
+                pid: child_pid,
+                ppid: MAIN_PID,
+                pgid: MAIN_PID,
+                sid: MAIN_PID,
+                umask: 0o022,
+                fds: BTreeMap::new(),
+                next_fd: 3,
+                cwd: "/".to_string(),
+                elf_path: String::new(),
+                so_entries: Vec::new(),
+                brk_start: 0,
+                brk_curr: 0,
+                mmap_start: 0,
+                mmap_end: 0,
+                mmap_alloc: MmapAllocator::new(),
+                scheduler: Scheduler::new(),
+                sig_handlers: BTreeMap::new(),
+                exited: zombie,
+                zombie,
+                exit_status,
+                vfork_parent: None,
+            },
+        );
+    }
+
+    #[test]
+    fn test_waitid_wnowait_immediate_and_wait4() {
+        let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+        state.multiproc_enabled = true;
+        let mut ctx = MockCtx::new(0x0B00_0000);
+        let child_pid = 1001;
+        insert_child_process(&mut state, child_pid, true, 42 << 8);
+
+        // waitid(P_PID=1, child_pid, infop=0x2000, WEXITED|WNOWAIT, rusage=0x2100)
+        const WEXITED: i64 = 4;
+        const WNOWAIT: i64 = 0x0100_0000;
+        let ret = handle_syscall(
+            &mut ctx,
+            &mut state,
+            247, /* SYS_WAITID */
+            1,
+            child_pid as i64,
+            0x2000,
+            WEXITED | WNOWAIT,
+            0x2100,
+            0,
+        );
+        assert_eq!(ret, 0);
+        let mut si = [0u8; 128];
+        ctx.mem_read(0x2000, &mut si).unwrap();
+        assert_eq!(i32::from_le_bytes(si[0..4].try_into().unwrap()), 17); // SIGCHLD
+        assert_eq!(i32::from_le_bytes(si[8..12].try_into().unwrap()), 1); // CLD_EXITED
+        assert_eq!(i32::from_le_bytes(si[16..20].try_into().unwrap()), child_pid);
+        assert_eq!(i32::from_le_bytes(si[24..28].try_into().unwrap()), 42);
+        // Zombie must still remain in processes because WNOWAIT was set!
+        assert!(state.processes.contains_key(&child_pid));
+
+        // Subsequent wait4(child_pid, &wstatus, 0, 0) reaps it and returns child_pid
+        let w4 = handle_syscall(
+            &mut ctx,
+            &mut state,
+            61, /* SYS_WAIT4 */
+            child_pid as i64,
+            0x2200,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(w4, child_pid as i64);
+        let mut ws = [0u8; 4];
+        ctx.mem_read(0x2200, &mut ws).unwrap();
+        assert_eq!(i32::from_le_bytes(ws), 42 << 8);
+        assert!(!state.processes.contains_key(&child_pid));
+
+        // Third wait4 returns -ECHILD (-10)
+        let w4_again = handle_syscall(&mut ctx, &mut state, 61, child_pid as i64, 0, 0, 0, 0, 0);
+        assert_eq!(w4_again, -10);
+    }
+
+    #[test]
+    fn test_waitid_wnowait_blocking_and_wait4() {
+        use crate::scheduler::{ThreadState, MAIN_TID};
+        let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+        state.multiproc_enabled = true;
+        let mut ctx = MockCtx::new(0x0B00_0000);
+        let child_pid = 1002;
+        insert_child_process(&mut state, child_pid, false, 0);
+
+        const WEXITED: i64 = 4;
+        const WNOWAIT: i64 = 0x0100_0000;
+        let ret = handle_syscall(
+            &mut ctx,
+            &mut state,
+            247, /* SYS_WAITID */
+            1,
+            child_pid as i64,
+            0x2000,
+            WEXITED | WNOWAIT,
+            0,
+            0,
+        );
+        assert_eq!(ret, 0);
+        assert_eq!(ctx.yield_flag, 1);
+        assert!(matches!(
+            state.scheduler.threads.get(&MAIN_TID).unwrap().state,
+            ThreadState::Wait4Wait { options, .. } if options == (WEXITED | WNOWAIT) as i32
+        ));
+
+        // Now child becomes a zombie with exit code 7
+        {
+            let c = state.processes.get_mut(&child_pid).unwrap();
+            c.exited = true;
+            c.zombie = true;
+            c.exit_status = 7 << 8;
+        }
+        // Drive multiproc yield handler to wake parent and complete PendingWakeup::Wait4
+        let action = state.on_yield_multiproc(&mut ctx, 1).unwrap();
+        assert_eq!(action, 1);
+        let mut si = [0u8; 128];
+        ctx.mem_read(0x2000, &mut si).unwrap();
+        assert_eq!(i32::from_le_bytes(si[16..20].try_into().unwrap()), child_pid);
+        assert_eq!(i32::from_le_bytes(si[24..28].try_into().unwrap()), 7);
+        assert!(state.processes.contains_key(&child_pid));
+
+        // Subsequent wait4 reaps child
+        let w4 = handle_syscall(&mut ctx, &mut state, 61, child_pid as i64, 0x2200, 0, 0, 0, 0);
+        assert_eq!(w4, child_pid as i64);
+        let mut ws = [0u8; 4];
+        ctx.mem_read(0x2200, &mut ws).unwrap();
+        assert_eq!(i32::from_le_bytes(ws), 7 << 8);
+    }
+
+    #[test]
+    fn test_waitid_without_wnowait_reaps_and_cld_killed_and_einval() {
+        let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+        state.multiproc_enabled = true;
+        let mut ctx = MockCtx::new(0x0B00_0000);
+        let child_pid = 1003;
+        // Signal 9 (SIGKILL) -> exit_status = 9
+        insert_child_process(&mut state, child_pid, true, 9);
+
+        // Invalid options (0) -> -EINVAL (-22)
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 247, 1, child_pid as i64, 0x2000, 0, 0, 0),
+            -22
+        );
+        // Invalid idtype (99) -> -EINVAL (-22)
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 247, 99, child_pid as i64, 0x2000, 4, 0, 0),
+            -22
+        );
+        // Invalid P_PID id (0) -> -EINVAL (-22)
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 247, 1, 0, 0x2000, 4, 0, 0),
+            -22
+        );
+
+        // Without WNOWAIT: populates CLD_KILLED (2) + sig=9 and reaps child
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 247, 1, child_pid as i64, 0x2000, 4, 0, 0),
+            0
+        );
+        let mut si = [0u8; 128];
+        ctx.mem_read(0x2000, &mut si).unwrap();
+        assert_eq!(i32::from_le_bytes(si[0..4].try_into().unwrap()), 17); // SIGCHLD
+        assert_eq!(i32::from_le_bytes(si[8..12].try_into().unwrap()), 2); // CLD_KILLED
+        assert_eq!(i32::from_le_bytes(si[24..28].try_into().unwrap()), 9); // SIGKILL
+        assert!(!state.processes.contains_key(&child_pid));
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 61, child_pid as i64, 0, 0, 0, 0, 0),
+            -10
+        );
+    }
+
+    #[test]
+    fn test_ipv4_tcp_loopback_full_lifecycle_and_epoll() {
+        let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+        let mut ctx = MockCtx::new(0x0B00_0000);
+
+        let write_sa = |ctx: &mut MockCtx, addr: u64, ip: [u8; 4], port: u16| {
+            let mut sa = [0u8; 16];
+            sa[0..2].copy_from_slice(&2u16.to_le_bytes()); // AF_INET
+            sa[2..4].copy_from_slice(&port.to_be_bytes());
+            sa[4..8].copy_from_slice(&ip);
+            ctx.mem_write(addr, &sa).unwrap();
+        };
+
+        // Create non-blocking listening socket
+        let lfd = handle_syscall(&mut ctx, &mut state, 41 /* socket */, 2, 1 | 0x800 | 0x80000, 0, 0, 0, 0) as i32;
+        assert!(lfd >= 3);
+
+        // setsockopt(SO_REUSEADDR=1) & getsockopt
+        ctx.mem_write(0x1000, &1i32.to_le_bytes()).unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 54 /* setsockopt */, lfd as i64, 1, 2, 0x1000, 4, 0), 0);
+        ctx.mem_write(0x1010, &4u32.to_le_bytes()).unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 55 /* getsockopt */, lfd as i64, 1, 2, 0x1004, 0x1010, 0), 0);
+        let mut optv = [0u8; 4];
+        ctx.mem_read(0x1004, &mut optv).unwrap();
+        assert_eq!(i32::from_le_bytes(optv), 1);
+
+        // Bind to 127.0.0.1:0 (ephemeral port)
+        write_sa(&mut ctx, 0x1100, [127, 0, 0, 1], 0);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 49 /* bind */, lfd as i64, 0x1100, 16, 0, 0, 0), 0);
+
+        // getsockname -> non-zero ephemeral port
+        ctx.mem_write(0x1120, &16u32.to_le_bytes()).unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 51 /* getsockname */, lfd as i64, 0x1110, 0x1120, 0, 0, 0), 0);
+        let mut sa_out = [0u8; 16];
+        ctx.mem_read(0x1110, &mut sa_out).unwrap();
+        let port = u16::from_be_bytes([sa_out[2], sa_out[3]]);
+        assert!(port >= 32768);
+
+        // Duplicate bind on same port -> -EADDRINUSE (-98)
+        let dup_fd = handle_syscall(&mut ctx, &mut state, 41, 2, 1, 0, 0, 0, 0) as i32;
+        write_sa(&mut ctx, 0x1130, [127, 0, 0, 1], port);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 49, dup_fd as i64, 0x1130, 16, 0, 0, 0), -98);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 3, dup_fd as i64, 0, 0, 0, 0, 0), 0);
+
+        // listen
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 50 /* listen */, lfd as i64, 16, 0, 0, 0, 0), 0);
+
+        // Non-blocking accept4 with empty queue -> -EAGAIN (-11)
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 288 /* accept4 */, lfd as i64, 0, 0, 0x800, 0, 0), -11);
+
+        // Register listener on epoll with EPOLLET | EPOLLIN
+        let epfd = handle_syscall(&mut ctx, &mut state, 291 /* epoll_create1 */, 0, 0, 0, 0, 0, 0) as i32;
+        let mut ev = [0u8; 12];
+        ev[0..4].copy_from_slice(&(0x8000_0001u32).to_le_bytes()); // EPOLLET | EPOLLIN
+        ev[4..12].copy_from_slice(&0xCAFEu64.to_le_bytes());
+        ctx.mem_write(0x1200, &ev).unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 233 /* epoll_ctl */, epfd as i64, 1, lfd as i64, 0x1200, 0, 0), 0);
+        // No pending connections -> epoll_wait returns 0
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 232 /* epoll_wait */, epfd as i64, 0x1220, 8, 0, 0, 0), 0);
+
+        // Connect to unused port -> -ECONNREFUSED (-111)
+        let cfd = handle_syscall(&mut ctx, &mut state, 41, 2, 1 | 0x800, 0, 0, 0, 0) as i32;
+        write_sa(&mut ctx, 0x1140, [127, 0, 0, 1], 19999);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 42 /* connect */, cfd as i64, 0x1140, 16, 0, 0, 0), -111);
+
+        // Connect to listening port -> succeeds (0)
+        write_sa(&mut ctx, 0x1140, [127, 0, 0, 1], port);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 42 /* connect */, cfd as i64, 0x1140, 16, 0, 0, 0), 0);
+
+        // getsockopt(SO_ERROR) == 0, setsockopt(TCP_NODELAY=1)
+        ctx.mem_write(0x1010, &4u32.to_le_bytes()).unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 55, cfd as i64, 1, 4, 0x1004, 0x1010, 0), 0);
+        ctx.mem_read(0x1004, &mut optv).unwrap();
+        assert_eq!(i32::from_le_bytes(optv), 0);
+        ctx.mem_write(0x1000, &1i32.to_le_bytes()).unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 54, cfd as i64, 6, 1, 0x1000, 4, 0), 0);
+
+        // epoll_wait on listener now reports EPOLLIN (1 event)
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 232, epfd as i64, 0x1220, 8, 0, 0, 0), 1);
+        let mut out_ev = [0u8; 12];
+        ctx.mem_read(0x1220, &mut out_ev).unwrap();
+        assert_eq!(u32::from_le_bytes(out_ev[0..4].try_into().unwrap()) & 1, 1);
+        assert_eq!(u64::from_le_bytes(out_ev[4..12].try_into().unwrap()), 0xCAFE);
+
+        // accept4 returns server-side connected FD + client sockaddr_in
+        ctx.mem_write(0x1160, &16u32.to_le_bytes()).unwrap();
+        let sfd = handle_syscall(&mut ctx, &mut state, 288, lfd as i64, 0x1150, 0x1160, 0x800, 0, 0) as i32;
+        assert!(sfd >= 3);
+
+        // getpeername on client returns listening port
+        ctx.mem_write(0x1180, &16u32.to_le_bytes()).unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 52 /* getpeername */, cfd as i64, 0x1170, 0x1180, 0, 0, 0), 0);
+        ctx.mem_read(0x1170, &mut sa_out).unwrap();
+        assert_eq!(u16::from_be_bytes([sa_out[2], sa_out[3]]), port);
+
+        // Bidirectional sendto/recvfrom + write/read
+        ctx.mem_write(0x1300, b"ping").unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 44 /* sendto */, cfd as i64, 0x1300, 4, 0, 0, 0), 4);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 45 /* recvfrom */, sfd as i64, 0x1310, 16, 0, 0, 0), 4);
+        let mut buf = [0u8; 4];
+        ctx.mem_read(0x1310, &mut buf).unwrap();
+        assert_eq!(&buf, b"ping");
+
+        ctx.mem_write(0x1320, b"pong").unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 1 /* write */, sfd as i64, 0x1320, 4, 0, 0, 0), 4);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 0 /* read */, cfd as i64, 0x1330, 16, 0, 0, 0), 4);
+        ctx.mem_read(0x1330, &mut buf).unwrap();
+        assert_eq!(&buf, b"pong");
+
+        // Non-blocking read with empty buffer -> -EAGAIN (-11)
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 0, cfd as i64, 0x1330, 16, 0, 0, 0), -11);
+
+        // shutdown(SHUT_WR) on server -> client sees EOF (0) and EPOLLIN|EPOLLRDHUP
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 48 /* shutdown */, sfd as i64, 1, 0, 0, 0, 0), 0);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 0, cfd as i64, 0x1330, 16, 0, 0, 0), 0);
+
+        // Cleanup
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 3, cfd as i64, 0, 0, 0, 0, 0), 0);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 3, sfd as i64, 0, 0, 0, 0, 0), 0);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 3, lfd as i64, 0, 0, 0, 0, 0), 0);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 3, epfd as i64, 0, 0, 0, 0, 0), 0);
+    }
+
+    #[test]
+    fn test_fallocate_and_map_shared_writeback() {
+        let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+        let mut ctx = MockCtx::new(0x0B00_0000);
+
+        // Create writable output file via openat(AT_FDCWD, "/tmp/out.bin", O_RDWR|O_CREAT|O_TRUNC, 0755)
+        write_cstr(&mut ctx, 0x1000, "/tmp/out.bin");
+        let fd = handle_syscall(
+            &mut ctx,
+            &mut state,
+            257, /* openat */
+            -100,
+            0x1000,
+            0x2 | 0x40 | 0x200,
+            0o755,
+            0,
+            0,
+        ) as i32;
+        assert!(fd >= 3);
+
+        // fallocate(fd, 0, 0, 4096) extends file to 4096 zero bytes
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 285 /* fallocate */, fd as i64, 0, 0, 4096, 0, 0),
+            0
+        );
+        assert_eq!(state.vfs.vfs_read_file("/tmp/out.bin").unwrap().len(), 4096);
+
+        // mmap(0, 4096, PROT_READ|PROT_WRITE (3), MAP_SHARED (1), fd, 0)
+        let addr = handle_syscall(&mut ctx, &mut state, 9 /* mmap */, 0, 4096, 3, 1, fd as i64, 0);
+        assert!(addr > 0);
+
+        // Write ELF magic into mapped memory
+        ctx.mem_write(addr as u64, b"\x7fELFlinked").unwrap();
+
+        // msync flushes changes to VFS immediately
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 26 /* msync */, addr, 4096, 4, 0, 0, 0), 0);
+        assert_eq!(&state.vfs.vfs_read_file("/tmp/out.bin").unwrap()[..10], b"\x7fELFlinked");
+
+        // Modify again and munmap -> flushes final bytes to VFS
+        ctx.mem_write(addr as u64 + 10, b"!").unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 11 /* munmap */, addr, 4096, 0, 0, 0, 0), 0);
+        assert_eq!(&state.vfs.vfs_read_file("/tmp/out.bin").unwrap()[..11], b"\x7fELFlinked!");
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 3, fd as i64, 0, 0, 0, 0, 0), 0);
+    }
+
+    #[test]
+    fn test_fallocate_fd_types_ro_and_4gib_overflow() {
+        let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+        let mut ctx = MockCtx::new(0x0B00_0000);
+        const SYS_FALLOCATE: i64 = 285;
+        const SYS_FTRUNCATE: i64 = 77;
+        const FALLOC_FL_KEEP_SIZE: i64 = 1;
+
+        // Pipe -> -ESPIPE (-29) for both mode=0 and FALLOC_FL_KEEP_SIZE
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 293 /* pipe2 */, 0x1000, 0, 0, 0, 0, 0), 0);
+        let mut pfd = [0u8; 8];
+        ctx.mem_read(0x1000, &mut pfd).unwrap();
+        let pr = i32::from_le_bytes(pfd[0..4].try_into().unwrap());
+        let pw = i32::from_le_bytes(pfd[4..8].try_into().unwrap());
+        assert_eq!(handle_syscall(&mut ctx, &mut state, SYS_FALLOCATE, pr as i64, 0, 0, 100, 0, 0), -29);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, SYS_FALLOCATE, pw as i64, 0, 0, 100, 0, 0), -29);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, SYS_FALLOCATE, pw as i64, FALLOC_FL_KEEP_SIZE, 0, 100, 0, 0), -29);
+
+        // TCP socket -> -ENODEV (-19) for both mode=0 and FALLOC_FL_KEEP_SIZE
+        let sfd = handle_syscall(&mut ctx, &mut state, 41 /* socket */, 2, 1, 0, 0, 0, 0) as i32;
+        assert!(sfd >= 3);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, SYS_FALLOCATE, sfd as i64, 0, 0, 100, 0, 0), -19);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, SYS_FALLOCATE, sfd as i64, FALLOC_FL_KEEP_SIZE, 0, 100, 0, 0), -19);
+
+        // stdout (fd 1) and directory -> -ENODEV (-19)
+        assert_eq!(handle_syscall(&mut ctx, &mut state, SYS_FALLOCATE, 1, 0, 0, 100, 0, 0), -19);
+        write_cstr(&mut ctx, 0x1020, "/tmp");
+        let dfd = handle_syscall(&mut ctx, &mut state, 257 /* openat */, -100, 0x1020, 0x10000 /* O_DIRECTORY */, 0, 0, 0) as i32;
+        assert!(dfd >= 3);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, SYS_FALLOCATE, dfd as i64, 0, 0, 100, 0, 0), -19);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, SYS_FALLOCATE, dfd as i64, FALLOC_FL_KEEP_SIZE, 0, 100, 0, 0), -19);
+
+        // O_RDONLY regular file -> -EBADF (-9) for both mode=0 and FALLOC_FL_KEEP_SIZE
+        write_cstr(&mut ctx, 0x1040, "/tmp/ro.bin");
+        let wfd = handle_syscall(&mut ctx, &mut state, 257, -100, 0x1040, 0x2 | 0x40 | 0x200, 0o644, 0, 0) as i32;
+        assert!(wfd >= 3);
+        let rfd = handle_syscall(&mut ctx, &mut state, 257, -100, 0x1040, 0 /* O_RDONLY */, 0, 0, 0) as i32;
+        assert!(rfd >= 3);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, SYS_FALLOCATE, rfd as i64, 0, 0, 100, 0, 0), -9);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, SYS_FALLOCATE, rfd as i64, FALLOC_FL_KEEP_SIZE, 0, 100, 0, 0), -9);
+
+        // >4 GiB (u32 overflow on wasm32) -> -EINVAL (-22) for both fallocate and ftruncate
+        let over_4gib: i64 = (1i64 << 32) + 4096;
+        assert_eq!(handle_syscall(&mut ctx, &mut state, SYS_FALLOCATE, wfd as i64, 0, 0, over_4gib, 0, 0), -22);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, SYS_FALLOCATE, wfd as i64, FALLOC_FL_KEEP_SIZE, 1i64 << 32, 4096, 0, 0), -22);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, SYS_FTRUNCATE, wfd as i64, over_4gib, 0, 0, 0, 0), -22);
+    }
+
+    #[test]
+    fn test_map_shared_partial_munmap_and_eof_clamping() {
+        let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+        let mut ctx = MockCtx::new(0x0B00_0000);
+
+        // Part A: partial munmap of 8192-byte MAP_SHARED mapping preserves second-half writeback
+        write_cstr(&mut ctx, 0x1000, "/tmp/partial.bin");
+        let fd = handle_syscall(&mut ctx, &mut state, 257, -100, 0x1000, 0x2 | 0x40 | 0x200, 0o644, 0, 0) as i32;
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 285 /* fallocate */, fd as i64, 0, 0, 8192, 0, 0), 0);
+        let addr = handle_syscall(&mut ctx, &mut state, 9 /* mmap */, 0, 8192, 3, 1 /* MAP_SHARED */, fd as i64, 0);
+        assert!(addr > 0);
+
+        ctx.mem_write(addr as u64, b"FIRST_HALF").unwrap();
+        // Unmap only the first 4096 bytes
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 11 /* munmap */, addr, 4096, 0, 0, 0, 0), 0);
+        assert_eq!(&state.vfs.vfs_read_file("/tmp/partial.bin").unwrap()[0..10], b"FIRST_HALF");
+
+        // Write to the still-mapped second 4096 bytes, then unmap it
+        ctx.mem_write(addr as u64 + 4096, b"SECOND_HALF").unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 11 /* munmap */, addr + 4096, 4096, 0, 0, 0, 0), 0);
+        let data = state.vfs.vfs_read_file("/tmp/partial.bin").unwrap();
+        assert_eq!(data.len(), 8192);
+        assert_eq!(&data[0..10], b"FIRST_HALF");
+        assert_eq!(&data[4096..4107], b"SECOND_HALF");
+
+        // Part B: 100-byte file mapped with 4096 bytes preserves file size 100 on writeback
+        write_cstr(&mut ctx, 0x1040, "/tmp/small100.bin");
+        let fd2 = handle_syscall(&mut ctx, &mut state, 257, -100, 0x1040, 0x2 | 0x40 | 0x200, 0o644, 0, 0) as i32;
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 285, fd2 as i64, 0, 0, 100, 0, 0), 0);
+        let addr2 = handle_syscall(&mut ctx, &mut state, 9, 0, 4096, 3, 1, fd2 as i64, 0);
+        assert!(addr2 > 0);
+        ctx.mem_write(addr2 as u64, b"AB").unwrap();
+        ctx.mem_write(addr2 as u64 + 99, b"Z").unwrap();
+        ctx.mem_write(addr2 as u64 + 200, b"PAST_EOF").unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 11, addr2, 4096, 0, 0, 0, 0), 0);
+        let small = state.vfs.vfs_read_file("/tmp/small100.bin").unwrap();
+        assert_eq!(small.len(), 100);
+        assert_eq!(&small[0..2], b"AB");
+        assert_eq!(small[99], b'Z');
+    }
+
+    #[test]
+    fn test_recvmsg_scatter_gather_and_eagain_preserves_msghdr() {
+        let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+        let mut ctx = MockCtx::new(0x0B00_0000);
+
+        // Set up connected TCP loopback pair (cfd, sfd)
+        let lfd = handle_syscall(&mut ctx, &mut state, 41, 2, 1 | 0x800, 0, 0, 0, 0) as i32;
+        let mut sa = [0u8; 16];
+        sa[0..2].copy_from_slice(&2u16.to_le_bytes());
+        sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        ctx.mem_write(0x1000, &sa).unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 49, lfd as i64, 0x1000, 16, 0, 0, 0), 0);
+        ctx.mem_write(0x1020, &16u32.to_le_bytes()).unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 51, lfd as i64, 0x1010, 0x1020, 0, 0, 0), 0);
+        ctx.mem_read(0x1010, &mut sa).unwrap();
+        let port = u16::from_be_bytes([sa[2], sa[3]]);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 50, lfd as i64, 8, 0, 0, 0, 0), 0);
+
+        let cfd = handle_syscall(&mut ctx, &mut state, 41, 2, 1 | 0x800, 0, 0, 0, 0) as i32;
+        sa[2..4].copy_from_slice(&port.to_be_bytes());
+        ctx.mem_write(0x1030, &sa).unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 42, cfd as i64, 0x1030, 16, 0, 0, 0), 0);
+        let sfd = handle_syscall(&mut ctx, &mut state, 288, lfd as i64, 0, 0, 0x800, 0, 0) as i32;
+        assert!(sfd >= 3);
+
+        // Prepare 2 iovecs: [0x2000, len=4] and [0x2100, len=6]
+        let mut iovs = [0u8; 32];
+        iovs[0..8].copy_from_slice(&0x2000u64.to_le_bytes());
+        iovs[8..16].copy_from_slice(&4u64.to_le_bytes());
+        iovs[16..24].copy_from_slice(&0x2100u64.to_le_bytes());
+        iovs[24..32].copy_from_slice(&6u64.to_le_bytes());
+        ctx.mem_write(0x1200, &iovs).unwrap();
+
+        // Prepare msghdr at 0x1300 with sentinel msg_controllen=0x1234, msg_flags=0x5678
+        let mut msg = [0u8; 56];
+        msg[16..24].copy_from_slice(&0x1200u64.to_le_bytes());
+        msg[24..32].copy_from_slice(&2u64.to_le_bytes());
+        msg[40..48].copy_from_slice(&0x1234u64.to_le_bytes());
+        msg[48..52].copy_from_slice(&0x5678i32.to_le_bytes());
+        ctx.mem_write(0x1300, &msg).unwrap();
+
+        // Empty non-blocking socket -> -EAGAIN (-11), msghdr sentinels untouched
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 47 /* recvmsg */, sfd as i64, 0x1300, 0, 0, 0, 0), -11);
+        let mut msg_after = [0u8; 56];
+        ctx.mem_read(0x1300, &mut msg_after).unwrap();
+        assert_eq!(u64::from_le_bytes(msg_after[40..48].try_into().unwrap()), 0x1234);
+        assert_eq!(i32::from_le_bytes(msg_after[48..52].try_into().unwrap()), 0x5678);
+
+        // Send 10 bytes across both iovecs -> returns 10 and zeroes msg_controllen/msg_flags
+        ctx.mem_write(0x1400, b"HEAD_BODY!").unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 44 /* sendto */, cfd as i64, 0x1400, 10, 0, 0, 0), 10);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 47 /* recvmsg */, sfd as i64, 0x1300, 0, 0, 0, 0), 10);
+        let mut b0 = [0u8; 4];
+        let mut b1 = [0u8; 6];
+        ctx.mem_read(0x2000, &mut b0).unwrap();
+        ctx.mem_read(0x2100, &mut b1).unwrap();
+        assert_eq!(&b0, b"HEAD");
+        assert_eq!(&b1, b"_BODY!");
+        ctx.mem_read(0x1300, &mut msg_after).unwrap();
+        assert_eq!(u64::from_le_bytes(msg_after[40..48].try_into().unwrap()), 0);
+        assert_eq!(i32::from_le_bytes(msg_after[48..52].try_into().unwrap()), 0);
+
+        // Partial scatter-gather (6 bytes into 4+6) -> returns 6 without blocking
+        ctx.mem_write(0x1400, b"ABCDEF").unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 44, cfd as i64, 0x1400, 6, 0, 0, 0), 6);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 47, sfd as i64, 0x1300, 0, 0, 0, 0), 6);
+        ctx.mem_read(0x2000, &mut b0).unwrap();
+        ctx.mem_read(0x2100, &mut b1).unwrap();
+        assert_eq!(&b0, b"ABCD");
+        assert_eq!(&b1[..2], b"EF");
+    }
+
+    #[test]
+    fn test_tcp_socket_close_wakeups_on_exit_execve_and_dup2() {
+        use crate::scheduler::{ThreadContext, ThreadState, MAIN_PID, MAIN_TID};
+
+        let make_connected_pair = |ctx: &mut MockCtx, state: &mut HostState, client_cloexec: bool| -> (i32, i32, i32) {
+            let lfd = handle_syscall(ctx, state, 41, 2, 1 | 0x800, 0, 0, 0, 0) as i32;
+            let mut sa = [0u8; 16];
+            sa[0..2].copy_from_slice(&2u16.to_le_bytes());
+            sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+            ctx.mem_write(0x1000, &sa).unwrap();
+            assert_eq!(handle_syscall(ctx, state, 49, lfd as i64, 0x1000, 16, 0, 0, 0), 0);
+            ctx.mem_write(0x1020, &16u32.to_le_bytes()).unwrap();
+            assert_eq!(handle_syscall(ctx, state, 51, lfd as i64, 0x1010, 0x1020, 0, 0, 0), 0);
+            ctx.mem_read(0x1010, &mut sa).unwrap();
+            let port = u16::from_be_bytes([sa[2], sa[3]]);
+            assert_eq!(handle_syscall(ctx, state, 50, lfd as i64, 8, 0, 0, 0, 0), 0);
+            let flags = 1 | if client_cloexec { 0x80000 } else { 0 };
+            let cfd = handle_syscall(ctx, state, 41, 2, flags, 0, 0, 0, 0) as i32;
+            sa[2..4].copy_from_slice(&port.to_be_bytes());
+            ctx.mem_write(0x1030, &sa).unwrap();
+            assert_eq!(handle_syscall(ctx, state, 42, cfd as i64, 0x1030, 16, 0, 0, 0), 0);
+            let sfd = handle_syscall(ctx, state, 288, lfd as i64, 0, 0, 0, 0, 0) as i32;
+            (lfd, cfd, sfd)
+        };
+
+        // 1. SYS_DUP2 overwriting TCP client socket wakes peer thread in PipeReadWait
+        {
+            let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+            let mut ctx = MockCtx::new(0x0B00_0000);
+            let (lfd, cfd, sfd) = make_connected_pair(&mut ctx, &mut state, false);
+            let t2 = 2001;
+            state.scheduler.threads.insert(t2, ThreadContext::new(t2));
+            state.scheduler.current_tid = t2;
+            // Blocking read on sfd -> enters PipeReadWait
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 0 /* read */, sfd as i64, 0x2000, 16, 0, 0, 0), 0);
+            assert!(matches!(state.scheduler.threads[&t2].state, ThreadState::PipeReadWait { .. }));
+            // Main thread overwrites cfd with dup2(1, cfd)
+            state.scheduler.current_tid = MAIN_TID;
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 33 /* dup2 */, 1, cfd as i64, 0, 0, 0, 0), cfd as i64);
+            assert_eq!(state.scheduler.threads[&t2].state, ThreadState::Runnable);
+
+            // Also verify dup2 overwriting listener wakes AcceptWait
+            let t3 = 2002;
+            state.scheduler.threads.insert(t3, ThreadContext::new(t3));
+            state.scheduler.current_tid = t3;
+            let lfd_blocking = handle_syscall(&mut ctx, &mut state, 41, 2, 1, 0, 0, 0, 0) as i32;
+            let mut sa = [0u8; 16];
+            sa[0..2].copy_from_slice(&2u16.to_le_bytes());
+            sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+            ctx.mem_write(0x1050, &sa).unwrap();
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 49, lfd_blocking as i64, 0x1050, 16, 0, 0, 0), 0);
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 50, lfd_blocking as i64, 8, 0, 0, 0, 0), 0);
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 43 /* accept */, lfd_blocking as i64, 0, 0, 0, 0, 0), 0);
+            assert!(matches!(state.scheduler.threads[&t3].state, ThreadState::AcceptWait { .. }));
+            state.scheduler.current_tid = MAIN_TID;
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 33, 1, lfd_blocking as i64, 0, 0, 0, 0), lfd_blocking as i64);
+            assert_eq!(state.scheduler.threads[&t3].state, ThreadState::Runnable);
+            let _ = lfd;
+        }
+
+        // 2. do_execve closing O_CLOEXEC TCP socket wakes peer waiter in another process
+        {
+            let mut elf = vec![0u8; 120];
+            elf[0..4].copy_from_slice(b"\x7fELF");
+            elf[4] = 2; // ELFCLASS64
+            elf[5] = 1; // ELFDATA2LSB
+            elf[6] = 1; // EV_CURRENT
+            elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+            elf[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+            elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+            elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+            elf[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+            elf[64..68].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+            elf[68..72].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
+            elf[72..80].copy_from_slice(&0u64.to_le_bytes()); // p_offset
+            elf[96..104].copy_from_slice(&120u64.to_le_bytes()); // p_filesz
+            elf[104..112].copy_from_slice(&120u64.to_le_bytes()); // p_memsz
+            let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+            state.vfs.vfs_write_file("/bin/dummy", &elf, 0o755);
+            state.multiproc_enabled = true;
+            let mut ctx = MockCtx::new(0x0B00_0000);
+            let (_lfd, cfd, sfd) = make_connected_pair(&mut ctx, &mut state, true);
+            let t2 = 2003;
+            state.scheduler.threads.insert(t2, ThreadContext::new(t2));
+            state.scheduler.current_tid = t2;
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 0, sfd as i64, 0x2000, 16, 0, 0, 0), 0);
+            assert!(matches!(state.scheduler.threads[&t2].state, ThreadState::PipeReadWait { .. }));
+            state.scheduler.current_tid = MAIN_TID;
+            write_cstr(&mut ctx, 0x1500, "/bin/dummy");
+            ctx.mem_write(0x1520, &0x1500u64.to_le_bytes()).unwrap();
+            ctx.mem_write(0x1528, &0u64.to_le_bytes()).unwrap();
+            ctx.mem_write(0x1530, &0u64.to_le_bytes()).unwrap();
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 59 /* execve */, 0x1500, 0x1520, 0x1530, 0, 0, 0), 0);
+            assert!(state.vfs.get_fd(cfd).is_none());
+            assert_eq!(state.scheduler.threads[&t2].state, ThreadState::Runnable);
+        }
+
+        // 3. exit_process closing TCP socket wakes parent process blocked in PipeReadWait
+        {
+            let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+            state.multiproc_enabled = true;
+            let mut ctx = MockCtx::new(0x0B00_0000);
+            let (_lfd, cfd, sfd) = make_connected_pair(&mut ctx, &mut state, false);
+            // Fork-like child holding only cfd; parent holds sfd and blocks in read(sfd)
+            let child_pid = 1005;
+            insert_child_process(&mut state, child_pid, false, 0);
+            let cfd_file = state.vfs.get_fd(cfd).cloned().unwrap();
+            state.processes.get_mut(&child_pid).unwrap().fds.insert(cfd, cfd_file);
+            // Remove cfd from parent without dropping refcount (transferred ownership to child)
+            state.vfs.fds.remove(&cfd);
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 0, sfd as i64, 0x2000, 16, 0, 0, 0), 0);
+            assert!(matches!(state.scheduler.threads[&MAIN_TID].state, ThreadState::PipeReadWait { .. }));
+
+            // Switch to child and exit_group(0) without explicitly closing cfd
+            state.switch_active_process(child_pid);
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 231 /* exit_group */, 0, 0, 0, 0, 0, 0), 0);
+            assert_eq!(
+                state.processes[&MAIN_PID].scheduler.threads[&MAIN_TID].state,
+                ThreadState::Runnable
+            );
+        }
+    }
+
+    #[test]
+    fn test_waitid_wstopped_only_does_not_match_exited_zombie() {
+        use crate::scheduler::{ThreadState, MAIN_TID};
+        let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+        state.multiproc_enabled = true;
+        let mut ctx = MockCtx::new(0x0B00_0000);
+        let child_pid = 1004;
+        insert_child_process(&mut state, child_pid, true, 55 << 8);
+
+        const WNOHANG: i64 = 1;
+        const WSTOPPED: i64 = 2;
+        const WEXITED: i64 = 4;
+
+        // Pre-fill siginfo_t with 0xAA
+        ctx.mem_write(0x2000, &[0xAAu8; 128]).unwrap();
+        // waitid(P_PID, child_pid, infop, WSTOPPED | WNOHANG, 0) -> must NOT match exited zombie
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 247 /* SYS_WAITID */, 1, child_pid as i64, 0x2000, WSTOPPED | WNOHANG, 0, 0),
+            0
+        );
+        let mut si = [0u8; 128];
+        ctx.mem_read(0x2000, &mut si).unwrap();
+        assert!(si.iter().all(|&b| b == 0));
+        assert!(state.processes.contains_key(&child_pid));
+
+        // Blocking waitid(P_PID, child_pid, infop, WSTOPPED, 0) -> blocks and is NOT woken by exited zombie
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 247, 1, child_pid as i64, 0x2000, WSTOPPED, 0, 0),
+            0
+        );
+        assert_eq!(ctx.yield_flag, 1);
+        assert!(matches!(state.scheduler.threads[&MAIN_TID].state, ThreadState::Wait4Wait { .. }));
+        state.wake_ready_waiters();
+        assert!(matches!(state.scheduler.threads[&MAIN_TID].state, ThreadState::Wait4Wait { .. }));
+        assert!(state.processes.contains_key(&child_pid));
+
+        // Reset thread to Runnable and call with WEXITED -> now matches and reaps zombie
+        state.scheduler.threads.get_mut(&MAIN_TID).unwrap().state = ThreadState::Runnable;
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 247, 1, child_pid as i64, 0x2000, WEXITED, 0, 0),
+            0
+        );
+        ctx.mem_read(0x2000, &mut si).unwrap();
+        assert_eq!(i32::from_le_bytes(si[16..20].try_into().unwrap()), child_pid);
+        assert_eq!(i32::from_le_bytes(si[24..28].try_into().unwrap()), 55);
+        assert!(!state.processes.contains_key(&child_pid));
     }
 }
