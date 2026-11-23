@@ -40,6 +40,7 @@ const DEFAULT_SO_SEARCH_DIRS = [
   "/lib",
   "/lib/x86_64-linux-gnu",
   "/usr/lib/x86_64-linux-gnu",
+  "/usr/lib64",
   "/usr/lib",
 ];
 
@@ -84,6 +85,112 @@ function basename(p) {
   return idx >= 0 ? p.slice(idx + 1) : p;
 }
 
+function dirname(p) {
+  const norm = normalizeGuestPath(p);
+  if (norm === "/") return "/";
+  const idx = norm.lastIndexOf("/");
+  return idx <= 0 ? "/" : norm.slice(0, idx);
+}
+
+function isElf64Bytes(bytes) {
+  if (
+    !bytes ||
+    bytes.length < 64 ||
+    bytes[0] !== 0x7f ||
+    bytes[1] !== 0x45 ||
+    bytes[2] !== 0x4c ||
+    bytes[3] !== 0x46
+  ) {
+    return false;
+  }
+  // EI_CLASS=2 (ELFCLASS64), EI_DATA=1 (ELFDATA2LSB), EI_VERSION=1 (EV_CURRENT)
+  if (bytes[4] !== 2 || bytes[5] !== 1 || bytes[6] !== 1) {
+    return false;
+  }
+  const eType = bytes[16] | (bytes[17] << 8);
+  const eMachine = bytes[18] | (bytes[19] << 8);
+  // ET_EXEC (2) or ET_DYN (3), EM_X86_64 (62)
+  if ((eType !== 2 && eType !== 3) || eMachine !== 62) {
+    return false;
+  }
+
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const ePhoff = dv.getBigUint64(32, true);
+  const ePhentsize = dv.getUint16(54, true);
+  const ePhnum = dv.getUint16(56, true);
+  if (ePhentsize !== 56 || ePhnum === 0) {
+    return false;
+  }
+  const fileLen = BigInt(bytes.length);
+  const phEnd = ePhoff + BigInt(ePhnum) * 56n;
+  if (phEnd > fileLen) {
+    return false;
+  }
+
+  let hasExecLoad = false;
+  const phoffNum = Number(ePhoff);
+  for (let i = 0; i < ePhnum; i++) {
+    const off = phoffNum + i * 56;
+    const pType = dv.getUint32(off, true);
+    const pFlags = dv.getUint32(off + 4, true);
+    const pOffset = dv.getBigUint64(off + 8, true);
+    const pFilesz = dv.getBigUint64(off + 32, true);
+    const pMemsz = dv.getBigUint64(off + 40, true);
+
+    if (pType === 1) {
+      // PT_LOAD
+      if (pFilesz > pMemsz) {
+        return false;
+      }
+      if (pOffset + pFilesz > fileLen) {
+        return false;
+      }
+      if ((pFlags & 1) !== 0 && pFilesz > 0n) {
+        hasExecLoad = true;
+      }
+    } else if (pType === 3) {
+      // PT_INTERP
+      if (pFilesz === 0n || pOffset + pFilesz > fileLen) {
+        return false;
+      }
+    }
+  }
+  return hasExecLoad;
+}
+
+function parseShebang(bytes) {
+  if (!bytes || bytes.length < 2 || bytes[0] !== 0x23 || bytes[1] !== 0x21) {
+    return null;
+  }
+  const maxLen = Math.min(bytes.length, 256);
+  let end = 2;
+  while (end < maxLen && bytes[end] !== 0x0a) end++;
+  const line = textDecoder.decode(bytes.subarray(2, end)).replace(/\r$/, "").trim();
+  if (!line) return null;
+  const match = line.match(/^(\S+)(?:\s+(.*))?$/);
+  if (!match) return null;
+  const interp = match[1];
+  const arg = match[2] !== undefined && match[2].trim().length > 0 ? match[2].trim() : null;
+  return { interp, arg };
+}
+
+function globToRegExp(pattern) {
+  let re = "^";
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "*") re += "[^/]*";
+    else if (ch === "?") re += "[^/]";
+    else if ("\\^$.|+()[]{}".includes(ch)) re += "\\" + ch;
+    else re += ch;
+  }
+  re += "$";
+  return new RegExp(re);
+}
+
+function yieldMacrotask() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 function readCStringFromBytes(bytes, offset, maxEnd = bytes.length) {
   let end = offset;
   while (end < maxEnd && bytes[end] !== 0) end++;
@@ -91,18 +198,11 @@ function readCStringFromBytes(bytes, offset, maxEnd = bytes.length) {
 }
 
 /**
- * Pure-JS ELF64 parser to extract PT_INTERP and DT_NEEDED library names.
+ * Pure-JS ELF64 parser to extract PT_INTERP, DT_NEEDED, DT_RPATH, and DT_RUNPATH.
  */
-function parseElf64Deps(elfBytes) {
-  if (elfBytes.length < 64) return { interp: null, needed: [] };
-  if (
-    elfBytes[0] !== 0x7f ||
-    elfBytes[1] !== 0x45 ||
-    elfBytes[2] !== 0x4c ||
-    elfBytes[3] !== 0x46 ||
-    elfBytes[4] !== 2 // ELFCLASS64
-  ) {
-    return { interp: null, needed: [] };
+export function parseElf64Deps(elfBytes) {
+  if (!isElf64Bytes(elfBytes)) {
+    return { interp: null, needed: [], rpath: [], runpath: [] };
   }
 
   const dv = new DataView(
@@ -153,6 +253,8 @@ function parseElf64Deps(elfBytes) {
   };
 
   const neededOffsets = [];
+  const rpathOffsets = [];
+  const runpathOffsets = [];
   let strtabVa = 0;
   let strsz = 0;
 
@@ -165,11 +267,18 @@ function parseElf64Deps(elfBytes) {
       if (tag === 1) neededOffsets.push(val); // DT_NEEDED
       else if (tag === 5) strtabVa = val; // DT_STRTAB
       else if (tag === 10) strsz = val; // DT_STRSZ
+      else if (tag === 15) rpathOffsets.push(val); // DT_RPATH
+      else if (tag === 29) runpathOffsets.push(val); // DT_RUNPATH
     }
   }
 
   const needed = [];
-  if (strtabVa !== 0 && neededOffsets.length > 0) {
+  const rpath = [];
+  const runpath = [];
+  if (
+    strtabVa !== 0 &&
+    (neededOffsets.length > 0 || rpathOffsets.length > 0 || runpathOffsets.length > 0)
+  ) {
     const strOff = vaddrToOffset(strtabVa);
     if (strOff !== null) {
       const strEnd =
@@ -181,10 +290,24 @@ function parseElf64Deps(elfBytes) {
           needed.push(readCStringFromBytes(elfBytes, strOff + noff, strEnd));
         }
       }
+      for (const roff of rpathOffsets) {
+        if (strOff + roff < strEnd) {
+          for (const entry of readCStringFromBytes(elfBytes, strOff + roff, strEnd).split(":")) {
+            if (entry) rpath.push(entry);
+          }
+        }
+      }
+      for (const rpoff of runpathOffsets) {
+        if (strOff + rpoff < strEnd) {
+          for (const entry of readCStringFromBytes(elfBytes, strOff + rpoff, strEnd).split(":")) {
+            if (entry) runpath.push(entry);
+          }
+        }
+      }
     }
   }
 
-  return { interp, needed };
+  return { interp, needed, rpath, runpath };
 }
 
 function encodeE2wbBundle(mainPath, mainBytes, soEntries) {
@@ -547,30 +670,48 @@ async function createNodeHostVfs(vfsRo, vfsRw) {
 }
 
 export class Elf2WasmSystem {
-  constructor({ compilerInst, runtimeInst, hostVfs }) {
+  constructor({ compilerInst, runtimeInst, hostVfs, moduleCache = null }) {
     this.compilerInst = compilerInst;
     this.runtimeInst = runtimeInst;
     this.hostVfs = hostVfs;
-    this.moduleCache = new Map();
+    this.moduleCache = moduleCache instanceof Map ? moduleCache : new Map();
     this.initialSoMap = new Map();
     this.vfsSymlinks = new Map();
+    this.vfsFilePaths = new Set();
     this.activeGuest = null;
+    this._processes = null;
+    this._inputWaiters = [];
+    this._aborted = false;
+    this.reapedPidCount = 0;
+    this.lastActiveProcessCount = 0;
   }
 
-  static async create({ compilerWasm, runtimeWasm, vfsRo = [], vfsRw = [] } = {}) {
+  static async create({
+    compilerWasm,
+    runtimeWasm,
+    compilerInst: existingCompilerInst = null,
+    moduleCache = null,
+    vfsRo = [],
+    vfsRw = [],
+  } = {}) {
     const [cMod, rMod] = await Promise.all([
-      compilerWasm ? compileWasmModule(compilerWasm) : Promise.resolve(null),
+      !existingCompilerInst && compilerWasm ? compileWasmModule(compilerWasm) : Promise.resolve(null),
       runtimeWasm ? compileWasmModule(runtimeWasm) : Promise.resolve(null),
     ]);
 
-    let compilerInst = null;
-    if (cMod) {
+    let compilerInst = existingCompilerInst;
+    if (!compilerInst && cMod) {
       compilerInst = await WebAssembly.instantiate(cMod, {});
     }
 
     const hostVfs = await createNodeHostVfs(vfsRo, vfsRw);
     let runtimeInst = null;
-    const sys = new Elf2WasmSystem({ compilerInst, runtimeInst: null, hostVfs });
+    const sys = new Elf2WasmSystem({
+      compilerInst,
+      runtimeInst: null,
+      hostVfs,
+      moduleCache,
+    });
 
     if (rMod) {
       const env = sys._makeRuntimeEnv();
@@ -744,6 +885,7 @@ export class Elf2WasmSystem {
     const rExp = this.runtimeInst.exports;
     const normPath = normalizeGuestPath(guestPath);
     this.vfsSymlinks.delete(normPath);
+    this.vfsFilePaths.add(normPath);
     const pathBytes = textEncoder.encode(normPath);
     const data = toUint8Array(bytes);
     const pPtr = rExp.alloc(pathBytes.length);
@@ -765,6 +907,7 @@ export class Elf2WasmSystem {
     const normPath = normalizeGuestPath(guestPath);
     const targetStr = String(target);
     this.vfsSymlinks.set(normPath, targetStr);
+    this.vfsFilePaths.add(normPath);
     if (typeof rExp.runtime_add_vfs_symlink === "function") {
       const pathBytes = textEncoder.encode(normPath);
       const targetBytes = textEncoder.encode(targetStr);
@@ -788,6 +931,152 @@ export class Elf2WasmSystem {
         throw new Error(`runtime_add_vfs_symlink failed for ${guestPath}: ${rc}`);
       }
     }
+  }
+
+  writeVfsDir(guestPath, mode = 0o755) {
+    if (!this.runtimeInst) throw new Error("Elf2WasmSystem created without runtimeWasm");
+    const rExp = this.runtimeInst.exports;
+    const normPath = normalizeGuestPath(guestPath);
+    if (normPath === "/") return;
+    this.vfsSymlinks.delete(normPath);
+    if (typeof rExp.runtime_add_vfs_dir === "function") {
+      const pathBytes = textEncoder.encode(normPath);
+      const pPtr = rExp.alloc(Math.max(1, pathBytes.length));
+      if (pathBytes.length > 0) {
+        new Uint8Array(rExp.memory.buffer, pPtr, pathBytes.length).set(pathBytes);
+      }
+      const rc = rExp.runtime_add_vfs_dir(pPtr, pathBytes.length, mode >>> 0);
+      rExp.dealloc(pPtr, Math.max(1, pathBytes.length));
+      if (rc !== 0) {
+        throw new Error(`runtime_add_vfs_dir failed for ${guestPath}: ${rc}`);
+      }
+    }
+  }
+
+  removeVfsPath(guestPath) {
+    if (!this.runtimeInst) throw new Error("Elf2WasmSystem created without runtimeWasm");
+    const rExp = this.runtimeInst.exports;
+    const normPath = normalizeGuestPath(guestPath);
+    if (normPath === "/") return;
+    const prefix = normPath + "/";
+    for (const key of Array.from(this.vfsSymlinks.keys())) {
+      if (key === normPath || key.startsWith(prefix)) {
+        this.vfsSymlinks.delete(key);
+      }
+    }
+    for (const key of Array.from(this.vfsFilePaths)) {
+      if (key === normPath || key.startsWith(prefix)) {
+        this.vfsFilePaths.delete(key);
+      }
+    }
+    if (typeof rExp.runtime_remove_vfs_path === "function") {
+      const pathBytes = textEncoder.encode(normPath);
+      const pPtr = rExp.alloc(Math.max(1, pathBytes.length));
+      if (pathBytes.length > 0) {
+        new Uint8Array(rExp.memory.buffer, pPtr, pathBytes.length).set(pathBytes);
+      }
+      rExp.runtime_remove_vfs_path(pPtr, pathBytes.length);
+      rExp.dealloc(pPtr, Math.max(1, pathBytes.length));
+    }
+  }
+
+  setUidGid(uid, gid) {
+    if (!this.runtimeInst) return;
+    const rExp = this.runtimeInst.exports;
+    if (typeof rExp.runtime_set_uid_gid === "function") {
+      rExp.runtime_set_uid_gid(uid >>> 0, gid >>> 0);
+    }
+  }
+
+  setTtyMode(enabled) {
+    if (!this.runtimeInst) return;
+    const rExp = this.runtimeInst.exports;
+    if (typeof rExp.runtime_set_tty_mode === "function") {
+      rExp.runtime_set_tty_mode(enabled ? 1 : 0);
+    }
+  }
+
+  setStdinOpen(open) {
+    if (!this.runtimeInst) return;
+    const rExp = this.runtimeInst.exports;
+    if (typeof rExp.runtime_set_stdin_open === "function") {
+      rExp.runtime_set_stdin_open(open ? 1 : 0);
+    }
+  }
+
+  setWinsize(rows, cols) {
+    if (!this.runtimeInst) return;
+    const rExp = this.runtimeInst.exports;
+    if (typeof rExp.runtime_set_winsize === "function") {
+      rExp.runtime_set_winsize(Math.max(1, rows | 0) >>> 0, Math.max(1, cols | 0) >>> 0);
+    }
+  }
+
+  _notifyInput() {
+    if (this._inputWaiters.length === 0) return;
+    const waiters = this._inputWaiters.splice(0, this._inputWaiters.length);
+    for (const resolve of waiters) {
+      resolve();
+    }
+  }
+
+  _waitForInput(signal) {
+    if (this._aborted || signal?.aborted) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      let done = false;
+      const onWake = () => {
+        if (done) return;
+        done = true;
+        if (signal) signal.removeEventListener("abort", onWake);
+        resolve();
+      };
+      this._inputWaiters.push(onWake);
+      if (signal) {
+        signal.addEventListener("abort", onWake, { once: true });
+      }
+    });
+  }
+
+  pushStdin(data) {
+    if (!this.runtimeInst) return;
+    const rExp = this.runtimeInst.exports;
+    const bytes = typeof data === "string" ? textEncoder.encode(data) : toUint8Array(data);
+    if (typeof rExp.runtime_push_stdin === "function" && bytes.length > 0) {
+      const ptr = rExp.alloc(bytes.length);
+      new Uint8Array(rExp.memory.buffer, ptr, bytes.length).set(bytes);
+      rExp.runtime_push_stdin(ptr, bytes.length);
+      rExp.dealloc(ptr, bytes.length);
+    }
+    this._notifyInput();
+  }
+
+  closeStdin() {
+    if (!this.runtimeInst) return;
+    const rExp = this.runtimeInst.exports;
+    if (typeof rExp.runtime_close_stdin === "function") {
+      rExp.runtime_close_stdin();
+    }
+    this._notifyInput();
+  }
+
+  sendSigint() {
+    if (!this.runtimeInst) return;
+    const rExp = this.runtimeInst.exports;
+    if (typeof rExp.runtime_send_sigint === "function") {
+      rExp.runtime_send_sigint();
+    }
+    this._notifyInput();
+  }
+
+  stop() {
+    this._aborted = true;
+    this._notifyInput();
+  }
+
+  getActiveProcessCount() {
+    return this._processes ? this._processes.size : this.lastActiveProcessCount;
   }
 
   readVfsLink(guestPath) {
@@ -844,37 +1133,182 @@ export class Elf2WasmSystem {
     return copy;
   }
 
-  _resolveElfSos(elfBytes, extraPaths = []) {
+  resolveCommandPath(command, env = []) {
+    const cmd = String(command || "");
+    if (!cmd) return null;
+    if (cmd.includes("/")) {
+      const norm = normalizeGuestPath(cmd);
+      return this.readVfsFile(norm) ? norm : null;
+    }
+    let pathVal = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    for (const entry of env || []) {
+      if (typeof entry === "string" && entry.startsWith("PATH=")) {
+        pathVal = entry.slice(5);
+        break;
+      }
+    }
+    for (const dir of pathVal.split(":")) {
+      if (!dir) continue;
+      const cand = normalizeGuestPath(`${dir}/${cmd}`);
+      if (this.readVfsFile(cand)) return cand;
+    }
+    return null;
+  }
+
+  _getConfigSoSearchDirs() {
+    const dirs = [];
+    const seenDirs = new Set();
+    const addDir = (d) => {
+      if (!d) return;
+      const norm = normalizeGuestPath(d);
+      if (!seenDirs.has(norm)) {
+        seenDirs.add(norm);
+        dirs.push(norm);
+      }
+    };
+
+    // musl search path file
+    const muslPathBytes = this.readVfsFile("/etc/ld-musl-x86_64.path");
+    if (muslPathBytes) {
+      const text = textDecoder.decode(muslPathBytes);
+      for (const line of text.split(/\r?\n/)) {
+        const clean = line.replace(/#.*$/, "").trim();
+        if (!clean) continue;
+        for (const part of clean.split(":")) {
+          const trimmed = part.trim();
+          if (trimmed) addDir(trimmed);
+        }
+      }
+    }
+
+    // glibc /etc/ld.so.conf (with recursive include glob support)
+    const visitedFiles = new Set();
+    const parseLdSoConf = (confPath, depth) => {
+      if (depth > 8) return;
+      const normConf = normalizeGuestPath(confPath);
+      if (visitedFiles.has(normConf)) return;
+      visitedFiles.add(normConf);
+      const bytes = this.readVfsFile(normConf);
+      if (!bytes) return;
+      const baseDir = dirname(normConf);
+      const text = textDecoder.decode(bytes);
+      for (const rawLine of text.split(/\r?\n/)) {
+        const line = rawLine.replace(/#.*$/, "").trim();
+        if (!line) continue;
+        if (/^include\s+/i.test(line)) {
+          const patterns = line.replace(/^include\s+/i, "").trim().split(/\s+/);
+          for (const pat of patterns) {
+            if (!pat) continue;
+            const fullPat = pat.startsWith("/")
+              ? normalizeGuestPath(pat)
+              : normalizeGuestPath(`${baseDir}/${pat}`);
+            if (fullPat.includes("*") || fullPat.includes("?")) {
+              const re = globToRegExp(fullPat);
+              const matches = Array.from(this.vfsFilePaths)
+                .filter((p) => re.test(p))
+                .sort();
+              for (const m of matches) {
+                parseLdSoConf(m, depth + 1);
+              }
+            } else {
+              parseLdSoConf(fullPat, depth + 1);
+            }
+          }
+        } else if (line.startsWith("/")) {
+          addDir(line);
+        }
+      }
+    };
+    parseLdSoConf("/etc/ld.so.conf", 0);
+
+    return dirs;
+  }
+
+  _expandOrigin(entry, originDir) {
+    if (!entry) return "";
+    const expanded = entry
+      .replace(/\$\{ORIGIN\}/g, originDir)
+      .replace(/\$ORIGIN(?![A-Za-z0-9_])/g, originDir);
+    return normalizeGuestPath(expanded);
+  }
+
+  _resolveElfSos(elfBytes, extraPaths = [], options = {}) {
     const resolved = [];
     const seen = new Set();
     const resolvedSeen = new Set();
     const queue = [];
 
-    const enqueue = (nameOrPath) => {
-      if (!nameOrPath || seen.has(nameOrPath)) return;
-      seen.add(nameOrPath);
-      queue.push(nameOrPath);
+    const env = options.env || [];
+    const ldLibDirs = [];
+    for (const entry of env) {
+      if (typeof entry === "string" && entry.startsWith("LD_LIBRARY_PATH=")) {
+        for (const p of entry.slice("LD_LIBRARY_PATH=".length).split(":")) {
+          if (p) ldLibDirs.push(normalizeGuestPath(p));
+        }
+      }
+    }
+    const configDirs = this._getConfigSoSearchDirs();
+
+    const rootOriginDir = options.elfPath
+      ? dirname(this.resolveVfsPath(options.elfPath))
+      : "/";
+
+    const enqueue = (nameOrPath, { originDir = rootOriginDir, rpath = [], runpath = [], isInterp = false } = {}) => {
+      if (!nameOrPath) return;
+      const key = `${isInterp ? "I:" : "N:"}${nameOrPath}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      queue.push({ target: nameOrPath, originDir, rpath, runpath, isInterp });
     };
 
-    const { interp, needed } = parseElf64Deps(elfBytes);
-    if (interp) enqueue(interp);
-    for (const n of needed) enqueue(n);
-    for (const ep of extraPaths) enqueue(ep);
+    const rootDeps = parseElf64Deps(elfBytes);
+    if (rootDeps.interp) {
+      enqueue(rootDeps.interp, {
+        originDir: rootOriginDir,
+        rpath: rootDeps.rpath,
+        runpath: rootDeps.runpath,
+        isInterp: true,
+      });
+    }
+    for (const n of rootDeps.needed) {
+      enqueue(n, {
+        originDir: rootOriginDir,
+        rpath: rootDeps.rpath,
+        runpath: rootDeps.runpath,
+      });
+    }
+    for (const ep of extraPaths) {
+      enqueue(ep, { originDir: rootOriginDir });
+    }
 
     while (queue.length > 0) {
-      const target = queue.shift();
+      const item = queue.shift();
+      const target = item.target;
       let foundPath = null;
       let foundBytes = null;
 
       if (target.startsWith("/")) {
-        const b = this.readVfsFile(target);
+        const normTarget = normalizeGuestPath(target);
+        const b = this.readVfsFile(normTarget);
         if (b) {
-          foundPath = target;
+          foundPath = normTarget;
           foundBytes = b;
         }
       } else {
-        for (const dir of DEFAULT_SO_SEARCH_DIRS) {
-          const cand = `${dir}/${target}`;
+        const searchDirs = [];
+        if (item.runpath.length === 0 && item.rpath.length > 0) {
+          for (const d of item.rpath) searchDirs.push(this._expandOrigin(d, item.originDir));
+        }
+        for (const d of ldLibDirs) searchDirs.push(d);
+        for (const d of item.runpath) searchDirs.push(this._expandOrigin(d, item.originDir));
+        for (const d of configDirs) searchDirs.push(d);
+        for (const d of DEFAULT_SO_SEARCH_DIRS) searchDirs.push(d);
+
+        const triedDirs = new Set();
+        for (const dir of searchDirs) {
+          if (!dir || triedDirs.has(dir)) continue;
+          triedDirs.add(dir);
+          const cand = normalizeGuestPath(`${dir}/${target}`);
           const b = this.readVfsFile(cand);
           if (b) {
             foundPath = cand;
@@ -893,21 +1327,22 @@ export class Elf2WasmSystem {
         }
       }
 
-      if (
-        foundBytes &&
-        foundBytes.length >= 64 &&
-        foundBytes[0] === 0x7f &&
-        foundBytes[1] === 0x45 &&
-        foundBytes[2] === 0x4c &&
-        foundBytes[3] === 0x46 &&
-        foundBytes[4] === 2
-      ) {
+      if (isElf64Bytes(foundBytes)) {
         const canonical = this.resolveVfsPath(foundPath);
         if (resolvedSeen.has(canonical)) continue;
         resolvedSeen.add(canonical);
-        resolved.push({ path: canonical, name: basename(canonical), bytes: foundBytes });
+        // Preserve requested PT_INTERP / DT_NEEDED foundPath so musl/glibc symlinks resolve cleanly
+        const emitPath = foundPath || canonical;
+        resolved.push({ path: emitPath, name: basename(emitPath), bytes: foundBytes });
         const sub = parseElf64Deps(foundBytes);
-        for (const n of sub.needed) enqueue(n);
+        const subOrigin = dirname(canonical);
+        for (const n of sub.needed) {
+          enqueue(n, {
+            originDir: subOrigin,
+            rpath: sub.rpath.length > 0 ? sub.rpath : item.rpath,
+            runpath: sub.runpath,
+          });
+        }
       }
     }
 
@@ -925,6 +1360,34 @@ export class Elf2WasmSystem {
     rExp.dealloc(metaPtr, metaBytes.length);
     rExp.dealloc(argsPtr, argsBuf.length);
     if (rc !== 0) throw new Error(`runtime_init_guest_stack failed: ${rc}`);
+  }
+
+  _applyInitialCwd(cwd) {
+    if (!cwd || !this.activeGuest || !this.runtimeInst) return;
+    const normCwd = normalizeGuestPath(cwd);
+    if (normCwd === "/") return;
+    const rExp = this.runtimeInst.exports;
+    if (typeof rExp.runtime_handle_syscall !== "function") return;
+
+    const cwdBytes = textEncoder.encode(normCwd + "\0");
+    const gMem = new Uint8Array(this.activeGuest.exports.memory.buffer);
+    const rsp = this.activeGuest.exports.rsp ? Number(this.activeGuest.exports.rsp.value) : 0;
+    const scratchSize = Math.max(256, cwdBytes.length + 16);
+    const scratchAddr = rsp > scratchSize + 4096 ? rsp - scratchSize : 0x1000;
+    if (scratchAddr + cwdBytes.length > gMem.length) return;
+
+    const saved = gMem.slice(scratchAddr, scratchAddr + cwdBytes.length);
+    gMem.set(cwdBytes, scratchAddr);
+    try {
+      // SYS_CHDIR = 80
+      let rc = rExp.runtime_handle_syscall(80n, BigInt(scratchAddr), 0n, 0n, 0n, 0n, 0n);
+      if (rc === -2n) {
+        this.writeVfsDir(normCwd, 0o755);
+        rExp.runtime_handle_syscall(80n, BigInt(scratchAddr), 0n, 0n, 0n, 0n, 0n);
+      }
+    } finally {
+      new Uint8Array(this.activeGuest.exports.memory.buffer).set(saved, scratchAddr);
+    }
   }
 
   _completeExec(pid, metaBytes, args, env) {
@@ -950,11 +1413,53 @@ export class Elf2WasmSystem {
     return new Uint8Array(rExp.memory.buffer, ptr, len).slice();
   }
 
+  _readOwnedRtBytes(fn) {
+    const rExp = this.runtimeInst.exports;
+    const outLenPtr = rExp.alloc(4);
+    const ptr = fn(outLenPtr);
+    const len = new DataView(rExp.memory.buffer).getUint32(outLenPtr, true);
+    rExp.dealloc(outLenPtr, 4);
+    if (ptr === 0 || len === 0) return new Uint8Array(0);
+    const copy = new Uint8Array(rExp.memory.buffer, ptr, len).slice();
+    rExp.dealloc(ptr, len);
+    return copy;
+  }
+
+  drainStdout() {
+    if (!this.runtimeInst) return new Uint8Array(0);
+    const rExp = this.runtimeInst.exports;
+    if (typeof rExp.runtime_drain_stdout !== "function") return new Uint8Array(0);
+    return this._readOwnedRtBytes((p) => rExp.runtime_drain_stdout(p));
+  }
+
+  drainStderr() {
+    if (!this.runtimeInst) return new Uint8Array(0);
+    const rExp = this.runtimeInst.exports;
+    if (typeof rExp.runtime_drain_stderr !== "function") return new Uint8Array(0);
+    return this._readOwnedRtBytes((p) => rExp.runtime_drain_stderr(p));
+  }
+
+  takeReapedPids() {
+    if (!this.runtimeInst) return [];
+    const rExp = this.runtimeInst.exports;
+    if (typeof rExp.runtime_take_reaped_pids !== "function") return [];
+    const raw = this._readOwnedRtBytes((p) => rExp.runtime_take_reaped_pids(p));
+    if (raw.length < 4) return [];
+    const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+    const count = Math.floor(raw.length / 4);
+    const pids = [];
+    for (let i = 0; i < count; i++) {
+      pids.push(dv.getUint32(i * 4, true));
+    }
+    return pids;
+  }
+
   async runElf(elfBytes, soEntries = [], args = [], options = {}) {
     if (!this.compilerInst || !this.runtimeInst) {
       throw new Error("Elf2WasmSystem requires both compilerWasm and runtimeWasm to run ELFs");
     }
 
+    this._aborted = false;
     const rExp = this.runtimeInst.exports;
     const elfU8 = toUint8Array(elfBytes);
     const elfPath = options.elfPath || "app";
@@ -975,6 +1480,7 @@ export class Elf2WasmSystem {
     const guestImports = {};
 
     const processes = new Map();
+    this._processes = processes;
     let activePid = 1000;
     const mainInst = await WebAssembly.instantiate(mod, guestImports);
     processes.set(activePid, { instance: mainInst, module: mod });
@@ -983,104 +1489,255 @@ export class Elf2WasmSystem {
     const effArgs =
       !args || args.length === 0
         ? [elfPath]
-        : args[0] === elfPath
+        : options.preserveArgv0 || args[0] === elfPath
           ? args
           : [elfPath, ...args];
     const effEnv = options.env || ["PATH=/usr/local/bin:/usr/bin:/bin"];
+
+    // Apply UID/GID, TTY mode, and winsize BEFORE _initGuestStack (which calls reset_for_new_run())
+    if (options.uid !== undefined || options.gid !== undefined) {
+      this.setUidGid(options.uid ?? 0, options.gid ?? 0);
+    }
+    const isInteractive = Boolean(options.tty || options.interactive);
+    const keepStdinOpen = Boolean(options.keepStdinOpen && options.stdin === undefined);
+    this.setTtyMode(isInteractive);
+    this.setStdinOpen(keepStdinOpen);
+    if (options.rows !== undefined || options.cols !== undefined) {
+      this.setWinsize(options.rows ?? 24, options.cols ?? 80);
+    }
+
     this._initGuestStack(metaBytes, effArgs, effEnv);
 
+    // Apply initial cwd AFTER _initGuestStack (reset_for_new_run() resets cwd to "/")
+    if (options.cwd) {
+      this._applyInitialCwd(options.cwd);
+    }
+
+    // Pre-seed stdin after _initGuestStack
+    if (options.stdin !== undefined) {
+      this.pushStdin(options.stdin);
+      if (!isInteractive) {
+        this.closeStdin();
+      }
+    }
+
+    if (typeof options.onReady === "function") {
+      options.onReady();
+    }
+
+    const onStdout = typeof options.onStdout === "function" ? options.onStdout : null;
+    const onStderr = typeof options.onStderr === "function" ? options.onStderr : null;
+    const signal = options.signal || null;
+    const yieldEvery = Number.isInteger(options.yieldEvery) && options.yieldEvery > 0
+      ? options.yieldEvery
+      : 100;
+
+    const flushStdio = () => {
+      if (onStdout) {
+        const chunk = this.drainStdout();
+        if (chunk.length > 0) onStdout(chunk);
+      }
+      if (onStderr) {
+        const chunk = this.drainStderr();
+        if (chunk.length > 0) onStderr(chunk);
+      }
+    };
+
+    const pendingReap = new Set();
+    const reapChildren = () => {
+      const reaped = this.takeReapedPids();
+      for (const pid of reaped) {
+        this.reapedPidCount++;
+        if (pid !== 1000) {
+          pendingReap.add(pid);
+        }
+      }
+      if (pendingReap.size === 0) return;
+      const curActive = rExp.runtime_get_active_pid();
+      for (const pid of Array.from(pendingReap)) {
+        if (pid !== 1000 && pid !== curActive) {
+          processes.delete(pid);
+          pendingReap.delete(pid);
+        }
+      }
+    };
+
+    const onAbort = () => this._notifyInput();
+    if (signal) {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+
     let lastCode = 0;
-    while (true) {
-      lastCode = this.activeGuest.exports._start();
+    let steps = 0;
+    let lastYieldTime = Date.now();
+    let skipStart = false;
 
-      if (rExp.runtime_is_exited() !== 0) {
-        break;
-      }
-
-      const yieldAction = rExp.runtime_on_yield();
-      if (yieldAction === 0) {
-        break;
-      } else if (yieldAction === 1) {
-        continue;
-      } else if (yieldAction === 2) {
-        activePid = rExp.runtime_get_active_pid();
-        const entry = processes.get(activePid);
-        if (!entry) throw new Error(`Missing guest instance for pid ${activePid}`);
-        this.activeGuest = entry.instance;
-        rExp.runtime_resume_active();
-      } else if (yieldAction === 3) {
-        // NeedFork
-        const childPid = rExp.runtime_get_pending_child_pid();
-        const scratchAddr = rExp.runtime_get_pending_scratch_addr() >>> 0;
-        const parentEntry = processes.get(activePid);
-        const childInst = await WebAssembly.instantiate(parentEntry.module, guestImports);
-
-        const parentMem = parentEntry.instance.exports.memory;
-        const childMem = childInst.exports.memory;
-        if (childMem.buffer.byteLength < parentMem.buffer.byteLength) {
-          const pagesNeeded =
-            (parentMem.buffer.byteLength - childMem.buffer.byteLength + 65535) >>> 16;
-          childMem.grow(pagesNeeded);
+    try {
+      while (true) {
+        if (this._aborted || signal?.aborted) {
+          break;
         }
-        new Uint8Array(childMem.buffer).set(new Uint8Array(parentMem.buffer));
 
-        for (const [name, exp] of Object.entries(parentEntry.instance.exports)) {
-          if (exp instanceof WebAssembly.Global && childInst.exports[name]) {
-            childInst.exports[name].value = exp.value;
+        if (!skipStart) {
+          lastCode = this.activeGuest.exports._start();
+        }
+        skipStart = false;
+
+        if (rExp.runtime_is_exited() !== 0) {
+          flushStdio();
+          reapChildren();
+          break;
+        }
+
+        const yieldAction = rExp.runtime_on_yield();
+        reapChildren();
+
+        if (yieldAction === 0) {
+          flushStdio();
+          break;
+        } else if (yieldAction === 1) {
+          steps++;
+          const now = Date.now();
+          if (steps % yieldEvery === 0 || now - lastYieldTime >= 16) {
+            flushStdio();
+            await yieldMacrotask();
+            lastYieldTime = Date.now();
           }
-        }
-        if (typeof childInst.exports.load_ctx === "function") {
-          childInst.exports.load_ctx(scratchAddr);
-        }
-
-        processes.set(childPid, { instance: childInst, module: parentEntry.module });
-        rExp.runtime_ack_fork(childPid);
-        activePid = rExp.runtime_get_active_pid();
-        this.activeGuest = processes.get(activePid).instance;
-        rExp.runtime_resume_active();
-      } else if (yieldAction === 4) {
-        // NeedExec
-        const outLenPtr = rExp.alloc(4);
-        const infoPtr = rExp.runtime_get_exec_info(outLenPtr);
-        const infoLen = new DataView(rExp.memory.buffer).getUint32(outLenPtr, true);
-        rExp.dealloc(outLenPtr, 4);
-        if (infoPtr === 0 || infoLen === 0) {
-          throw new Error("runtime_get_exec_info returned empty buffer");
-        }
-        const infoBytes = new Uint8Array(rExp.memory.buffer, infoPtr, infoLen).slice();
-        rExp.dealloc(infoPtr, infoLen);
-
-        const execInfo = decodeE2weExecInfo(infoBytes);
-        const execElf = this.readVfsFile(execInfo.path);
-        if (!execElf) {
-          throw new Error(`execve target not found in VFS: ${execInfo.path}`);
-        }
-        const extraSos = [];
-        for (const arg of execInfo.argv || []) {
-          if (
-            typeof arg === "string" &&
-            arg.startsWith("/") &&
-            (arg.endsWith(".so") || arg.includes(".so."))
-          ) {
-            extraSos.push(arg);
+          continue;
+        } else if (yieldAction === 2) {
+          activePid = rExp.runtime_get_active_pid();
+          reapChildren();
+          const entry = processes.get(activePid);
+          if (!entry) throw new Error(`Missing guest instance for pid ${activePid}`);
+          this.activeGuest = entry.instance;
+          const resumed = rExp.runtime_resume_active();
+          if (resumed === 0) {
+            skipStart = true;
           }
-        }
-        const execSos = this._resolveElfSos(execElf, extraSos);
-        const compiled = await this._compileCached(execElf, execSos, execInfo.path);
-        const newInst = await WebAssembly.instantiate(compiled.mod, guestImports);
+          steps++;
+          const now = Date.now();
+          if (steps % yieldEvery === 0 || now - lastYieldTime >= 16) {
+            flushStdio();
+            await yieldMacrotask();
+            lastYieldTime = Date.now();
+          }
+        } else if (yieldAction === 3) {
+          // NeedFork
+          flushStdio();
+          const childPid = rExp.runtime_get_pending_child_pid();
+          const scratchAddr = rExp.runtime_get_pending_scratch_addr() >>> 0;
+          const parentEntry = processes.get(activePid);
+          const childInst = await WebAssembly.instantiate(parentEntry.module, guestImports);
 
-        processes.set(execInfo.pid, { instance: newInst, module: compiled.mod });
-        activePid = execInfo.pid;
-        this.activeGuest = newInst;
-        this._completeExec(
-          execInfo.pid,
-          compiled.metaBytes,
-          execInfo.argv.length > 0 ? execInfo.argv : [execInfo.path],
-          execInfo.envp
-        );
-      } else {
-        throw new Error(`Unexpected runtime_on_yield return code: ${yieldAction}`);
+          const parentMem = parentEntry.instance.exports.memory;
+          const childMem = childInst.exports.memory;
+          if (childMem.buffer.byteLength < parentMem.buffer.byteLength) {
+            const pagesNeeded =
+              (parentMem.buffer.byteLength - childMem.buffer.byteLength + 65535) >>> 16;
+            childMem.grow(pagesNeeded);
+          }
+          new Uint8Array(childMem.buffer).set(new Uint8Array(parentMem.buffer));
+
+          for (const [name, exp] of Object.entries(parentEntry.instance.exports)) {
+            if (exp instanceof WebAssembly.Global && childInst.exports[name]) {
+              childInst.exports[name].value = exp.value;
+            }
+          }
+          if (typeof childInst.exports.load_ctx === "function") {
+            childInst.exports.load_ctx(scratchAddr);
+          }
+
+          processes.set(childPid, { instance: childInst, module: parentEntry.module });
+          rExp.runtime_ack_fork(childPid);
+          activePid = rExp.runtime_get_active_pid();
+          this.activeGuest = processes.get(activePid).instance;
+          const resumed = rExp.runtime_resume_active();
+          if (resumed === 0) {
+            skipStart = true;
+          }
+        } else if (yieldAction === 4) {
+          // NeedExec
+          flushStdio();
+          const infoBytes = this._readOwnedRtBytes((p) => rExp.runtime_get_exec_info(p));
+          if (infoBytes.length === 0) {
+            throw new Error("runtime_get_exec_info returned empty buffer");
+          }
+
+          const execInfo = decodeE2weExecInfo(infoBytes);
+          const execElf = this.readVfsFile(execInfo.path);
+          if (!execElf) {
+            throw new Error(`execve target not found in VFS: ${execInfo.path}`);
+          }
+          const extraSos = [];
+          for (const arg of execInfo.argv || []) {
+            if (
+              typeof arg === "string" &&
+              arg.startsWith("/") &&
+              (arg.endsWith(".so") || arg.includes(".so."))
+            ) {
+              extraSos.push(arg);
+            }
+          }
+          const execSos = this._resolveElfSos(execElf, extraSos, {
+            elfPath: execInfo.path,
+            env: execInfo.envp,
+          });
+          const compiled = await this._compileCached(execElf, execSos, execInfo.path);
+          const newInst = await WebAssembly.instantiate(compiled.mod, guestImports);
+
+          processes.set(execInfo.pid, { instance: newInst, module: compiled.mod });
+          activePid = execInfo.pid;
+          this.activeGuest = newInst;
+          this._completeExec(
+            execInfo.pid,
+            compiled.metaBytes,
+            execInfo.argv.length > 0 ? execInfo.argv : [execInfo.path],
+            execInfo.envp
+          );
+        } else if (yieldAction === 5) {
+          // NeedStdin
+          flushStdio();
+          reapChildren();
+          if (this._aborted || signal?.aborted) {
+            break;
+          }
+          await this._waitForInput(signal);
+          if (this._aborted || signal?.aborted) {
+            break;
+          }
+          if (rExp.runtime_is_exited() !== 0) {
+            flushStdio();
+            reapChildren();
+            break;
+          }
+          activePid = rExp.runtime_get_active_pid();
+          reapChildren();
+          const entry = processes.get(activePid);
+          if (entry) {
+            this.activeGuest = entry.instance;
+          }
+          const resumed = rExp.runtime_resume_active();
+          if (resumed === 0) {
+            skipStart = true;
+          }
+          lastYieldTime = Date.now();
+        } else {
+          throw new Error(`Unexpected runtime_on_yield return code: ${yieldAction}`);
+        }
       }
+    } finally {
+      if (signal) {
+        signal.removeEventListener("abort", onAbort);
+      }
+      flushStdio();
+      reapChildren();
+      this.lastActiveProcessCount = processes.size;
+      for (const pid of Array.from(processes.keys())) {
+        if (pid !== 1000) {
+          processes.delete(pid);
+        }
+      }
+      this._processes = null;
     }
 
     this.activeGuest = processes.get(1000).instance;
@@ -1088,9 +1745,11 @@ export class Elf2WasmSystem {
       ? this.activeGuest.exports.exit_flag.value | 0
       : 0;
     const exitCode =
-      exitFlag !== 0 || rExp.runtime_is_exited() !== 0
-        ? rExp.runtime_get_exit_code()
-        : lastCode;
+      this._aborted || signal?.aborted
+        ? 130
+        : exitFlag !== 0 || rExp.runtime_is_exited() !== 0
+          ? rExp.runtime_get_exit_code()
+          : lastCode;
 
     const stdout = this._readRtBytes((p) => rExp.runtime_get_stdout(p));
     const stderr = this._readRtBytes((p) => rExp.runtime_get_stderr(p));
@@ -1104,15 +1763,60 @@ export class Elf2WasmSystem {
   }
 
   async runFromVfs(guestPath, args = [], options = {}) {
-    const normPath = normalizeGuestPath(guestPath);
-    const resolvedPath = this.resolveVfsPath(normPath);
-    const elfBytes = this.readVfsFile(resolvedPath);
-    if (!elfBytes) {
-      throw new Error(`ELF not found in VFS: ${guestPath}`);
+    let currentPath = String(guestPath || "");
+    let currentArgs = Array.isArray(args) ? args.slice() : [];
+    const env = options.env || ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"];
+
+    if (!currentPath.includes("/")) {
+      const found = this.resolveCommandPath(currentPath, env);
+      if (!found) {
+        const err = new Error(`Command not found in PATH: ${guestPath}`);
+        err.code = "ENOENT";
+        throw err;
+      }
+      currentPath = found;
+    } else {
+      currentPath = normalizeGuestPath(currentPath);
     }
-    const soEntries = this._resolveElfSos(elfBytes, options.extraSos || []);
-    return await this.runElf(elfBytes, soEntries, args, {
+
+    let elfBytes = null;
+    let normPath = currentPath;
+    let resolvedPath = currentPath;
+
+    for (let depth = 0; depth < 5; depth++) {
+      normPath = normalizeGuestPath(currentPath);
+      resolvedPath = this.resolveVfsPath(normPath);
+      elfBytes = this.readVfsFile(resolvedPath);
+      if (!elfBytes) {
+        const err = new Error(`ELF not found in VFS: ${currentPath}`);
+        err.code = "ENOENT";
+        throw err;
+      }
+      const shebang = parseShebang(elfBytes);
+      if (!shebang) break;
+      const tailArgs = currentArgs.length > 0 ? currentArgs.slice(1) : [];
+      currentArgs = [
+        shebang.interp,
+        ...(shebang.arg ? [shebang.arg] : []),
+        normPath,
+        ...tailArgs,
+      ];
+      currentPath = shebang.interp;
+    }
+
+    if (!isElf64Bytes(elfBytes)) {
+      const err = new Error(`Exec format error (not an ELF64 binary): ${normPath}`);
+      err.code = "ENOEXEC";
+      throw err;
+    }
+
+    const soEntries = this._resolveElfSos(elfBytes, options.extraSos || [], {
+      elfPath: resolvedPath,
+      env,
+    });
+    return await this.runElf(elfBytes, soEntries, currentArgs, {
       ...options,
+      env,
       elfPath: options.elfPath || normPath,
     });
   }
@@ -1308,6 +2012,8 @@ export function extractTarToVfs(arg1, arg2) {
   const tar = toUint8Array(rawBytes);
   const files = new Map();
   const symlinks = new Map();
+  const dirs = new Map();
+  const whiteouts = [];
 
   let offset = 0;
   let nextLongName = null;
@@ -1381,11 +2087,34 @@ export function extractTarToVfs(arg1, arg2) {
     const guestPath = normalizeGuestPath("/" + rawPath.replace(/^\.\//, ""));
     if (guestPath === "/") continue;
 
+    // OCI whiteout markers (.wh..wh..opq and .wh.<name>) apply only to lower
+    // layers (handled in applyVfsOverlay before applying this layer's entries),
+    // never to sibling entries within the same layer.
+    const base = basename(guestPath);
+    const parentDir = dirname(guestPath);
+    if (base === ".wh..wh..opq") {
+      whiteouts.push({ type: "opaque", dir: parentDir });
+      continue;
+    }
+    if (base.startsWith(".wh.")) {
+      const targetName = base.slice(4);
+      if (targetName) {
+        const targetPath =
+          parentDir === "/" ? "/" + targetName : `${parentDir}/${targetName}`;
+        whiteouts.push({ type: "remove", path: targetPath });
+      }
+      continue;
+    }
+
     if (typeFlag === "5") {
+      symlinks.delete(guestPath);
+      files.delete(guestPath);
+      dirs.set(guestPath, mode || 0o755);
       continue;
     }
     if (typeFlag === "2") {
       files.delete(guestPath);
+      dirs.delete(guestPath);
       symlinks.set(guestPath, linkTarget);
       continue;
     }
@@ -1395,18 +2124,22 @@ export function extractTarToVfs(arg1, arg2) {
       if (existing) {
         const copy = existing.bytes.slice();
         symlinks.delete(guestPath);
+        dirs.delete(guestPath);
         files.set(guestPath, { bytes: copy, mode: mode || existing.mode || 0o644 });
       } else if (sys) {
         const targetBytes = sys.readVfsFile(targetGuestPath);
         if (targetBytes) {
           symlinks.delete(guestPath);
+          dirs.delete(guestPath);
           files.set(guestPath, { bytes: targetBytes, mode: mode || 0o644 });
         } else {
           files.delete(guestPath);
+          dirs.delete(guestPath);
           symlinks.set(guestPath, targetGuestPath);
         }
       } else {
         files.delete(guestPath);
+        dirs.delete(guestPath);
         symlinks.set(guestPath, targetGuestPath);
       }
       continue;
@@ -1414,15 +2147,17 @@ export function extractTarToVfs(arg1, arg2) {
     if (typeFlag === "0" || typeFlag === "\0") {
       const fileMode = mode || 0o644;
       symlinks.delete(guestPath);
+      dirs.delete(guestPath);
       files.set(guestPath, { bytes: payload, mode: fileMode });
     }
   }
 
+  const vfs = { files, symlinks, dirs, whiteouts };
   if (sys) {
-    applyVfsOverlay(sys, { files, symlinks });
+    applyVfsOverlay(sys, vfs);
   }
 
-  return { files, symlinks };
+  return vfs;
 }
 
 export async function extractTarGzToVfs(arg1, arg2) {
@@ -1452,6 +2187,7 @@ export async function extractZipToVfs(arg1, arg2) {
   const view = new DataView(zip.buffer, zip.byteOffset, zip.byteLength);
   const files = new Map();
   const symlinks = new Map();
+  const dirs = new Map();
 
   let eocdOffset = -1;
   const minOff = Math.max(0, zip.length - 65557);
@@ -1509,32 +2245,59 @@ export async function extractZipToVfs(arg1, arg2) {
     const unixMode = (externalAttrs >>> 16) & 0xffff;
     const fileType = unixMode & 0o170000;
     const isDir = fileType === 0o040000 || rawName.endsWith("/");
-    if (isDir) continue;
+    if (isDir) {
+      const perm = unixMode & 0o7777 ? unixMode & 0o7777 : 0o755;
+      dirs.set(guestPath, perm);
+      continue;
+    }
 
     if (fileType === 0o120000) {
       const target = textDecoder.decode(data);
       files.delete(guestPath);
+      dirs.delete(guestPath);
       symlinks.set(guestPath, target);
     } else {
       const perm = unixMode & 0o7777 ? unixMode & 0o7777 : 0o644;
       symlinks.delete(guestPath);
+      dirs.delete(guestPath);
       files.set(guestPath, { bytes: data, mode: perm });
     }
   }
 
+  const vfs = { files, symlinks, dirs };
   if (sys) {
-    applyVfsOverlay(sys, { files, symlinks });
+    applyVfsOverlay(sys, vfs);
   }
 
-  return { files, symlinks };
+  return vfs;
 }
 
 function pathDepth(p) {
   return normalizeGuestPath(p).split("/").filter(Boolean).length;
 }
 
-function applyVfsOverlay(sys, vfs) {
+export function applyVfsOverlay(sys, vfs) {
   if (!vfs) return;
+  if (Array.isArray(vfs.whiteouts)) {
+    for (const w of vfs.whiteouts) {
+      if (w.type === "opaque") {
+        if (w.dir && w.dir !== "/") {
+          sys.removeVfsPath(w.dir);
+          sys.writeVfsDir(w.dir, 0o755);
+        }
+      } else if (w.type === "remove" && w.path) {
+        sys.removeVfsPath(w.path);
+      }
+    }
+  }
+  if (vfs.dirs instanceof Map) {
+    const sortedDirs = Array.from(vfs.dirs.entries()).sort(
+      ([a], [b]) => pathDepth(a) - pathDepth(b)
+    );
+    for (const [path, mode] of sortedDirs) {
+      sys.writeVfsDir(path, mode ?? 0o755);
+    }
+  }
   if (vfs.symlinks instanceof Map) {
     const sortedSymlinks = Array.from(vfs.symlinks.entries()).sort(
       ([a], [b]) => pathDepth(a) - pathDepth(b)
