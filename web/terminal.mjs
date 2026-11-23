@@ -236,7 +236,7 @@ export class VT100Terminal {
     this._resizeTimerId = null;
     this._destroyed = false;
 
-    // Set up DOM inside containerEl (no child <input> or <textarea>!)
+    // Set up DOM inside containerEl
     if (!this.el.hasAttribute("tabindex")) {
       this.el.setAttribute("tabindex", "0");
     }
@@ -245,6 +245,18 @@ export class VT100Terminal {
     this._scrollbackEl.className = "term-scrollback";
     this._screenEl = document.createElement("div");
     this._screenEl.className = "term-screen";
+    this._inputEl = document.createElement("textarea");
+    this._inputEl.className = "term-input";
+    this._inputEl.setAttribute("tabindex", "-1");
+    this._inputEl.setAttribute("autocapitalize", "off");
+    this._inputEl.setAttribute("autocomplete", "off");
+    this._inputEl.setAttribute("autocorrect", "off");
+    this._inputEl.setAttribute("spellcheck", "false");
+    this._inputEl.setAttribute("enterkeyhint", "send");
+    this._inputEl.setAttribute("aria-label", "Terminal input");
+    this._inputEl.value = " ";
+    this._composing = false;
+    this.el.appendChild(this._inputEl);
     this.el.appendChild(this._scrollbackEl);
     this.el.appendChild(this._screenEl);
 
@@ -252,11 +264,17 @@ export class VT100Terminal {
     this._onKeyDown = this._handleKeyDown.bind(this);
     this._onPaste = this._handlePaste.bind(this);
     this._onClick = this._handleClick.bind(this);
+    this._onInput = this._handleInput.bind(this);
+    this._onCompositionStart = this._handleCompositionStart.bind(this);
+    this._onCompositionEnd = this._handleCompositionEnd.bind(this);
     this._onWindowResize = this._scheduleMeasure.bind(this);
 
     this.el.addEventListener("keydown", this._onKeyDown);
     this.el.addEventListener("paste", this._onPaste);
     this.el.addEventListener("click", this._onClick);
+    this._inputEl.addEventListener("input", this._onInput);
+    this._inputEl.addEventListener("compositionstart", this._onCompositionStart);
+    this._inputEl.addEventListener("compositionend", this._onCompositionEnd);
     window.addEventListener("resize", this._onWindowResize);
 
     if (typeof ResizeObserver !== "undefined") {
@@ -863,7 +881,16 @@ export class VT100Terminal {
   }
 
   _handleKeyDown(e) {
-    if (this._destroyed || e.isComposing) return;
+    if (
+      this._destroyed ||
+      this._composing ||
+      e.isComposing ||
+      e.key === "Process" ||
+      e.key === "Unidentified" ||
+      e.keyCode === 229
+    ) {
+      return;
+    }
 
     // Allow browser Meta shortcuts (Cmd+C, Cmd+V, Cmd+R, etc.)
     if (e.metaKey) return;
@@ -999,6 +1026,66 @@ export class VT100Terminal {
     this.focus();
   }
 
+  _resetInputSentinel() {
+    if (!this._inputEl) return;
+    this._inputEl.value = " ";
+    if (document.activeElement === this._inputEl) {
+      try {
+        this._inputEl.setSelectionRange(1, 1);
+      } catch {
+        // Ignore selection errors on unsupported environments
+      }
+    }
+  }
+
+  _handleCompositionStart() {
+    this._composing = true;
+  }
+
+  _handleCompositionEnd(e) {
+    this._composing = false;
+    if (this._destroyed) return;
+    const raw = typeof e?.data === "string" ? e.data : "";
+    if (raw.length > 0) {
+      this.onData(raw.replace(/\r\n?/g, "\n"));
+    }
+    this._resetInputSentinel();
+  }
+
+  _handleInput(e) {
+    if (this._destroyed || this._composing || e?.isComposing) return;
+    const inputType = e?.inputType || "";
+    if (inputType === "insertCompositionText") return;
+
+    const val = this._inputEl ? this._inputEl.value : "";
+
+    if (inputType === "deleteContentBackward" || (val.length === 0 && !e?.data)) {
+      this.onData("\x7f");
+      this._resetInputSentinel();
+      return;
+    }
+
+    if (inputType === "insertLineBreak" || inputType === "insertParagraph") {
+      this.onData("\n");
+      this._resetInputSentinel();
+      return;
+    }
+
+    let text = "";
+    if (val.startsWith(" ")) {
+      text = val.slice(1);
+    } else if (val.length > 0) {
+      text = val;
+    } else if (typeof e?.data === "string") {
+      text = e.data;
+    }
+
+    if (text.length > 0) {
+      this.onData(text.replace(/\r\n?/g, "\n"));
+    }
+    this._resetInputSentinel();
+  }
+
   _scheduleMeasure() {
     if (this._destroyed) return;
     if (this._resizeTimerId !== null) {
@@ -1106,11 +1193,13 @@ export class VT100Terminal {
 
   focus() {
     if (this._destroyed) return;
+    const target = this._inputEl || this.el;
     try {
-      this.el.focus({ preventScroll: true });
+      target.focus({ preventScroll: true });
     } catch {
-      this.el.focus();
+      target.focus();
     }
+    this._resetInputSentinel();
   }
 
   getText() {
@@ -1142,6 +1231,11 @@ export class VT100Terminal {
     this.el.removeEventListener("keydown", this._onKeyDown);
     this.el.removeEventListener("paste", this._onPaste);
     this.el.removeEventListener("click", this._onClick);
+    if (this._inputEl) {
+      this._inputEl.removeEventListener("input", this._onInput);
+      this._inputEl.removeEventListener("compositionstart", this._onCompositionStart);
+      this._inputEl.removeEventListener("compositionend", this._onCompositionEnd);
+    }
     window.removeEventListener("resize", this._onWindowResize);
   }
 }
