@@ -12,6 +12,24 @@ window.runDockerImage = runDockerImage;
 const COMPILER_WASM_URL = "/wasm/elf2wasm_compiler_wasm.wasm";
 const RUNTIME_WASM_URL = "/wasm/elf2wasm_runtime_wasm.wasm";
 
+function resolveRegistryProxyBase() {
+  if (
+    typeof window !== "undefined" &&
+    typeof window.ELF2WASM_PROXY_BASE === "string" &&
+    window.ELF2WASM_PROXY_BASE.trim().length > 0
+  ) {
+    return window.ELF2WASM_PROXY_BASE.trim();
+  }
+  if (typeof document !== "undefined") {
+    const meta = document.querySelector('meta[name="elf2wasm-proxy-base"]');
+    const content = meta?.getAttribute("content")?.trim();
+    if (content) {
+      return content;
+    }
+  }
+  return "/api/v2";
+}
+
 // Primary DOM elements
 const imageInput = document.getElementById("image-input");
 const cmdInput = document.getElementById("cmd-input");
@@ -119,7 +137,7 @@ async function getDocker() {
   const pending = Elf2WasmDocker.create({
     compilerWasmUrl: COMPILER_WASM_URL,
     runtimeWasmUrl: RUNTIME_WASM_URL,
-    registryProxyBase: "/api/v2",
+    registryProxyBase: resolveRegistryProxyBase(),
     useWorker: typeof Worker !== "undefined",
   })
     .then((docker) => {
