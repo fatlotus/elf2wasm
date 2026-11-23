@@ -2821,4 +2821,213 @@ mod tests {
         assert_eq!(rcx, u64::MAX, "sub rax, 1 should produce -1");
         assert_eq!(rax, 0xFFFF_FFEE, "cmovb and jne should have observed live flags");
     }
+
+    fn run_rcr_snippet(code: &[u8]) -> (u64, u64, u64, u64, u64, u64) {
+        let image = make_synthetic_image(code.to_vec());
+        let prog = discover_code(&image).unwrap();
+        let wasm = emit_wasm(&image, &prog).unwrap();
+        let engine = Engine::default();
+        let module = WasmModule::new(&engine, &wasm).unwrap();
+        let mut store = Store::new(&engine, ());
+        let inst = Instance::new(&mut store, &module, &[]).unwrap();
+        inst.get_global(&mut store, "rsp")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I64(STACK_TOP as i64))
+            .unwrap();
+        let start = inst
+            .get_typed_func::<(), i32>(&mut store, "_start")
+            .unwrap();
+        let _ = start.call(&mut store, ()).unwrap();
+        let g = |store: &mut Store<()>, name: &str| {
+            inst.get_global(&mut *store, name)
+                .unwrap()
+                .get(&mut *store)
+                .unwrap_i64() as u64
+        };
+        (
+            g(&mut store, "rax"),
+            g(&mut store, "rbx"),
+            g(&mut store, "rcx"),
+            g(&mut store, "rdx"),
+            g(&mut store, "rsi"),
+            g(&mut store, "rdi"),
+        )
+    }
+
+    #[test]
+    fn test_exec_rcr_rcl_widths_and_counts() {
+        // 1. 64-bit RCR by 1 with CF=1:
+        //    mov rax, 0x0000_0000_0000_0003; stc; rcr rax, 1
+        //    -> rax = 0x8000_0000_0000_0001, CF = 1, OF = 1 (msb=1 ^ bit62=0)
+        //    setc bl; seto bh
+        let code_rcr64_1: &[u8] = &[
+            0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00, // mov rax, 3
+            0x31, 0xDB, // xor ebx, ebx
+            0x45, 0x31, 0xC0, 0x41, 0x80, 0xF8, 0x01, // xor r8d, r8d; cmp r8b, 1 (CF=1)
+            0x48, 0xD1, 0xD8, // rcr rax, 1
+            0x0F, 0x92, 0xC3, // setc bl
+            0x0F, 0x90, 0xC7, // seto bh
+            0xC3, // ret
+        ];
+        let (rax, rbx, _, _, _, _) = run_rcr_snippet(code_rcr64_1);
+        assert_eq!(rax, 0x8000_0000_0000_0001);
+        assert_eq!(rbx & 0xFF, 1, "CF should be 1");
+        assert_eq!((rbx >> 8) & 0xFF, 1, "OF should be 1");
+
+        // 2. 64-bit RCR by 63 with CF=1, and RCL by 63 with CF=0:
+        //    rax = 0x8000_0000_0000_0001, CF=1, rcr rax, 63 ->
+        //      new_cf = bit 62 of rax = 0
+        //      res = (rax >> 63) | (1 << 1) | (rax << 2) = 1 | 2 | 4 = 7
+        //    rdx = 0x8000_0000_0000_0001, CF=0, rcl rdx, 63 ->
+        //      new_cf = bit 1 of rdx = 0
+        //      res = (rdx << 63) | (0 << 62) | (rdx >> 2) = 0x8000_0000_0000_0000 | 0x2000_0000_0000_0000 = 0xA000_0000_0000_0000
+        let code_64_multi: &[u8] = &[
+            0x48, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, // movabs rax, 0x8000000000000001
+            0x48, 0x89, 0xC2, // mov rdx, rax
+            0x31, 0xDB, // xor ebx, ebx
+            0x45, 0x31, 0xC0, 0x41, 0x80, 0xF8, 0x01, // CF=1
+            0x48, 0xC1, 0xD8, 0x3F, // rcr rax, 63
+            0x0F, 0x92, 0xC3, // setc bl
+            0x45, 0x31, 0xC0, // CF=0
+            0x48, 0xC1, 0xD2, 0x3F, // rcl rdx, 63
+            0x0F, 0x92, 0xC7, // setc bh
+            0xC3, // ret
+        ];
+        let (rax, rbx, _, rdx, _, _) = run_rcr_snippet(code_64_multi);
+        assert_eq!(rax, 7);
+        assert_eq!(rbx & 0xFF, 0);
+        assert_eq!(rdx, 0xA000_0000_0000_0000);
+        assert_eq!((rbx >> 8) & 0xFF, 0);
+
+        // 3. Count == 0 preserves CF/OF; on x86-64, 32-bit register operands still zero-extend into r64:
+        //    rax = 0x1234_5678_9ABC_DEF0, cl = 0, CF=1, rcr eax, cl -> rax = 0x0000_0000_9ABC_DEF0, CF=1
+        //    Then cl = 1, rcr eax, cl -> upper 32 bits zeroed, eax = (0x9ABC_DEF0 >> 1) | 0x8000_0000 = 0xCD5E_6F78, CF=0
+        let code_count0_and_32: &[u8] = &[
+            0x48, 0xB8, 0xF0, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12, // movabs rax, 0x123456789ABCDEF0
+            0x31, 0xC9, // xor ecx, ecx (cl = 0)
+            0x31, 0xDB, // xor ebx, ebx
+            0x45, 0x31, 0xC0, 0x41, 0x80, 0xF8, 0x01, // CF=1
+            0xD3, 0xD8, // rcr eax, cl
+            0x48, 0x89, 0xC2, // mov rdx, rax (snapshot after count=0)
+            0x0F, 0x92, 0xC3, // setc bl
+            0xB1, 0x01, // mov cl, 1
+            0xD3, 0xD8, // rcr eax, cl (CF was still 1)
+            0x0F, 0x92, 0xC7, // setc bh
+            0xC3, // ret
+        ];
+        let (rax, rbx, _, rdx, _, _) = run_rcr_snippet(code_count0_and_32);
+        assert_eq!(
+            rdx, 0x0000_0000_9ABC_DEF0,
+            "32-bit count=0 must zero-extend rax while preserving CF"
+        );
+        assert_eq!(rbx & 0xFF, 1, "count=0 must leave CF intact");
+        assert_eq!(rax, 0xCD5E_6F78, "32-bit rcr must zero-extend upper 32 bits");
+        assert_eq!((rbx >> 8) & 0xFF, 0, "new CF should be bit 0 of 0x9ABCDEF0 (0)");
+
+        // 4. 8-bit & 16-bit modulo-9 / modulo-17 counts and full-width wrap (c=8, c=16):
+        //    al = 0x81, CF=1, rcr al, 9 (9 % 9 == 0 -> unchanged, CF=1)
+        //    Then rcr al, 8 -> new_cf = bit 7 (1), res = (1 << 0) | ((0x81 << 1) & 0xFF) = 0x03
+        //    dx = 0x8001, CF=1, rcl dx, 17 (17 % 17 == 0 -> unchanged, CF=1)
+        //    Then rcl dx, 1 -> new_cf = 1, res = 0x0003, OF = msb(0x0003)^1 = 1
+        let code_8_16: &[u8] = &[
+            0x31, 0xC0, // xor eax, eax
+            0xB0, 0x81, // mov al, 0x81
+            0x31, 0xDB, // xor ebx, ebx
+            0x45, 0x31, 0xC0, 0x41, 0x80, 0xF8, 0x01, // CF=1
+            0xC0, 0xD8, 0x09, // rcr al, 9 (c = 0)
+            0x48, 0x89, 0xC6, // mov rsi, rax
+            0xC0, 0xD8, 0x08, // rcr al, 8 (c = 8, CF=1)
+            0x0F, 0x92, 0xC3, // setc bl
+            0x31, 0xD2, // xor edx, edx
+            0x66, 0xBA, 0x01, 0x80, // mov dx, 0x8001
+            0x45, 0x31, 0xC0, 0x41, 0x80, 0xF8, 0x01, // CF=1
+            0x66, 0xC1, 0xD2, 0x11, // rcl dx, 17 (c = 0)
+            0x48, 0x89, 0xD7, // mov rdi, rdx
+            0x66, 0xD1, 0xD2, // rcl dx, 1 (CF=1)
+            0x0F, 0x90, 0xC7, // seto bh
+            0xC3, // ret
+        ];
+        let (rax, rbx, _, rdx, rsi, rdi) = run_rcr_snippet(code_8_16);
+        assert_eq!(rsi, 0x81, "8-bit rcr by 9 must be no-op");
+        assert_eq!(rax, 0x03, "8-bit rcr by 8 with CF=1");
+        assert_eq!(rbx & 0xFF, 1, "8-bit rcr by 8 CF");
+        assert_eq!(rdi, 0x8001, "16-bit rcl by 17 must be no-op");
+        assert_eq!(rdx, 0x0003, "16-bit rcl by 1 with CF=1");
+        assert_eq!((rbx >> 8) & 0xFF, 1, "16-bit rcl by 1 OF");
+
+        // 5. Memory-operand RCR/RCL (m32 with count=0 and count=1 preserving adjacent bytes, plus m64 RCL by 1):
+        let code_mem: &[u8] = &[
+            0x48, 0x83, 0xEC, 0x10, // sub rsp, 16
+            0x48, 0xB8, 0x03, 0x00, 0x00, 0x80, 0x44, 0x33, 0x22, 0x11, // movabs rax, 0x1122334480000003
+            0x48, 0x89, 0x04, 0x24, // mov [rsp], rax
+            0x48, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, // movabs rax, 0x8000000000000001
+            0x48, 0x89, 0x44, 0x24, 0x08, // mov [rsp+8], rax
+            0x31, 0xDB, // xor ebx, ebx
+            0x31, 0xC9, // xor ecx, ecx (cl = 0)
+            0x45, 0x31, 0xC0, 0x41, 0x80, 0xF8, 0x01, // CF=1
+            0xD3, 0x1C, 0x24, // rcr dword ptr [rsp], cl (count=0: memory & CF unchanged)
+            0x48, 0x8B, 0x34, 0x24, // mov rsi, [rsp]
+            0xD1, 0x1C, 0x24, // rcr dword ptr [rsp], 1 (CF=1 -> 0xC0000001, new CF=1)
+            0x0F, 0x92, 0xC3, // setc bl
+            0x48, 0x8B, 0x04, 0x24, // mov rax, [rsp]
+            0x48, 0xD1, 0x54, 0x24, 0x08, // rcl qword ptr [rsp+8], 1 (CF=1 -> 0x3, new CF=1)
+            0x0F, 0x92, 0xC7, // setc bh
+            0x48, 0x8B, 0x54, 0x24, 0x08, // mov rdx, [rsp+8]
+            0x48, 0x83, 0xC4, 0x10, // add rsp, 16
+            0xC3, // ret
+        ];
+        let (rax, rbx, _, rdx, rsi, _) = run_rcr_snippet(code_mem);
+        assert_eq!(
+            rsi, 0x1122_3344_8000_0003,
+            "m32 rcr count=0 must leave memory and adjacent bytes intact"
+        );
+        assert_eq!(
+            rax, 0x1122_3344_C000_0001,
+            "m32 rcr by 1 must update only low 32 bits and preserve adjacent bytes"
+        );
+        assert_eq!(rbx & 0xFF, 1, "m32 rcr by 1 CF");
+        assert_eq!(rdx, 0x0000_0000_0000_0003, "m64 rcl by 1 with CF=1");
+        assert_eq!((rbx >> 8) & 0xFF, 1, "m64 rcl by 1 CF");
+    }
+
+    #[test]
+    fn test_exec_rcr_go_unsigned_div_pattern() {
+        // Exact Go 1.24 runtime.semrelease1 unsigned modulo-251 sequence:
+        //   movabs rax, magic_251
+        //   movabs rsi, x
+        //   mul rsi
+        //   add rdx, rsi     (sets CF=1 for large x!)
+        //   rcr rdx, 1       (consumes CF!)
+        //   shr rdx, 7       (q = x / 251)
+        //   imul rcx, rdx, 251
+        //   sub rsi, rcx     (r = x % 251)
+        let magic: u64 = (((1u128 << 72) / 251 + 1) - (1u128 << 64)) as u64;
+        for &x in &[
+            0u64,
+            250,
+            251,
+            252,
+            0x1234_5678_9ABC_DEF0,
+            u64::MAX - 13, // forces add rdx, rsi to overflow (CF = 1)
+            u64::MAX,
+        ] {
+            let mut code = Vec::new();
+            code.extend_from_slice(&[0x48, 0xB8]); // movabs rax, magic
+            code.extend_from_slice(&magic.to_le_bytes());
+            code.extend_from_slice(&[0x48, 0xBE]); // movabs rsi, x
+            code.extend_from_slice(&x.to_le_bytes());
+            code.extend_from_slice(&[
+                0x48, 0xF7, 0xE6, // mul rsi
+                0x48, 0x01, 0xF2, // add rdx, rsi
+                0x48, 0xD1, 0xDA, // rcr rdx, 1
+                0x48, 0xC1, 0xEA, 0x07, // shr rdx, 7
+                0x48, 0x69, 0xCA, 0xFB, 0x00, 0x00, 0x00, // imul rcx, rdx, 251
+                0x48, 0x29, 0xCE, // sub rsi, rcx
+                0xC3, // ret
+            ]);
+            let (_, _, _, rdx, rsi, _) = run_rcr_snippet(&code);
+            assert_eq!(rdx, x / 251, "quotient mismatch for x={x:#x}");
+            assert_eq!(rsi, x % 251, "remainder mismatch for x={x:#x}");
+        }
+    }
 }

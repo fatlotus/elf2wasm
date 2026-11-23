@@ -1727,6 +1727,12 @@ impl<'a> Lifter<'a> {
             Mnemonic::Ror => {
                 self.lift_rotate(instr, false);
             }
+            Mnemonic::Rcl => {
+                self.lift_rotate_carry(instr, true);
+            }
+            Mnemonic::Rcr => {
+                self.lift_rotate_carry(instr, false);
+            }
             Mnemonic::Shld => {
                 self.lift_double_shift(instr, true);
             }
@@ -2617,6 +2623,177 @@ impl<'a> Lifter<'a> {
             self.emit(WInst::I32Const(1));
             self.emit(WInst::I32And);
             self.emit(WInst::GlobalSet(GLOBAL_CF));
+        }
+        self.emit(WInst::End);
+    }
+
+    fn lift_rotate_carry(&mut self, instr: &X86Inst, left: bool) {
+        let w = self.operand_width_bytes(instr, 0);
+        let bits = w * 8;
+        let count_mask = if w == 8 { 0x3Fi64 } else { 0x1Fi64 };
+
+        // LOCAL_I64_0 = val (masked to w bytes)
+        self.read_op_i64(instr, 0, w);
+        self.mask_i64(w);
+        self.emit(WInst::LocalSet(LOCAL_I64_0));
+
+        // LOCAL_I64_1 = effective count c in 0..=bits
+        if instr.op_count() >= 2 {
+            self.read_op_i64(instr, 1, 1);
+        } else {
+            self.emit(WInst::I64Const(1));
+        }
+        self.emit(WInst::I64Const(count_mask));
+        self.emit(WInst::I64And);
+        if w == 1 {
+            self.emit(WInst::I64Const(9));
+            self.emit(WInst::I64RemU);
+        } else if w == 2 {
+            self.emit(WInst::I64Const(17));
+            self.emit(WInst::I64RemU);
+        }
+        self.emit(WInst::LocalSet(LOCAL_I64_1));
+
+        // If c == 0: flags are unchanged; 32-bit register operands still zero-extend into r64
+        self.emit(WInst::LocalGet(LOCAL_I64_1));
+        self.emit(WInst::I64Const(0));
+        self.emit(WInst::I64Ne);
+        self.emit(WInst::If(BlockType::Empty));
+        {
+            // LOCAL_I64_3 = old_cf (0 or 1)
+            self.emit(WInst::GlobalGet(GLOBAL_CF));
+            self.emit(WInst::I32Const(1));
+            self.emit(WInst::I32And);
+            self.emit(WInst::I64ExtendI32U);
+            self.emit(WInst::LocalSet(LOCAL_I64_3));
+
+            if left {
+                // RCL: new_cf = (val >> (bits - c)) & 1
+                self.emit(WInst::LocalGet(LOCAL_I64_0));
+                self.emit(WInst::I64Const(bits as i64));
+                self.emit(WInst::LocalGet(LOCAL_I64_1));
+                self.emit(WInst::I64Sub);
+                self.emit(WInst::I64ShrU);
+                self.emit(WInst::I32WrapI64);
+                self.emit(WInst::I32Const(1));
+                self.emit(WInst::I32And);
+                self.emit(WInst::LocalSet(LOCAL_I32_0));
+
+                // (val << c) | (old_cf << (c - 1)) | (if c > 1 { val >> (bits + 1 - c) } else { 0 })
+                self.emit(WInst::LocalGet(LOCAL_I64_0));
+                self.emit(WInst::LocalGet(LOCAL_I64_1));
+                self.emit(WInst::I64Shl);
+
+                self.emit(WInst::LocalGet(LOCAL_I64_3));
+                self.emit(WInst::LocalGet(LOCAL_I64_1));
+                self.emit(WInst::I64Const(1));
+                self.emit(WInst::I64Sub);
+                self.emit(WInst::I64Shl);
+                self.emit(WInst::I64Or);
+
+                self.emit(WInst::LocalGet(LOCAL_I64_1));
+                self.emit(WInst::I64Const(1));
+                self.emit(WInst::I64GtU);
+                self.emit(WInst::If(BlockType::Result(ValType::I64)));
+                {
+                    self.emit(WInst::LocalGet(LOCAL_I64_0));
+                    self.emit(WInst::I64Const((bits + 1) as i64));
+                    self.emit(WInst::LocalGet(LOCAL_I64_1));
+                    self.emit(WInst::I64Sub);
+                    self.emit(WInst::I64ShrU);
+                }
+                self.emit(WInst::Else);
+                {
+                    self.emit(WInst::I64Const(0));
+                }
+                self.emit(WInst::End);
+                self.emit(WInst::I64Or);
+            } else {
+                // RCR: new_cf = (val >> (c - 1)) & 1
+                self.emit(WInst::LocalGet(LOCAL_I64_0));
+                self.emit(WInst::LocalGet(LOCAL_I64_1));
+                self.emit(WInst::I64Const(1));
+                self.emit(WInst::I64Sub);
+                self.emit(WInst::I64ShrU);
+                self.emit(WInst::I32WrapI64);
+                self.emit(WInst::I32Const(1));
+                self.emit(WInst::I32And);
+                self.emit(WInst::LocalSet(LOCAL_I32_0));
+
+                // (val >> c) | (old_cf << (bits - c)) | (if c > 1 { val << (bits + 1 - c) } else { 0 })
+                self.emit(WInst::LocalGet(LOCAL_I64_0));
+                self.emit(WInst::LocalGet(LOCAL_I64_1));
+                self.emit(WInst::I64ShrU);
+
+                self.emit(WInst::LocalGet(LOCAL_I64_3));
+                self.emit(WInst::I64Const(bits as i64));
+                self.emit(WInst::LocalGet(LOCAL_I64_1));
+                self.emit(WInst::I64Sub);
+                self.emit(WInst::I64Shl);
+                self.emit(WInst::I64Or);
+
+                self.emit(WInst::LocalGet(LOCAL_I64_1));
+                self.emit(WInst::I64Const(1));
+                self.emit(WInst::I64GtU);
+                self.emit(WInst::If(BlockType::Result(ValType::I64)));
+                {
+                    self.emit(WInst::LocalGet(LOCAL_I64_0));
+                    self.emit(WInst::I64Const((bits + 1) as i64));
+                    self.emit(WInst::LocalGet(LOCAL_I64_1));
+                    self.emit(WInst::I64Sub);
+                    self.emit(WInst::I64Shl);
+                }
+                self.emit(WInst::Else);
+                {
+                    self.emit(WInst::I64Const(0));
+                }
+                self.emit(WInst::End);
+                self.emit(WInst::I64Or);
+            }
+
+            self.mask_i64(w);
+            self.emit(WInst::LocalSet(LOCAL_I64_2));
+
+            self.emit(WInst::LocalGet(LOCAL_I64_2));
+            self.write_op_i64(instr, 0, w);
+
+            // CF = new_cf
+            self.emit(WInst::LocalGet(LOCAL_I32_0));
+            self.emit(WInst::GlobalSet(GLOBAL_CF));
+
+            // OF for count == 1:
+            // - RCL: OF = msb(res) ^ new_cf
+            // - RCR: OF = msb(res) ^ bit(bits - 2, res)
+            self.emit(WInst::LocalGet(LOCAL_I64_1));
+            self.emit(WInst::I64Const(1));
+            self.emit(WInst::I64Eq);
+            self.emit(WInst::If(BlockType::Empty));
+            {
+                self.emit(WInst::LocalGet(LOCAL_I64_2));
+                self.emit(WInst::I64Const((bits - 1) as i64));
+                self.emit(WInst::I64ShrU);
+                self.emit(WInst::I32WrapI64);
+                self.emit(WInst::I32Const(1));
+                self.emit(WInst::I32And);
+                if left {
+                    self.emit(WInst::LocalGet(LOCAL_I32_0));
+                } else {
+                    self.emit(WInst::LocalGet(LOCAL_I64_2));
+                    self.emit(WInst::I64Const((bits - 2) as i64));
+                    self.emit(WInst::I64ShrU);
+                    self.emit(WInst::I32WrapI64);
+                    self.emit(WInst::I32Const(1));
+                    self.emit(WInst::I32And);
+                }
+                self.emit(WInst::I32Xor);
+                self.emit(WInst::GlobalSet(GLOBAL_OF));
+            }
+            self.emit(WInst::End);
+        }
+        if w == 4 && instr.op_kind(0) == OpKind::Register {
+            self.emit(WInst::Else);
+            self.emit(WInst::LocalGet(LOCAL_I64_0));
+            self.write_op_i64(instr, 0, 4);
         }
         self.emit(WInst::End);
     }
