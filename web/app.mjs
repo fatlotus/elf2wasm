@@ -425,33 +425,42 @@ async function bootImage({ imageRef, tarball = null, cmdStr = null, envList = nu
       });
     }
 
-    if (seq !== sessionSeq) return;
+    let container;
+    try {
+      if (seq !== sessionSeq) return;
 
-    const rawCmd = cmdStr !== null ? cmdStr : cmdInput.value.trim();
-    const cmdTokens = rawCmd ? splitShellArgs(rawCmd) : [];
-    const envEntries = envList !== null ? envList : parseEnvLines(envInput.value);
-    const workdir = cwd !== null ? cwd : cwdInput.value.trim();
-    const { cols, rows } = terminal.getSize();
+      const rawCmd = cmdStr !== null ? cmdStr : cmdInput.value.trim();
+      const cmdTokens = rawCmd ? splitShellArgs(rawCmd) : [];
+      const envEntries = envList !== null ? envList : parseEnvLines(envInput.value);
+      const workdir = cwd !== null ? cwd : cwdInput.value.trim();
+      const { cols, rows } = terminal.getSize();
 
-    const displayCmd =
-      cmdTokens.length > 0
-        ? cmdTokens.join(" ")
-        : (image.config?.cmd && image.config.cmd.join(" ")) || "/bin/sh";
-    if (terminalTitleEl) {
-      terminalTitleEl.textContent = `${resolvedDisplayName} — ${displayCmd}`;
+      const displayCmd =
+        cmdTokens.length > 0
+          ? cmdTokens.join(" ")
+          : (image.config?.cmd && image.config.cmd.join(" ")) || "/bin/sh";
+      if (terminalTitleEl) {
+        terminalTitleEl.textContent = `${resolvedDisplayName} — ${displayCmd}`;
+      }
+
+      container = await image.createContainer({
+        cmd: cmdTokens.length > 0 ? cmdTokens : undefined,
+        env: envEntries.length > 0 ? envEntries : undefined,
+        cwd: workdir || undefined,
+        tty: true,
+        cols,
+        rows,
+        onProgress: (ev) => {
+          if (seq === sessionSeq) handleProgressEvent(ev);
+        },
+      });
+    } finally {
+      try {
+        await image.dispose();
+      } catch {
+        // Ignore cleanup error
+      }
     }
-
-    const container = await image.createContainer({
-      cmd: cmdTokens.length > 0 ? cmdTokens : undefined,
-      env: envEntries.length > 0 ? envEntries : undefined,
-      cwd: workdir || undefined,
-      tty: true,
-      cols,
-      rows,
-      onProgress: (ev) => {
-        if (seq === sessionSeq) handleProgressEvent(ev);
-      },
-    });
 
     if (seq !== sessionSeq) {
       try {
