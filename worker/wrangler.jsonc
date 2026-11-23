@@ -13,6 +13,7 @@
     "run_worker_first": ["/api/*"]
   },
   "vars": {
-    "ALLOWED_ORIGINS": ""
+    "ALLOWED_ORIGINS": "",
+    "DOCKER_HUB_MIRROR": "mirror.gcr.io"
   }
 }

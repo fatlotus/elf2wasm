@@ -34,6 +34,43 @@ const CORS_EXPOSE_HEADERS = [
 
 const USER_AGENT = "elf2wasm-registry-proxy/1.0";
 
+const DOCKER_HUB_REGISTRIES = new Set([
+  "registry-1.docker.io",
+  "index.docker.io",
+  "docker.io",
+]);
+const DEFAULT_DOCKER_HUB_MIRROR = "mirror.gcr.io";
+const DOCKER_HUB_COOLDOWN_MS = 60_000;
+const IMMUTABLE_CACHE_CONTROL = "public, max-age=604800, immutable";
+const MUTABLE_MANIFEST_CACHE_CONTROL = "public, max-age=300";
+
+function isDockerHubHost(hostname) {
+  return DOCKER_HUB_REGISTRIES.has(String(hostname || "").toLowerCase());
+}
+
+function resolveDockerHubMirror(env, defaultMirror) {
+  if (env && typeof env.DOCKER_HUB_MIRROR === "string") {
+    return env.DOCKER_HUB_MIRROR.trim();
+  }
+  return defaultMirror;
+}
+
+function getEdgeCacheControl(kind, target) {
+  if (kind === "blobs" || (typeof target === "string" && target.includes(":"))) {
+    return IMMUTABLE_CACHE_CONTROL;
+  }
+  return MUTABLE_MANIFEST_CACHE_CONTROL;
+}
+
+function buildEdgeCacheKey(requestUrl, kind, acceptHeader) {
+  const keyUrl = new URL(requestUrl);
+  keyUrl.search = "";
+  if (kind === "manifests" && acceptHeader) {
+    keyUrl.searchParams.set("__accept", acceptHeader);
+  }
+  return new Request(keyUrl.toString(), { method: "GET" });
+}
+
 function parseAllowedOrigins(rawValue) {
   const set = new Set();
   if (typeof rawValue !== "string" || rawValue.trim().length === 0) {
@@ -212,8 +249,19 @@ export function createWorkerHandler(options = {}) {
   const fetchImpl = options.fetchImpl ?? ((input, init) => fetch(input, init));
   const defaultAllowLocalRegistries = Boolean(options.allowLocalRegistries);
   const defaultAllowedOrigins = options.allowedOrigins ?? "";
+  const defaultDockerHubMirror =
+    options.dockerHubMirror !== undefined ? options.dockerHubMirror : DEFAULT_DOCKER_HUB_MIRROR;
+  const dockerHubCooldownMs = options.dockerHubCooldownMs ?? DOCKER_HUB_COOLDOWN_MS;
+  const edgeCache =
+    options.cache !== undefined
+      ? options.cache
+      : typeof caches !== "undefined" && caches.default
+        ? caches.default
+        : null;
   const maxRedirects = options.maxRedirects ?? 5;
   const requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
+
+  let dockerHubRateLimitedUntil = 0;
 
   const tokenCache = createTokenCache({
     maxEntries: options.tokenCacheMaxEntries ?? 256,
@@ -314,7 +362,8 @@ export function createWorkerHandler(options = {}) {
 
     if (tokenRes.status !== 200) {
       await cancelBodySafely(tokenRes);
-      throw new ProxyError(502, `Registry auth server returned HTTP ${tokenRes.status}`);
+      const errStatus = tokenRes.status === 429 ? 429 : 502;
+      throw new ProxyError(errStatus, `Registry auth server returned HTTP ${tokenRes.status}`);
     }
 
     const bodyText = await readBoundedText(tokenRes, MAX_TOKEN_RESPONSE_BYTES);
@@ -337,7 +386,59 @@ export function createWorkerHandler(options = {}) {
     };
   }
 
-  async function handleOciProxy(request, env, rawPathname, cors) {
+  async function fetchFromRegistry({
+    registry,
+    hostname,
+    kind,
+    repo,
+    target,
+    method,
+    baseHeaders,
+    allowLocalRegistries,
+  }) {
+    const scheme = selectInitialScheme(hostname, allowLocalRegistries);
+    const upstreamUrl = new URL(`${scheme}//${registry}/v2/${repo}/${kind}/${target}`);
+    const cacheKey = `${registry}|${repo}`;
+    const cachedToken = tokenCache.get(cacheKey);
+
+    let upstreamRes = await requestWithRedirects(upstreamUrl, {
+      method,
+      baseHeaders,
+      authToken: cachedToken,
+      allowLocalRegistries,
+    });
+
+    // Handle OCI v2 401 Bearer challenge with at most one retry.
+    if (upstreamRes.status === 401) {
+      const wwwAuth = upstreamRes.headers.get("www-authenticate");
+      await cancelBodySafely(upstreamRes);
+      tokenCache.delete(cacheKey);
+
+      if (!wwwAuth) {
+        throw new ProxyError(502, "Upstream registry returned 401 without WWW-Authenticate header");
+      }
+
+      const fetched = await fetchBearerToken(wwwAuth, allowLocalRegistries);
+      tokenCache.set(cacheKey, fetched.token, fetched.expiresIn);
+
+      upstreamRes = await requestWithRedirects(upstreamUrl, {
+        method,
+        baseHeaders,
+        authToken: fetched.token,
+        allowLocalRegistries,
+      });
+
+      if (upstreamRes.status === 401) {
+        await cancelBodySafely(upstreamRes);
+        tokenCache.delete(cacheKey);
+        throw new ProxyError(502, "Upstream registry rejected Bearer token");
+      }
+    }
+
+    return upstreamRes;
+  }
+
+  async function handleOciProxy(request, env, ctx, rawPathname, cors) {
     const method = (request.method || "GET").toUpperCase();
 
     if (method === "OPTIONS") {
@@ -362,9 +463,6 @@ export function createWorkerHandler(options = {}) {
     try {
       const { registry, hostname, kind, repo, target } = parseProxyPath(rawPathname);
 
-      const scheme = selectInitialScheme(hostname, allowLocalRegistries);
-      const upstreamUrl = new URL(`${scheme}//${registry}/v2/${repo}/${kind}/${target}`);
-
       const baseHeaders = {
         "User-Agent": USER_AGENT,
       };
@@ -378,40 +476,91 @@ export function createWorkerHandler(options = {}) {
         baseHeaders.Accept = "*/*";
       }
 
-      const cacheKey = `${registry}|${repo}`;
-      const cachedToken = tokenCache.get(cacheKey);
+      const edgeCacheKey = edgeCache
+        ? buildEdgeCacheKey(request.url, kind, kind === "manifests" ? baseHeaders.Accept : null)
+        : null;
 
-      let upstreamRes = await requestWithRedirects(upstreamUrl, {
-        method,
-        baseHeaders,
-        authToken: cachedToken,
-        allowLocalRegistries,
-      });
-
-      // Handle OCI v2 401 Bearer challenge with at most one retry.
-      if (upstreamRes.status === 401) {
-        const wwwAuth = upstreamRes.headers.get("www-authenticate");
-        await cancelBodySafely(upstreamRes);
-        tokenCache.delete(cacheKey);
-
-        if (!wwwAuth) {
-          throw new ProxyError(502, "Upstream registry returned 401 without WWW-Authenticate header");
+      if (edgeCache && edgeCacheKey) {
+        let cachedRes = null;
+        try {
+          cachedRes = await edgeCache.match(edgeCacheKey);
+        } catch {
+          cachedRes = null;
         }
+        if (cachedRes) {
+          const outHeaders = new Headers();
+          applyApiHeaders(outHeaders, cors);
+          for (const headerName of FORWARDED_RESPONSE_HEADERS) {
+            const val = cachedRes.headers.get(headerName);
+            if (val !== null) {
+              outHeaders.set(headerName, val);
+            }
+          }
+          if (method === "HEAD") {
+            await cancelBodySafely(cachedRes);
+            return new Response(null, { status: cachedRes.status, headers: outHeaders });
+          }
+          return new Response(cachedRes.body, { status: cachedRes.status, headers: outHeaders });
+        }
+      }
 
-        const fetched = await fetchBearerToken(wwwAuth, allowLocalRegistries);
-        tokenCache.set(cacheKey, fetched.token, fetched.expiresIn);
+      const mirrorHost = isDockerHubHost(hostname)
+        ? resolveDockerHubMirror(env, defaultDockerHubMirror)
+        : "";
+      const canUseMirror =
+        mirrorHost.length > 0 && mirrorHost.toLowerCase() !== hostname.toLowerCase();
+      const inCooldown = canUseMirror && Date.now() < dockerHubRateLimitedUntil;
 
-        upstreamRes = await requestWithRedirects(upstreamUrl, {
+      let upstreamRes;
+      if (inCooldown) {
+        const mirrorHostname = mirrorHost.split(":")[0];
+        upstreamRes = await fetchFromRegistry({
+          registry: mirrorHost,
+          hostname: mirrorHostname,
+          kind,
+          repo,
+          target,
           method,
           baseHeaders,
-          authToken: fetched.token,
           allowLocalRegistries,
         });
+      } else {
+        let rateLimitedError = null;
+        try {
+          upstreamRes = await fetchFromRegistry({
+            registry,
+            hostname,
+            kind,
+            repo,
+            target,
+            method,
+            baseHeaders,
+            allowLocalRegistries,
+          });
+        } catch (err) {
+          if (canUseMirror && err instanceof ProxyError && err.statusCode === 429) {
+            rateLimitedError = err;
+          } else {
+            throw err;
+          }
+        }
 
-        if (upstreamRes.status === 401) {
-          await cancelBodySafely(upstreamRes);
-          tokenCache.delete(cacheKey);
-          throw new ProxyError(502, "Upstream registry rejected Bearer token");
+        if (canUseMirror && (rateLimitedError || upstreamRes.status === 429)) {
+          if (upstreamRes) {
+            await cancelBodySafely(upstreamRes);
+          }
+          dockerHubRateLimitedUntil = Date.now() + dockerHubCooldownMs;
+          const mirrorHostname = mirrorHost.split(":")[0];
+          upstreamRes = await fetchFromRegistry({
+            registry: mirrorHost,
+            hostname: mirrorHostname,
+            kind,
+            repo,
+            target,
+            method,
+            baseHeaders,
+            allowLocalRegistries,
+          });
         }
       }
 
@@ -419,6 +568,10 @@ export function createWorkerHandler(options = {}) {
       if (status === 404) {
         await cancelBodySafely(upstreamRes);
         return jsonResponse({ error: "Upstream OCI resource not found" }, 404, cors);
+      }
+      if (status === 429) {
+        await cancelBodySafely(upstreamRes);
+        return jsonResponse({ error: "Upstream registry rate-limited (HTTP 429)" }, 429, cors);
       }
       if (status < 200 || status >= 300) {
         await cancelBodySafely(upstreamRes);
@@ -439,6 +592,36 @@ export function createWorkerHandler(options = {}) {
         return new Response(null, { status, headers: outHeaders });
       }
 
+      if (edgeCache && edgeCacheKey && status === 200) {
+        const cacheHeaders = new Headers();
+        for (const headerName of FORWARDED_RESPONSE_HEADERS) {
+          const val = upstreamRes.headers.get(headerName);
+          if (val !== null) {
+            cacheHeaders.set(headerName, val);
+          }
+        }
+        cacheHeaders.set("Cache-Control", getEdgeCacheControl(kind, target));
+
+        if (upstreamRes.body && typeof upstreamRes.body.tee === "function") {
+          const [clientStream, cacheStream] = upstreamRes.body.tee();
+          const cacheRes = new Response(cacheStream, { status, headers: cacheHeaders });
+          const putPromise = Promise.resolve(edgeCache.put(edgeCacheKey, cacheRes)).catch(() =>
+            cancelBodySafely(cacheRes)
+          );
+          if (ctx && typeof ctx.waitUntil === "function") {
+            ctx.waitUntil(putPromise);
+          }
+          return new Response(clientStream, { status, headers: outHeaders });
+        }
+
+        const cacheRes = new Response(null, { status, headers: cacheHeaders });
+        const putPromise = Promise.resolve(edgeCache.put(edgeCacheKey, cacheRes)).catch(() => {});
+        if (ctx && typeof ctx.waitUntil === "function") {
+          ctx.waitUntil(putPromise);
+        }
+        return new Response(upstreamRes.body, { status, headers: outHeaders });
+      }
+
       return new Response(upstreamRes.body, { status, headers: outHeaders });
     } catch (err) {
       if (err instanceof ProxyError) {
@@ -455,9 +638,10 @@ export function createWorkerHandler(options = {}) {
   return {
     clearTokenCache() {
       tokenCache.clear();
+      dockerHubRateLimitedUntil = 0;
     },
 
-    async fetch(request, env = {}, _ctx) {
+    async fetch(request, env = {}, ctx) {
       const rawPathname = extractRawPathname(request.url);
       const cors = evaluateCors(request, env, defaultAllowedOrigins);
 
@@ -474,7 +658,7 @@ export function createWorkerHandler(options = {}) {
       }
 
       if (rawPathname === "/api/v2" || rawPathname.startsWith("/api/v2/")) {
-        return handleOciProxy(request, env, rawPathname, cors);
+        return handleOciProxy(request, env, ctx, rawPathname, cors);
       }
 
       if (env && env.ASSETS && typeof env.ASSETS.fetch === "function") {
