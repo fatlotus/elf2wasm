@@ -2788,6 +2788,134 @@ test("formatWasmTrapError annotates WebAssembly.RuntimeError with phase, elfPath
   assert.doesNotMatch(compileTrap.message, /rip=/);
 });
 
+test("M14: waitid(WNOWAIT) followed by wait4 reaps child cleanly through runtime.wasm", async () => {
+  const elf = buildStaticTestElf(`
+    static long sc6(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
+      long ret;
+      register long r10 __asm__("r10") = a3;
+      register long r8 __asm__("r8") = a4;
+      register long r9 __asm__("r9") = a5;
+      __asm__ volatile ("syscall"
+        : "=a"(ret)
+        : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "r"(r10), "r"(r8), "r"(r9)
+        : "rcx", "r11", "memory");
+      return ret;
+    }
+    void _start(void) {
+      long pid = sc6(57 /* fork */, 0, 0, 0, 0, 0, 0);
+      if (pid < 0) sc6(231, 10, 0, 0, 0, 0, 0);
+      if (pid == 0) {
+        sc6(231 /* exit_group */, 42, 0, 0, 0, 0, 0);
+      }
+      int si[32];
+      for (int i = 0; i < 32; i++) si[i] = 0;
+      /* waitid(P_PID=1, pid, &si, WEXITED(4)|WNOWAIT(0x01000000), 0) */
+      long r = sc6(247, 1, pid, (long)si, 0x01000004L, 0, 0);
+      if (r != 0) sc6(231, 11, 0, 0, 0, 0, 0);
+      if (si[0] != 17 || si[2] != 1 || si[4] != (int)pid || si[6] != 42) {
+        sc6(231, 12, 0, 0, 0, 0, 0);
+      }
+      int wstatus = 0;
+      long w = sc6(61 /* wait4 */, pid, (long)&wstatus, 0, 0, 0, 0);
+      if (w != pid || ((wstatus >> 8) & 0xff) != 42) {
+        sc6(231, 13, 0, 0, 0, 0, 0);
+      }
+      long w2 = sc6(61 /* wait4 */, pid, (long)&wstatus, 0, 0, 0, 0);
+      if (w2 != -10 /* -ECHILD */) {
+        sc6(231, 14, 0, 0, 0, 0, 0);
+      }
+      sc6(1 /* write */, 1, (long)"WAITID_OK\\n", 10, 0, 0, 0);
+      sc6(231 /* exit_group */, 0, 0, 0, 0, 0, 0);
+    }
+  `);
+
+  const sys = await Elf2WasmSystem.create({
+    compilerWasm: fs.readFileSync(COMPILER_WASM_PATH),
+    runtimeWasm: fs.readFileSync(RUNTIME_WASM_PATH),
+  });
+  let out = "";
+  const res = await sys.runElf(elf, [], ["/test_waitid"], {
+    onStdout: (c) => {
+      out += textDecoder.decode(c);
+    },
+  });
+  assert.equal(res.exitCode, 0);
+  assert.equal(out, "WAITID_OK\n");
+});
+
+test("M14: IPv4 TCP loopback socket bind/listen/connect/accept4/epoll/shutdown roundtrip through runtime.wasm", async () => {
+  const elf = buildStaticTestElf(`
+    static long sc6(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
+      long ret;
+      register long r10 __asm__("r10") = a3;
+      register long r8 __asm__("r8") = a4;
+      register long r9 __asm__("r9") = a5;
+      __asm__ volatile ("syscall"
+        : "=a"(ret)
+        : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "r"(r10), "r"(r8), "r"(r9)
+        : "rcx", "r11", "memory");
+      return ret;
+    }
+    void _start(void) {
+      long lfd = sc6(41 /* socket */, 2 /* AF_INET */, 1 | 0x800 | 0x80000, 0, 0, 0, 0);
+      if (lfd < 3) sc6(231, 1, 0, 0, 0, 0, 0);
+
+      unsigned char sa[16] = {2, 0, 0, 0, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0};
+      if (sc6(49 /* bind */, lfd, (long)sa, 16, 0, 0, 0) != 0) sc6(231, 2, 0, 0, 0, 0, 0);
+
+      unsigned char bound[16] = {0};
+      unsigned int blen = 16;
+      if (sc6(51 /* getsockname */, lfd, (long)bound, (long)&blen, 0, 0, 0) != 0) sc6(231, 3, 0, 0, 0, 0, 0);
+      if (bound[2] == 0 && bound[3] == 0) sc6(231, 4, 0, 0, 0, 0, 0);
+
+      if (sc6(50 /* listen */, lfd, 16, 0, 0, 0, 0) != 0) sc6(231, 5, 0, 0, 0, 0, 0);
+
+      long epfd = sc6(291 /* epoll_create1 */, 0x80000, 0, 0, 0, 0, 0);
+      if (epfd < 3) sc6(231, 6, 0, 0, 0, 0, 0);
+      unsigned char ev[12] = {1, 0, 0, 0x80, 0x42, 0, 0, 0, 0, 0, 0, 0};
+      if (sc6(233 /* epoll_ctl */, epfd, 1, lfd, (long)ev, 0, 0) != 0) sc6(231, 7, 0, 0, 0, 0, 0);
+
+      long cfd = sc6(41 /* socket */, 2, 1 | 0x800, 0, 0, 0, 0);
+      if (cfd < 3) sc6(231, 8, 0, 0, 0, 0, 0);
+      if (sc6(42 /* connect */, cfd, (long)bound, 16, 0, 0, 0) != 0) sc6(231, 9, 0, 0, 0, 0, 0);
+
+      unsigned char out_ev[12] = {0};
+      if (sc6(232 /* epoll_wait */, epfd, (long)out_ev, 1, 0, 0, 0) != 1) sc6(231, 10, 0, 0, 0, 0, 0);
+
+      long sfd = sc6(288 /* accept4 */, lfd, 0, 0, 0x800, 0, 0);
+      if (sfd < 3) sc6(231, 11, 0, 0, 0, 0, 0);
+
+      if (sc6(44 /* sendto */, cfd, (long)"hello", 5, 0, 0, 0) != 5) sc6(231, 12, 0, 0, 0, 0, 0);
+      char buf[8] = {0};
+      if (sc6(45 /* recvfrom */, sfd, (long)buf, 8, 0, 0, 0) != 5) sc6(231, 13, 0, 0, 0, 0, 0);
+      if (buf[0] != 'h' || buf[4] != 'o') sc6(231, 14, 0, 0, 0, 0, 0);
+
+      if (sc6(48 /* shutdown */, sfd, 1 /* SHUT_WR */, 0, 0, 0, 0) != 0) sc6(231, 15, 0, 0, 0, 0, 0);
+      if (sc6(0 /* read */, cfd, (long)buf, 8, 0, 0, 0) != 0) sc6(231, 16, 0, 0, 0, 0, 0);
+
+      sc6(3, cfd, 0, 0, 0, 0, 0);
+      sc6(3, sfd, 0, 0, 0, 0, 0);
+      sc6(3, lfd, 0, 0, 0, 0, 0);
+      sc6(3, epfd, 0, 0, 0, 0, 0);
+      sc6(1 /* write */, 1, (long)"TCP_LOOPBACK_OK\\n", 16, 0, 0, 0);
+      sc6(231 /* exit_group */, 0, 0, 0, 0, 0, 0);
+    }
+  `);
+
+  const sys = await Elf2WasmSystem.create({
+    compilerWasm: fs.readFileSync(COMPILER_WASM_PATH),
+    runtimeWasm: fs.readFileSync(RUNTIME_WASM_PATH),
+  });
+  let out = "";
+  const res = await sys.runElf(elf, [], ["/test_tcp"], {
+    onStdout: (c) => {
+      out += textDecoder.decode(c);
+    },
+  });
+  assert.equal(res.exitCode, 0);
+  assert.equal(out, "TCP_LOOPBACK_OK\n");
+});
+
 
 
 
