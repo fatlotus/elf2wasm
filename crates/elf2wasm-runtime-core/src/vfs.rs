@@ -849,6 +849,18 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
                 return Some((idx, so));
             }
         }
+        // Also match shared libraries whose registered guest path traverses
+        // overlay symlinks (e.g. Debian usrmerge /lib -> usr/lib and soname
+        // symlinks like libtinfo.so.6 -> libtinfo.so.6.4) to reach norm_path.
+        for (idx, so) in self.so_entries.iter().enumerate() {
+            if so
+                .guest_paths
+                .iter()
+                .any(|gp| self.resolve_path(AT_FDCWD, gp, true).as_deref() == Ok(norm_path))
+            {
+                return Some((idx, so));
+            }
+        }
         None
     }
 
@@ -3077,5 +3089,34 @@ mod tests {
         let vfs = VirtualFs::new_in_memory(&[]);
         assert_eq!(vfs.access(AT_FDCWD, "/nonexistent.so", 2), -ENOENT);
         assert_eq!(vfs.access(AT_FDCWD, "/nonexistent.so", 0), -ENOENT);
+    }
+
+    #[test]
+    fn test_find_so_resolves_usrmerge_and_soname_symlinks() {
+        let so = MetaSoFile {
+            guest_paths: vec!["/lib/x86_64-linux-gnu/libtinfo.so.6".to_string()],
+            base_addr: 0x0300_0000,
+            bytes: b"\x7fELF_libtinfo".to_vec(),
+        };
+        let mut vfs = VirtualFs::new_in_memory(&[so]);
+        // Simulate Debian usrmerge (/lib -> usr/lib) + soname symlink (libtinfo.so.6 -> libtinfo.so.6.4)
+        vfs.vfs_add_symlink("/lib", "usr/lib");
+        vfs.vfs_write_file(
+            "/usr/lib/x86_64-linux-gnu/libtinfo.so.6.4",
+            b"\x7fELF_libtinfo",
+            0o644,
+        );
+        vfs.vfs_add_symlink(
+            "/usr/lib/x86_64-linux-gnu/libtinfo.so.6",
+            "libtinfo.so.6.4",
+        );
+
+        let fd1 = vfs.openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libtinfo.so.6", O_RDONLY);
+        assert!(fd1 >= 3, "expected valid fd, got {}", fd1);
+        assert_eq!(vfs.get_fd(fd1 as i32).unwrap().so_base_addr, Some(0x0300_0000));
+
+        let fd2 = vfs.openat(AT_FDCWD, "/usr/lib/x86_64-linux-gnu/libtinfo.so.6.4", O_RDONLY);
+        assert!(fd2 >= 3, "expected valid fd, got {}", fd2);
+        assert_eq!(vfs.get_fd(fd2 as i32).unwrap().so_base_addr, Some(0x0300_0000));
     }
 }
