@@ -4,9 +4,10 @@ use crate::decoder::{
 use crate::elf_loader::{ExecSegment, LoadedImage, INITIAL_MEM_PAGES};
 use crate::lifter::{
     Lifter, DEFAULT_QUANTUM, GLOBAL_CF, GLOBAL_DF, GLOBAL_EXIT_CODE, GLOBAL_EXIT_FLAG,
-    GLOBAL_FSBASE, GLOBAL_GSBASE, GLOBAL_MXCSR, GLOBAL_QUANTUM, GLOBAL_RAX, GLOBAL_RIP, GLOBAL_RSP,
-    GLOBAL_TSC, GLOBAL_X87_CW, GLOBAL_X87_SE_BASE, GLOBAL_X87_ST_BASE, GLOBAL_X87_SW,
-    GLOBAL_X87_TOP, GLOBAL_XMM_BASE, GLOBAL_YIELD_FLAG, GPR_NAMES, LOCAL_I64_0, LOCAL_PC_IDX,
+    GLOBAL_FSBASE, GLOBAL_GSBASE, GLOBAL_MXCSR, GLOBAL_QUANTUM, GLOBAL_RAX, GLOBAL_RCX,
+    GLOBAL_RIP, GLOBAL_RSP, GLOBAL_TSC, GLOBAL_X87_CW, GLOBAL_X87_SE_BASE, GLOBAL_X87_ST_BASE,
+    GLOBAL_X87_SW, GLOBAL_X87_TOP, GLOBAL_XMM_BASE, GLOBAL_YIELD_FLAG, GPR_NAMES, LOCAL_I64_0,
+    LOCAL_PC_IDX, YIELD_SYSCALL_PENDING,
 };
 use crate::meta::{MetaSoFile, WasmMeta};
 use crate::x87::{
@@ -454,6 +455,74 @@ fn emit_start_function(num_chunks: u32, hash_mask: u32, dispatch_hash_addr: u32)
             func.instruction(&WInst::GlobalGet(GLOBAL_EXIT_CODE));
             func.instruction(&WInst::Return);
             func.instruction(&WInst::End);
+
+            // Emulate Linux x86-64 legacy vsyscall page (0xffffffffff600000..+0x1000):
+            //   0xffffffffff600000 -> vgettimeofday (SYS_gettimeofday = 96)
+            //   0xffffffffff600400 -> vtime         (SYS_time         = 201)
+            //   0xffffffffff600800 -> vgetcpu       (SYS_getcpu       = 309)
+            // Each entry point executes `mov eax, nr; syscall; ret`.
+            // Runs only on this cold branch (zero overhead on normal 32-bit RIP dispatch).
+            func.instruction(&WInst::I32Const(0));
+            func.instruction(&WInst::LocalSet(0));
+            for &(vsyscall_va, syscall_nr) in &[
+                (0xffff_ffff_ff60_0000u64, 96i32),  // vgettimeofday
+                (0xffff_ffff_ff60_0400u64, 201i32), // vtime
+                (0xffff_ffff_ff60_0800u64, 309i32), // vgetcpu
+            ] {
+                func.instruction(&WInst::LocalGet(4));
+                func.instruction(&WInst::I64Const(vsyscall_va as i64));
+                func.instruction(&WInst::I64Eq);
+                func.instruction(&WInst::If(BlockType::Empty));
+                func.instruction(&WInst::I32Const(syscall_nr));
+                func.instruction(&WInst::LocalSet(0));
+                func.instruction(&WInst::End);
+            }
+
+            func.instruction(&WInst::LocalGet(0));
+            func.instruction(&WInst::If(BlockType::Empty));
+            {
+                // Bounds-check GLOBAL_RSP fits in 32-bit guest linear memory before wrapping.
+                func.instruction(&WInst::GlobalGet(GLOBAL_RSP));
+                func.instruction(&WInst::LocalTee(4));
+                func.instruction(&WInst::I64Const(32));
+                func.instruction(&WInst::I64ShrU);
+                func.instruction(&WInst::I64Const(0));
+                func.instruction(&WInst::I64Ne);
+                func.instruction(&WInst::If(BlockType::Empty));
+                func.instruction(&WInst::Unreachable);
+                func.instruction(&WInst::End);
+
+                // Pop return address from [GLOBAL_RSP] and advance GLOBAL_RSP += 8.
+                func.instruction(&WInst::LocalGet(4));
+                func.instruction(&WInst::I32WrapI64);
+                func.instruction(&WInst::I64Load(MemArg {
+                    offset: 0,
+                    align: 0,
+                    memory_index: 0,
+                }));
+                func.instruction(&WInst::LocalSet(4));
+
+                func.instruction(&WInst::GlobalGet(GLOBAL_RSP));
+                func.instruction(&WInst::I64Const(8));
+                func.instruction(&WInst::I64Add);
+                func.instruction(&WInst::GlobalSet(GLOBAL_RSP));
+
+                // CPS syscall ABI: rip = rcx = ret_addr, rax = syscall_nr,
+                // yield_flag = YIELD_SYSCALL_PENDING, return exit_code.
+                func.instruction(&WInst::LocalGet(4));
+                func.instruction(&WInst::GlobalSet(GLOBAL_RIP));
+                func.instruction(&WInst::LocalGet(4));
+                func.instruction(&WInst::GlobalSet(GLOBAL_RCX));
+                func.instruction(&WInst::LocalGet(0));
+                func.instruction(&WInst::I64ExtendI32U);
+                func.instruction(&WInst::GlobalSet(GLOBAL_RAX));
+                func.instruction(&WInst::I32Const(YIELD_SYSCALL_PENDING));
+                func.instruction(&WInst::GlobalSet(GLOBAL_YIELD_FLAG));
+                func.instruction(&WInst::GlobalGet(GLOBAL_EXIT_CODE));
+                func.instruction(&WInst::Return);
+            }
+            func.instruction(&WInst::End);
+
             func.instruction(&WInst::Unreachable);
         }
         func.instruction(&WInst::End);
@@ -3029,5 +3098,178 @@ mod tests {
             assert_eq!(rdx, x / 251, "quotient mismatch for x={x:#x}");
             assert_eq!(rsi, x % 251, "remainder mismatch for x={x:#x}");
         }
+    }
+
+    #[test]
+    fn test_exec_vsyscall_emulation_all_three_entries() {
+        let cases: &[(u64, i64)] = &[
+            (0xffff_ffff_ff60_0000, 96),  // vgettimeofday -> SYS_gettimeofday
+            (0xffff_ffff_ff60_0400, 201), // vtime         -> SYS_time
+            (0xffff_ffff_ff60_0800, 309), // vgetcpu       -> SYS_getcpu
+        ];
+
+        for &(vsyscall_va, expected_nr) in cases {
+            // mov rdi, 0x1111; mov rsi, 0x2222; mov rdx, 0x3333;
+            // movabs rax, vsyscall_va; call rax;
+            // add rax, 0x10; ret
+            let mut code = Vec::new();
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x11, 0x11, 0x00, 0x00]); // mov rdi, 0x1111 (7B)
+            code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x22, 0x22, 0x00, 0x00]); // mov rsi, 0x2222 (7B)
+            code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x33, 0x33, 0x00, 0x00]); // mov rdx, 0x3333 (7B)
+            code.extend_from_slice(&[0x48, 0xB8]); // movabs rax, vsyscall_va (10B)
+            code.extend_from_slice(&vsyscall_va.to_le_bytes());
+            code.extend_from_slice(&[0xFF, 0xD0]); // call rax (2B)
+            let ret_offset = code.len() as u64;
+            code.extend_from_slice(&[0x48, 0x83, 0xC0, 0x10]); // add rax, 0x10
+            code.push(0xC3); // ret
+
+            let image = make_synthetic_image(code);
+            let ret_va = image.entry_rip as u64 + ret_offset;
+            let prog = discover_code(&image).unwrap();
+            let wasm = emit_wasm(&image, &prog).unwrap();
+            let engine = Engine::default();
+            let module = WasmModule::new(&engine, &wasm).unwrap();
+            let mut store = Store::new(&engine, ());
+            let inst = Instance::new(&mut store, &module, &[]).unwrap();
+
+            inst.get_global(&mut store, "rsp")
+                .unwrap()
+                .set(&mut store, wasmtime::Val::I64(STACK_TOP as i64))
+                .unwrap();
+            let start = inst
+                .get_typed_func::<(), i32>(&mut store, "_start")
+                .unwrap();
+
+            // First invocation yields for the emulated syscall.
+            let _ = start.call(&mut store, ()).unwrap();
+
+            let yield_flag = inst
+                .get_global(&mut store, "yield_flag")
+                .unwrap()
+                .get(&mut store)
+                .unwrap_i32();
+            let rax = inst
+                .get_global(&mut store, "rax")
+                .unwrap()
+                .get(&mut store)
+                .unwrap_i64();
+            let rip = inst
+                .get_global(&mut store, "rip")
+                .unwrap()
+                .get(&mut store)
+                .unwrap_i64() as u64;
+            let rcx = inst
+                .get_global(&mut store, "rcx")
+                .unwrap()
+                .get(&mut store)
+                .unwrap_i64() as u64;
+            let rsp = inst
+                .get_global(&mut store, "rsp")
+                .unwrap()
+                .get(&mut store)
+                .unwrap_i64() as u64;
+            let rdi = inst
+                .get_global(&mut store, "rdi")
+                .unwrap()
+                .get(&mut store)
+                .unwrap_i64() as u64;
+            let rsi = inst
+                .get_global(&mut store, "rsi")
+                .unwrap()
+                .get(&mut store)
+                .unwrap_i64() as u64;
+            let rdx = inst
+                .get_global(&mut store, "rdx")
+                .unwrap()
+                .get(&mut store)
+                .unwrap_i64() as u64;
+
+            assert_eq!(yield_flag, YIELD_SYSCALL_PENDING, "vsyscall {vsyscall_va:#x} must yield syscall");
+            assert_eq!(rax, expected_nr, "vsyscall {vsyscall_va:#x} syscall nr mismatch");
+            assert_eq!(rip, ret_va, "vsyscall {vsyscall_va:#x} must pop return address into rip");
+            assert_eq!(rcx, ret_va, "vsyscall {vsyscall_va:#x} must set rcx to return address");
+            assert_eq!(rsp, STACK_TOP as u64, "vsyscall {vsyscall_va:#x} must restore rsp");
+            assert_eq!((rdi, rsi, rdx), (0x1111, 0x2222, 0x3333), "vsyscall args must be preserved");
+
+            // Host handles syscall, writes return value to rax, clears yield_flag, and resumes.
+            inst.get_global(&mut store, "rax")
+                .unwrap()
+                .set(&mut store, wasmtime::Val::I64(42))
+                .unwrap();
+            inst.get_global(&mut store, "yield_flag")
+                .unwrap()
+                .set(&mut store, wasmtime::Val::I32(0))
+                .unwrap();
+
+            let _ = start.call(&mut store, ()).unwrap();
+            let final_rax = inst
+                .get_global(&mut store, "rax")
+                .unwrap()
+                .get(&mut store)
+                .unwrap_i64();
+            assert_eq!(final_rax, 58, "resumed execution after vsyscall {vsyscall_va:#x} should run add rax, 0x10");
+        }
+    }
+
+    #[test]
+    fn test_exec_non_vsyscall_high_addresses_still_trap() {
+        for &bad_va in &[
+            0xffff_ffff_ff60_0100u64, // middle of vsyscall page (not a valid entry)
+            0xffff_ffff_ff60_0001u64, // off-by-one from vgettimeofday
+            0x0000_0001_0000_0000u64, // first non-32-bit address
+        ] {
+            let mut code = Vec::new();
+            code.extend_from_slice(&[0x48, 0xB8]); // movabs rax, bad_va
+            code.extend_from_slice(&bad_va.to_le_bytes());
+            code.extend_from_slice(&[0xFF, 0xD0]); // call rax
+            code.push(0xC3); // ret
+
+            let image = make_synthetic_image(code);
+            let prog = discover_code(&image).unwrap();
+            let wasm = emit_wasm(&image, &prog).unwrap();
+            let engine = Engine::default();
+            let module = WasmModule::new(&engine, &wasm).unwrap();
+            let mut store = Store::new(&engine, ());
+            let inst = Instance::new(&mut store, &module, &[]).unwrap();
+            inst.get_global(&mut store, "rsp")
+                .unwrap()
+                .set(&mut store, wasmtime::Val::I64(STACK_TOP as i64))
+                .unwrap();
+            let start = inst
+                .get_typed_func::<(), i32>(&mut store, "_start")
+                .unwrap();
+            let err = start.call(&mut store, ()).expect_err("non-vsyscall high address must trap");
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("unreachable"),
+                "expected unreachable trap for {bad_va:#x}, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_exec_vsyscall_with_invalid_high_rsp_traps() {
+        let code = vec![0xC3]; // dummy block so num_chunks > 0
+        let image = make_synthetic_image(code);
+        let prog = discover_code(&image).unwrap();
+        let wasm = emit_wasm(&image, &prog).unwrap();
+        let engine = Engine::default();
+        let module = WasmModule::new(&engine, &wasm).unwrap();
+        let mut store = Store::new(&engine, ());
+        let inst = Instance::new(&mut store, &module, &[]).unwrap();
+        // Set rip to vgettimeofday with an out-of-range 64-bit rsp
+        inst.get_global(&mut store, "rip")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I64(0xffff_ffff_ff60_0000u64 as i64))
+            .unwrap();
+        inst.get_global(&mut store, "rsp")
+            .unwrap()
+            .set(&mut store, wasmtime::Val::I64(0x0000_0001_0000_1000u64 as i64))
+            .unwrap();
+        let start = inst
+            .get_typed_func::<(), i32>(&mut store, "_start")
+            .unwrap();
+        let err = start.call(&mut store, ()).expect_err("vsyscall with 64-bit rsp must trap");
+        assert!(format!("{err:?}").contains("unreachable"));
     }
 }
