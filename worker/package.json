@@ -1,0 +1,17 @@
+{
+  "name": "elf2wasm-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Workers deployment for elf2wasm (OCI registry proxy + static web/WASM frontend)",
+  "scripts": {
+    "build:assets": "node scripts/build_assets.mjs",
+    "test": "node --test test/worker.test.mjs",
+    "dev": "npm run build:assets && wrangler dev",
+    "deploy": "npm run build:assets && wrangler deploy",
+    "deploy:dry-run": "wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

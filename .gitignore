@@ -3,3 +3,8 @@
 .agents/
 __pycache__/
 *.pyc
+node_modules/
+.wrangler/
+.dev.vars
+worker/dist/
+
