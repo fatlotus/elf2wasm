@@ -69,6 +69,67 @@
         <button type="button" class="preset-chip" data-image="node:22-slim">node:22-slim</button>
       </div>
 
+      <div class="repo-grid" role="group" aria-label="Git repository overlay">
+        <div class="field">
+          <label for="repo-input">Git Repo Overlay (optional)</label>
+          <input
+            id="repo-input"
+            name="repo"
+            type="text"
+            placeholder="owner/repo or https://github.com/owner/repo"
+            autocomplete="off"
+            spellcheck="false"
+          >
+        </div>
+
+        <div class="field">
+          <label for="repo-ref-input">Branch / Tag / Commit</label>
+          <input
+            id="repo-ref-input"
+            name="repoRef"
+            type="text"
+            placeholder="HEAD (default)"
+            autocomplete="off"
+            spellcheck="false"
+          >
+        </div>
+
+        <div class="field">
+          <label for="repo-mount-input">Mount Path</label>
+          <input
+            id="repo-mount-input"
+            name="repoMount"
+            type="text"
+            value="/workspace"
+            placeholder="/workspace"
+            autocomplete="off"
+            spellcheck="false"
+          >
+        </div>
+      </div>
+
+      <div class="project-presets-row" role="group" aria-label="Project test suite presets">
+        <span class="presets-label">Project Tests:</span>
+        <button
+          type="button"
+          class="project-preset-chip"
+          data-preset="python-bottle"
+          data-language="python"
+        ><span class="lang-badge lang-python" aria-hidden="true">Py</span> Python: Bottle (359 tests)</button>
+        <button
+          type="button"
+          class="project-preset-chip"
+          data-preset="js-nanoid"
+          data-language="javascript"
+        ><span class="lang-badge lang-js" aria-hidden="true">JS</span> JavaScript: Nano ID (13 tests)</button>
+        <button
+          type="button"
+          class="project-preset-chip"
+          data-preset="rust-nushell"
+          data-language="rust"
+        ><span class="lang-badge lang-rust" aria-hidden="true">Rs</span> Rust: Nushell stdlib (35 tests)</button>
+      </div>
+
       <details class="panel-drawer" id="advanced-options">
         <summary>Advanced Options (Environment &amp; Working Directory)</summary>
         <div class="advanced-grid">
@@ -110,7 +171,7 @@
         </div>
         <div class="stage-steps" aria-hidden="true">
           <span class="stage-step" data-step="pull">1. Pull Image</span>
-          <span class="stage-step" data-step="unpack">2. Unpack Rootfs</span>
+          <span class="stage-step" data-step="unpack">2. Unpack &amp; Overlay</span>
           <span class="stage-step" data-step="compile">3. Compile ELF &rarr; WASM</span>
           <span class="stage-step" data-step="run">4. Run in Browser</span>
         </div>

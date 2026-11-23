@@ -30,9 +30,69 @@ function resolveRegistryProxyBase() {
   return "/api/v2";
 }
 
+function resolveGitProxyBase() {
+  if (
+    typeof window !== "undefined" &&
+    typeof window.ELF2WASM_GIT_PROXY_BASE === "string" &&
+    window.ELF2WASM_GIT_PROXY_BASE.trim().length > 0
+  ) {
+    return window.ELF2WASM_GIT_PROXY_BASE.trim();
+  }
+  if (typeof document !== "undefined") {
+    const meta = document.querySelector('meta[name="elf2wasm-git-proxy-base"]');
+    const content = meta?.getAttribute("content")?.trim();
+    if (content) {
+      return content;
+    }
+  }
+  return "/api/git/archive";
+}
+
+const PROJECT_PRESETS = Object.freeze({
+  "python-bottle": Object.freeze({
+    id: "python-bottle",
+    label: "Python: Bottle (359 tests)",
+    language: "Python",
+    image: "python:3.12-slim",
+    repo: "bottlepy/bottle",
+    ref: "0.13.4",
+    mountPath: "/workspace",
+    cmd: "python3 -m unittest discover -s test -t .",
+    cwd: "/workspace",
+    env: Object.freeze(["PYTHONUNBUFFERED=1"]),
+  }),
+  "js-nanoid": Object.freeze({
+    id: "js-nanoid",
+    label: "JavaScript: Nano ID (13 tests)",
+    language: "JavaScript",
+    image: "node:22-slim",
+    repo: "ai/nanoid",
+    ref: "6.0.2",
+    mountPath: "/workspace",
+    cmd: "node test/non-secure.test.js",
+    cwd: "/workspace",
+    env: Object.freeze([]),
+  }),
+  "rust-nushell": Object.freeze({
+    id: "rust-nushell",
+    label: "Rust: Nushell stdlib (35 tests)",
+    language: "Rust",
+    image: "ghcr.io/nushell/nushell:0.117.0-alpine",
+    repo: "nushell/nushell",
+    ref: "0.117.0",
+    mountPath: "/workspace",
+    cmd: "--no-config-file -c \"source crates/nu-std/tests/test_asserts.nu; source crates/nu-std/tests/test_iter.nu; source crates/nu-std/tests/test_formats.nu; assert_basic; assert_not; assert_equal; assert_not_equal; assert_error; assert_length; assert_less; assert_less_or_equal; assert_greater; assert_greater_or_equal; iter_find; iter_intersperse; iter_scan; iter_filter_map; iter_find_index; iter_zip_with; iter_flat_map; iter_zip_into_record; from_ndjson_multiple_objects; from_ndjson_single_object; from_ndjson_invalid_object; from_jsonl_multiple_objects; from_jsonl_single_object; from_jsonl_invalid_object; to_ndjson_multiple_objects; to_ndjson_single_object; to_jsonl_multiple_objects; to_jsonl_single_object; from_ndnuon_multiple_objects; from_ndnuon_single_object; from_ndnuon_invalid_object; to_ndnuon_multiple_objects; to_ndnuon_single_object; to_ndnuon_multiline_strings; from_ndnuon_multiline_strings; print 'OK: 35 nu-std tests passed'\"",
+    cwd: "/workspace",
+    env: Object.freeze(["HOME=/tmp"]),
+  }),
+});
+
 // Primary DOM elements
 const imageInput = document.getElementById("image-input");
 const cmdInput = document.getElementById("cmd-input");
+const repoInput = document.getElementById("repo-input");
+const repoRefInput = document.getElementById("repo-ref-input");
+const repoMountInput = document.getElementById("repo-mount-input");
 const envInput = document.getElementById("env-input");
 const cwdInput = document.getElementById("cwd-input");
 const startBtn = document.getElementById("start-btn");
@@ -46,6 +106,7 @@ const terminalEl = document.getElementById("terminal");
 const terminalTitleEl = document.getElementById("terminal-title");
 const terminalSizeEl = document.getElementById("terminal-size");
 const presetChips = Array.from(document.querySelectorAll(".preset-chip"));
+const projectPresetChips = Array.from(document.querySelectorAll(".project-preset-chip"));
 const stageStepEls = {
   pull: document.querySelector('.stage-step[data-step="pull"]'),
   unpack: document.querySelector('.stage-step[data-step="unpack"]'),
@@ -138,6 +199,7 @@ async function getDocker() {
     compilerWasmUrl: COMPILER_WASM_URL,
     runtimeWasmUrl: RUNTIME_WASM_URL,
     registryProxyBase: resolveRegistryProxyBase(),
+    gitProxyBase: resolveGitProxyBase(),
     useWorker: typeof Worker !== "undefined",
   })
     .then((docker) => {
@@ -179,7 +241,13 @@ function updateStageSteps(stage) {
   let activeIdx = -1;
   if (stage === "manifest" || stage === "config" || stage === "download" || stage === "decompress") {
     activeIdx = 0;
-  } else if (stage === "ready" || stage === "extract") {
+  } else if (
+    stage === "ready" ||
+    stage === "extract" ||
+    stage === "git-download" ||
+    stage === "git-decompress" ||
+    stage === "git-overlay"
+  ) {
     activeIdx = 1;
   } else if (stage === "compile") {
     activeIdx = 2;
@@ -256,6 +324,26 @@ function handleProgressEvent(ev) {
       setStatus(`Unpacking rootfs layer ${layerIdx + 1}/${layerCount} in browser...`, "busy");
       break;
     }
+    case "git-download": {
+      const frac = total > 0 ? Math.min(1, loaded / total) : loaded > 0 ? 0.5 : 0;
+      const pct = 82 + frac * 4; // 82% -> 86%
+      const sizeNote =
+        total > 0 ? ` (${formatBytes(loaded)} / ${formatBytes(total)})` : loaded > 0 ? ` (${formatBytes(loaded)})` : "";
+      const baseMsg = (ev.message || "Downloading git repository").replace(/\.+$/, "");
+      setProgress(pct, "git-download");
+      setStatus(`${baseMsg}${sizeNote}...`, "busy");
+      break;
+    }
+    case "git-decompress":
+      setProgress(87, "git-decompress");
+      setStatus(ev.message || "Decompressing git repository in browser...", "busy");
+      break;
+    case "git-overlay": {
+      const pct = total > 0 && loaded >= total ? 89 : 88;
+      setProgress(pct, "git-overlay");
+      setStatus(ev.message || "Overlaying git repository onto container VFS...", "busy");
+      break;
+    }
     case "compile":
       setProgress(90, "compile");
       setStatus("Compiling ELF → WASM in browser...", "busy");
@@ -295,8 +383,13 @@ function splitShellArgs(str) {
       if (ch === '"') {
         inDouble = false;
       } else if (ch === "\\" && i + 1 < str.length) {
-        i++;
-        current += str[i];
+        const next = str[i + 1];
+        if (next === '"' || next === "\\" || next === "$" || next === "`") {
+          i++;
+          current += next;
+        } else {
+          current += ch;
+        }
       } else {
         current += ch;
       }
@@ -371,8 +464,40 @@ async function stopActiveSession({ updateUi = true } = {}) {
   }
 }
 
-async function bootImage({ imageRef, tarball = null, cmdStr = null, envList = null, cwd = null }) {
+async function bootImage({ imageRef, tarball = null, cmdStr = null, envList = null, cwd = null, gitRepo = undefined }) {
   const seq = ++sessionSeq;
+
+  // Snapshot all form controls synchronously before any await so clicking a preset
+  // or editing fields mid-pull cannot corrupt this in-flight boot.
+  const rawCmd = cmdStr !== null ? cmdStr : cmdInput.value.trim();
+  const cmdTokens = rawCmd ? splitShellArgs(rawCmd) : [];
+  const envEntries = envList !== null ? envList : parseEnvLines(envInput.value);
+  const workdir = cwd !== null ? cwd : cwdInput.value.trim();
+
+  let resolvedGitRepo;
+  if (gitRepo === null) {
+    resolvedGitRepo = undefined;
+  } else if (gitRepo && typeof gitRepo === "object") {
+    const repoVal = String(gitRepo.repo || "").trim();
+    if (repoVal) {
+      resolvedGitRepo = {
+        repo: repoVal,
+        ref: String(gitRepo.ref || "").trim() || "HEAD",
+        mountPath: String(gitRepo.mountPath || "").trim() || "/workspace",
+      };
+    }
+  } else {
+    const rawRepo = repoInput ? repoInput.value.trim() : "";
+    const rawRef = repoRefInput ? repoRefInput.value.trim() : "";
+    const rawMount = repoMountInput ? repoMountInput.value.trim() : "";
+    if (rawRepo) {
+      resolvedGitRepo = {
+        repo: rawRepo,
+        ref: rawRef || "HEAD",
+        mountPath: rawMount || "/workspace",
+      };
+    }
+  }
 
   // Cancel any in-flight pull and cleanly stop any previous container
   await stopActiveSession({ updateUi: false });
@@ -429,27 +554,30 @@ async function bootImage({ imageRef, tarball = null, cmdStr = null, envList = nu
     try {
       if (seq !== sessionSeq) return;
 
-      const rawCmd = cmdStr !== null ? cmdStr : cmdInput.value.trim();
-      const cmdTokens = rawCmd ? splitShellArgs(rawCmd) : [];
-      const envEntries = envList !== null ? envList : parseEnvLines(envInput.value);
-      const workdir = cwd !== null ? cwd : cwdInput.value.trim();
       const { cols, rows } = terminal.getSize();
 
       const displayCmd =
         cmdTokens.length > 0
           ? cmdTokens.join(" ")
-          : (image.config?.cmd && image.config.cmd.join(" ")) || "/bin/sh";
+          : (image.config?.cmd && image.config.cmd.join(" ")) ||
+            (image.config?.entrypoint && image.config.entrypoint.join(" ")) ||
+            "/bin/sh";
       if (terminalTitleEl) {
-        terminalTitleEl.textContent = `${resolvedDisplayName} — ${displayCmd}`;
+        const repoSuffix = resolvedGitRepo
+          ? ` + ${resolvedGitRepo.repo}@${resolvedGitRepo.ref}`
+          : "";
+        terminalTitleEl.textContent = `${resolvedDisplayName}${repoSuffix} — ${displayCmd}`;
       }
 
       container = await image.createContainer({
         cmd: cmdTokens.length > 0 ? cmdTokens : undefined,
         env: envEntries.length > 0 ? envEntries : undefined,
         cwd: workdir || undefined,
+        gitRepo: resolvedGitRepo,
         tty: true,
         cols,
         rows,
+        signal: abortController.signal,
         onProgress: (ev) => {
           if (seq === sessionSeq) handleProgressEvent(ev);
         },
@@ -560,13 +688,52 @@ cmdInput.addEventListener("keydown", (e) => {
   }
 });
 
+for (const inputEl of [repoInput, repoRefInput, repoMountInput]) {
+  inputEl?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void startFromControls();
+    }
+  });
+}
+
+function clearActiveProjectPreset() {
+  for (const c of projectPresetChips) {
+    c.dataset.active = "false";
+  }
+}
+
 for (const chip of presetChips) {
   chip.addEventListener("click", () => {
     const img = chip.dataset.image;
     if (img) {
+      clearActiveProjectPreset();
       imageInput.value = img;
+      if (repoInput) repoInput.value = "";
+      if (repoRefInput) repoRefInput.value = "";
+      if (repoMountInput) repoMountInput.value = "/workspace";
+      cmdInput.value = "";
+      cwdInput.value = "";
+      envInput.value = "";
       imageInput.focus();
     }
+  });
+}
+
+for (const chip of projectPresetChips) {
+  chip.addEventListener("click", () => {
+    const preset = PROJECT_PRESETS[chip.dataset.preset];
+    if (!preset) return;
+    clearActiveProjectPreset();
+    chip.dataset.active = "true";
+    imageInput.value = preset.image;
+    if (repoInput) repoInput.value = preset.repo;
+    if (repoRefInput) repoRefInput.value = preset.ref;
+    if (repoMountInput) repoMountInput.value = preset.mountPath || "/workspace";
+    cmdInput.value = preset.cmd;
+    cwdInput.value = preset.cwd || preset.mountPath || "/workspace";
+    envInput.value = Array.isArray(preset.env) ? preset.env.join("\n") : "";
+    startBtn.focus();
   });
 }
 
@@ -741,6 +908,7 @@ manualRunBtn?.addEventListener("click", async () => {
       imageRef: stagedTarball.name,
       tarball: stagedTarball,
       cmdStr: manualCmdInput?.value.trim() || "",
+      gitRepo: null,
     });
     return;
   }

@@ -176,6 +176,13 @@ body {
   align-items: end;
 }
 
+.repo-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.5fr) minmax(140px, 0.9fr) minmax(140px, 0.8fr);
+  gap: 10px;
+  align-items: end;
+}
+
 .field {
   display: flex;
   flex-direction: column;
@@ -305,6 +312,73 @@ textarea {
   border-color: var(--accent);
   color: var(--accent);
   background: rgba(56, 189, 248, 0.08);
+}
+
+.project-presets-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.project-preset-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-elevated);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease;
+}
+
+.project-preset-chip:hover {
+  border-color: var(--ok);
+  color: var(--ok);
+  background: rgba(52, 211, 153, 0.1);
+}
+
+.project-preset-chip[data-active="true"] {
+  border-color: var(--ok);
+  color: var(--ok);
+  background: rgba(52, 211, 153, 0.12);
+}
+
+.preset-chip:focus-visible,
+.project-preset-chip:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.lang-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1px 5px;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.lang-python {
+  background: rgba(56, 189, 248, 0.16);
+  color: #7dd3fc;
+}
+
+.lang-js {
+  background: rgba(251, 191, 36, 0.16);
+  color: #fde68a;
+}
+
+.lang-rust {
+  background: rgba(248, 113, 113, 0.16);
+  color: #fca5a5;
 }
 
 /* Advanced options & manual upload details */
@@ -583,6 +657,9 @@ input[type="file"] {
 
 @media (max-width: 860px) {
   .control-grid {
+    grid-template-columns: 1fr;
+  }
+  .repo-grid {
     grid-template-columns: 1fr;
   }
   .advanced-grid {
