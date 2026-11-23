@@ -145,6 +145,7 @@ const SYS_EPOLL_CREATE1: i64 = 291;
 const SYS_DUP3: i64 = 292;
 const SYS_PIPE2: i64 = 293;
 const SYS_PRLIMIT64: i64 = 302;
+const SYS_GETCPU: i64 = 309;
 const SYS_RENAMEAT2: i64 = 316;
 const SYS_GETRANDOM: i64 = 318;
 const SYS_EXECVEAT: i64 = 322;
@@ -4253,6 +4254,7 @@ fn handle_syscall_inner(
         }
         SYS_GETTIMEOFDAY => {
             let tv = a0 as u64;
+            let tz = a1 as u64;
             if tv != 0 {
                 let ns = state.scheduler.realtime_ns();
                 let sec = (ns / 1_000_000_000) as i64;
@@ -4261,6 +4263,11 @@ fn handle_syscall_inner(
                 buf[0..8].copy_from_slice(&sec.to_le_bytes());
                 buf[8..16].copy_from_slice(&usec.to_le_bytes());
                 if let Err(e) = write_bytes(ctx, tv, &buf) {
+                    return e;
+                }
+            }
+            if tz != 0 {
+                if let Err(e) = write_bytes(ctx, tz, &[0u8; 8]) {
                     return e;
                 }
             }
@@ -4275,6 +4282,22 @@ fn handle_syscall_inner(
                 }
             }
             sec
+        }
+        SYS_GETCPU => {
+            let cpu_ptr = a0 as u64;
+            let node_ptr = a1 as u64;
+            // a2 (struct getcpu_cache *tcache) is deprecated/unused on Linux since 2.6.24.
+            if cpu_ptr != 0 {
+                if let Err(e) = write_bytes(ctx, cpu_ptr, &0u32.to_le_bytes()) {
+                    return e;
+                }
+            }
+            if node_ptr != 0 {
+                if let Err(e) = write_bytes(ctx, node_ptr, &0u32.to_le_bytes()) {
+                    return e;
+                }
+            }
+            0
         }
         SYS_RT_SIGACTION => {
             let signum = a0 as i32;
@@ -6220,6 +6243,128 @@ mod tests {
         let (ev_hup, data_hup) = read_ev(&ctx, ev_out_addr);
         assert_eq!(data_hup, 1);
         assert_ne!(ev_hup & (POLLHUP as u32), 0);
+    }
+
+    #[test]
+    fn test_sys_getcpu_all_pointer_combinations_and_efault() {
+        let mut ctx = MockGuestContext::new(64 * 1024, 64 * 1024);
+        let mut state = make_state();
+
+        let cpu_addr = 0x1000u64;
+        let node_addr = 0x1010u64;
+        let sentinel = 0xDEAD_BEEFu32.to_le_bytes();
+
+        // 1. Both non-null: writes 0u32 to both cpu and node, ignores tcache
+        ctx.mem_write(cpu_addr, &sentinel).unwrap();
+        ctx.mem_write(node_addr, &sentinel).unwrap();
+        assert_eq!(
+            handle_syscall(
+                &mut ctx,
+                &mut state,
+                SYS_GETCPU,
+                cpu_addr as i64,
+                node_addr as i64,
+                0x9999,
+                0,
+                0,
+                0
+            ),
+            0
+        );
+        let mut out = [0u8; 4];
+        ctx.mem_read(cpu_addr, &mut out).unwrap();
+        assert_eq!(u32::from_le_bytes(out), 0);
+        ctx.mem_read(node_addr, &mut out).unwrap();
+        assert_eq!(u32::from_le_bytes(out), 0);
+
+        // 2. Null cpu, non-null node
+        ctx.mem_write(node_addr, &sentinel).unwrap();
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_GETCPU, 0, node_addr as i64, 0, 0, 0, 0),
+            0
+        );
+        ctx.mem_read(node_addr, &mut out).unwrap();
+        assert_eq!(u32::from_le_bytes(out), 0);
+
+        // 3. Non-null cpu, null node
+        ctx.mem_write(cpu_addr, &sentinel).unwrap();
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_GETCPU, cpu_addr as i64, 0, 0, 0, 0, 0),
+            0
+        );
+        ctx.mem_read(cpu_addr, &mut out).unwrap();
+        assert_eq!(u32::from_le_bytes(out), 0);
+
+        // 4. Both null
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_GETCPU, 0, 0, 0, 0, 0, 0),
+            0
+        );
+
+        // 5. Out-of-bounds cpu pointer -> -EFAULT
+        let oob = 0x20000i64;
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_GETCPU, oob, node_addr as i64, 0, 0, 0, 0),
+            -EFAULT
+        );
+
+        // 6. Out-of-bounds node pointer -> -EFAULT
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_GETCPU, cpu_addr as i64, oob, 0, 0, 0, 0),
+            -EFAULT
+        );
+    }
+
+    #[test]
+    fn test_sys_gettimeofday_and_time_null_and_non_null_pointers() {
+        let mut ctx = MockGuestContext::new(64 * 1024, 64 * 1024);
+        let mut state = make_state();
+
+        let tv_addr = 0x2000u64;
+        let tz_addr = 0x2020u64;
+        let tloc_addr = 0x2040u64;
+        let oob = 0x20000i64;
+
+        // gettimeofday(tv, NULL) succeeds and writes valid sec/usec
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_GETTIMEOFDAY, tv_addr as i64, 0, 0, 0, 0, 0),
+            0
+        );
+        let mut tv_buf = [0u8; 16];
+        ctx.mem_read(tv_addr, &mut tv_buf).unwrap();
+        let sec = i64::from_le_bytes(tv_buf[0..8].try_into().unwrap());
+        let usec = i64::from_le_bytes(tv_buf[8..16].try_into().unwrap());
+        assert!(sec > 0, "tv_sec should be positive");
+        assert!((0..1_000_000).contains(&usec), "tv_usec out of range");
+
+        // gettimeofday(NULL, tz) zeros struct timezone
+        ctx.mem_write(tz_addr, &[0xFF; 8]).unwrap();
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_GETTIMEOFDAY, 0, tz_addr as i64, 0, 0, 0, 0),
+            0
+        );
+        let mut tz_buf = [0u8; 8];
+        ctx.mem_read(tz_addr, &mut tz_buf).unwrap();
+        assert_eq!(tz_buf, [0u8; 8]);
+
+        // gettimeofday with invalid tz -> -EFAULT
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_GETTIMEOFDAY, tv_addr as i64, oob, 0, 0, 0, 0),
+            -EFAULT
+        );
+
+        // time(NULL) returns sec, time(tloc) writes sec and returns it
+        let t_null = handle_syscall(&mut ctx, &mut state, SYS_TIME, 0, 0, 0, 0, 0, 0);
+        assert_eq!(t_null, sec);
+        let t_ptr = handle_syscall(&mut ctx, &mut state, SYS_TIME, tloc_addr as i64, 0, 0, 0, 0, 0);
+        assert_eq!(t_ptr, sec);
+        let mut t_buf = [0u8; 8];
+        ctx.mem_read(tloc_addr, &mut t_buf).unwrap();
+        assert_eq!(i64::from_le_bytes(t_buf), sec);
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, SYS_TIME, oob, 0, 0, 0, 0, 0),
+            -EFAULT
+        );
     }
 }
 
