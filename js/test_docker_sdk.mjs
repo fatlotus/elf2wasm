@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { createServer } from "../server/server.mjs";
@@ -30,6 +30,7 @@ import {
   loadOciTarball,
 } from "./oci_client.mjs";
 import {
+  ContainerEngine,
   Elf2WasmDocker,
   DockerImage,
   DockerContainer,
@@ -857,6 +858,321 @@ test("OCI client + Docker SDK against local mock registry & server proxy", async
 });
 
 // ============================================================================
+// 4b. M7 Unit & Integration Tests (F19 NeedStdin Race, F20 Python lib-dynload,
+//     F21 Node.js Default --jitless Env Injection)
+// ============================================================================
+test("F19: NeedStdin lost-wakeup race fix (_inputSignaled) prevents hang on synchronous/early stdin", async () => {
+  const compilerWasm = fs.readFileSync(COMPILER_WASM_PATH);
+  const runtimeWasm = fs.readFileSync(RUNTIME_WASM_PATH);
+  const sys = await Elf2WasmSystem.create({ compilerWasm, runtimeWasm });
+
+  // 1. Direct _waitForInput() after pushStdin() must resolve immediately (no lost wakeup)
+  sys.pushStdin("early\n");
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const first = await Promise.race([
+    sys._waitForInput().then(() => "woke"),
+    sleep(500).then(() => "hung"),
+  ]);
+  assert.equal(first, "woke", "_waitForInput must consume pending _inputSignaled immediately");
+
+  // 2. Subsequent _waitForInput() without new signal must park until signaled
+  let secondWoke = false;
+  const secondPromise = sys._waitForInput().then(() => {
+    secondWoke = true;
+    return "woke";
+  });
+  await sleep(30);
+  assert.equal(secondWoke, false, "Second _waitForInput must remain parked until new input");
+  sys.pushStdin("later\n");
+  assert.equal(await secondPromise, "woke");
+
+  // 3. Interactive ELF race: write prompt on stdout, then read stdin; pushStdin/closeStdin
+  //    triggered synchronously from onStdout (inside flushStdio before _waitForInput) must not hang.
+  const promptEchoElf = buildStaticTestElf(`
+    static long sys3(long n, long a, long b, long c) {
+      long r;
+      __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c) : "rcx", "r11", "memory");
+      return r;
+    }
+    void _start(void) {
+      const char prompt[] = "PROMPT>";
+      sys3(1, 1, (long)prompt, 7);
+      char buf[64];
+      for (;;) {
+        long n = sys3(0, 0, (long)buf, sizeof(buf));
+        if (n <= 0) break;
+        sys3(1, 1, (long)buf, n);
+      }
+      sys3(60, 0, 0, 0);
+    }
+  `);
+
+  const sys2 = await Elf2WasmSystem.create({ compilerWasm, runtimeWasm });
+  let pushed = false;
+  let accOut = "";
+  const runRes = await Promise.race([
+    sys2.runElf(promptEchoElf, [], ["/bin/prompt_echo"], {
+      tty: false,
+      keepStdinOpen: true,
+      onStdout: (chunk) => {
+        accOut += textDecoder.decode(chunk);
+        if (!pushed && accOut.includes("PROMPT>")) {
+          pushed = true;
+          // Synchronous pushStdin + closeStdin inside flushStdio() right before _waitForInput()
+          sys2.pushStdin("RACE_FREE_OK\n");
+          sys2.closeStdin();
+        }
+      },
+    }),
+    sleep(5000).then(() => {
+      sys2.stop();
+      throw new Error("Timed out waiting for promptEchoElf (lost NeedStdin wakeup)");
+    }),
+  ]);
+  assert.equal(runRes.exitCode, 0);
+  assert.equal(textDecoder.decode(runRes.stdout), "PROMPT>RACE_FREE_OK\n");
+});
+
+test("F20: _resolveElfSos auto-bundles core Python lib-dynload/*.so extensions deterministically", async () => {
+  const runtimeWasm = fs.readFileSync(RUNTIME_WASM_PATH);
+  const sys = await Elf2WasmSystem.create({ runtimeWasm });
+
+  // Build minimal valid ELF64 bytes for testing _resolveElfSos discovery & filtering
+  const dummyElf = buildStaticTestElf(`
+    void _start(void) {
+      __asm__ volatile("syscall" :: "a"(60), "D"(0) : "rcx", "r11");
+    }
+  `);
+
+  sys.writeVfsFile("/usr/local/bin/python3.12", dummyElf, 0o755);
+  sys.writeVfsSymlink("/usr/local/bin/python3", "python3.12");
+  sys.writeVfsFile(
+    "/usr/local/lib/python3.12/lib-dynload/math.cpython-312-x86_64-linux-gnu.so",
+    dummyElf,
+    0o755
+  );
+  sys.writeVfsFile(
+    "/usr/local/lib/python3.12/lib-dynload/_sha2.cpython-312-x86_64-linux-gnu.so",
+    dummyElf,
+    0o755
+  );
+  sys.writeVfsFile(
+    "/usr/local/lib/python3.12/lib-dynload/_json.cpython-312-x86_64-linux-gnu.so",
+    dummyElf,
+    0o755
+  );
+  sys.writeVfsFile(
+    "/usr/local/lib/python3.12/lib-dynload/_testcapi.cpython-312-x86_64-linux-gnu.so",
+    dummyElf,
+    0o755
+  );
+  // Different Python version directory should be ignored when python3.12 matches
+  sys.writeVfsFile(
+    "/usr/lib/python3.11/lib-dynload/math.cpython-311-x86_64-linux-gnu.so",
+    dummyElf,
+    0o755
+  );
+  sys.writeVfsFile("/bin/other", dummyElf, 0o755);
+
+  const pySos = sys._resolveElfSos(dummyElf, [], { elfPath: "/usr/local/bin/python3" });
+  const pyPaths = pySos.map((s) => s.path);
+  assert.deepEqual(pyPaths, [
+    "/usr/local/lib/python3.12/lib-dynload/_json.cpython-312-x86_64-linux-gnu.so",
+    "/usr/local/lib/python3.12/lib-dynload/_sha2.cpython-312-x86_64-linux-gnu.so",
+    "/usr/local/lib/python3.12/lib-dynload/math.cpython-312-x86_64-linux-gnu.so",
+  ]);
+
+  const otherSos = sys._resolveElfSos(dummyElf, [], { elfPath: "/bin/other" });
+  assert.deepEqual(otherSos, [], "Non-Python executable must not auto-bundle lib-dynload/*.so");
+});
+
+test("F21: Node.js default --jitless env injection, user override, and non-Node negative case", async (t) => {
+  const envProbeElf = buildStaticTestElf(`
+    static long sys3(long n, long a, long b, long c) {
+      long r;
+      __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c) : "rcx", "r11", "memory");
+      return r;
+    }
+    static long slen(const char *s) { long n = 0; while (s && s[n]) n++; return n; }
+    static void w_str(const char *s) { sys3(1, 1, (long)s, slen(s)); }
+    static int starts_with(const char *s, const char *p) {
+      while (*p) { if (*s++ != *p++) return 0; }
+      return 1;
+    }
+    static void print_var(char **envp, const char *key_eq) {
+      long klen = slen(key_eq);
+      const char *val = "UNSET";
+      for (int i = 0; envp[i]; i++) {
+        if (starts_with(envp[i], key_eq)) {
+          val = envp[i] + klen;
+          break;
+        }
+      }
+      w_str(key_eq);
+      w_str(val);
+      w_str("\\n");
+    }
+    void entry_c(long *sp) {
+      long argc = sp[0];
+      char **argv = (char **)(sp + 1);
+      char **envp = argv + argc + 1;
+      print_var(envp, "NODE_OPTIONS=");
+      print_var(envp, "MALLOC_ARENA_MAX=");
+      print_var(envp, "UV_USE_IO_URING=");
+      print_var(envp, "UV_THREADPOOL_SIZE=");
+      sys3(60, 0, 0, 0);
+    }
+    __asm__(
+      ".global _start\\n"
+      "_start:\\n"
+      "  mov %rsp, %rdi\\n"
+      "  and $-16, %rsp\\n"
+      "  call entry_c\\n"
+    );
+  `);
+
+  const reg = createMockRegistry({ port: 0, host: "127.0.0.1" });
+  await reg.start();
+  const srv = createServer({ port: 0, host: "127.0.0.1", allowLocalRegistries: true });
+  await srv.start();
+
+  const docker = await Elf2WasmDocker.create({
+    compilerWasmUrl: `${srv.url}/wasm/elf2wasm_compiler_wasm.wasm`,
+    runtimeWasmUrl: `${srv.url}/wasm/elf2wasm_runtime_wasm.wasm`,
+    registryProxyBase: `${srv.url}/api/v2`,
+    useWorker: false,
+  });
+
+  t.after(async () => {
+    await docker.dispose();
+    await srv.stop();
+    await reg.stop();
+  });
+
+  const probeFiles = [
+    { path: "bin/envprobe", type: "file", content: envProbeElf, mode: 0o755 },
+    { path: "usr/local/bin/node", type: "file", content: envProbeElf, mode: 0o755 },
+  ];
+
+  reg.addImage("library/mock-node", "22-slim", {
+    mediaTypeMode: "oci",
+    multiArch: false,
+    config: {
+      entrypoint: ["/bin/envprobe"],
+      cmd: ["node"],
+      env: ["PATH=/usr/local/bin:/usr/bin:/bin", "NODE_VERSION=22.23.5"],
+    },
+    layers: [{ files: probeFiles }],
+  });
+
+  reg.addImage("library/mock-node", "20-slim", {
+    mediaTypeMode: "oci",
+    multiArch: false,
+    config: {
+      entrypoint: ["/bin/envprobe"],
+      cmd: ["node"],
+      env: ["PATH=/usr/local/bin:/usr/bin:/bin", "NODE_VERSION=20.11.0"],
+    },
+    layers: [{ files: probeFiles }],
+  });
+
+  reg.addImage("library/mock-custom-node", "latest", {
+    mediaTypeMode: "oci",
+    multiArch: false,
+    config: {
+      cmd: ["/usr/local/bin/node"],
+      env: ["PATH=/usr/local/bin:/usr/bin:/bin"],
+    },
+    layers: [{ files: probeFiles }],
+  });
+
+  reg.addImage("library/mock-plain", "latest", {
+    mediaTypeMode: "oci",
+    multiArch: false,
+    config: {
+      cmd: ["/bin/envprobe", "node"],
+      env: ["PATH=/bin:/usr/bin"],
+    },
+    layers: [{ files: probeFiles }],
+  });
+
+  const parseVars = (stdout) => {
+    const out = {};
+    for (const line of stdout.trim().split(/\r?\n/)) {
+      const idx = line.indexOf("=");
+      if (idx > 0) out[line.slice(0, idx)] = line.slice(idx + 1);
+    }
+    return out;
+  };
+
+  // 1. Official Node >= 22 image (NODE_VERSION=22.23.5) receives all 4 defaults including --no-experimental-strip-types
+  const defRes = await runDockerImage(`${reg.host}/library/mock-node:22-slim`, { docker });
+  assert.equal(defRes.exitCode, 0);
+  assert.deepEqual(parseVars(defRes.stdout), {
+    NODE_OPTIONS: "--jitless --v8-pool-size=1 --no-experimental-strip-types",
+    MALLOC_ARENA_MAX: "1",
+    UV_USE_IO_URING: "0",
+    UV_THREADPOOL_SIZE: "1",
+  });
+
+  // 2. User-supplied options.env strictly overrides defaults while preserving non-overridden ones
+  const ovRes = await runDockerImage(`${reg.host}/library/mock-node:22-slim`, {
+    docker,
+    env: ["NODE_OPTIONS=--jitless --max-old-space-size=128", "UV_THREADPOOL_SIZE=2"],
+  });
+  assert.equal(ovRes.exitCode, 0);
+  assert.deepEqual(parseVars(ovRes.stdout), {
+    NODE_OPTIONS: "--jitless --max-old-space-size=128",
+    MALLOC_ARENA_MAX: "1",
+    UV_USE_IO_URING: "0",
+    UV_THREADPOOL_SIZE: "2",
+  });
+
+  // 3. Empty string clearing (NODE_OPTIONS=) is honored
+  const clearRes = await runDockerImage(`${reg.host}/library/mock-node:22-slim`, {
+    docker,
+    env: ["NODE_OPTIONS="],
+  });
+  assert.equal(clearRes.exitCode, 0);
+  assert.deepEqual(parseVars(clearRes.stdout), {
+    NODE_OPTIONS: "",
+    MALLOC_ARENA_MAX: "1",
+    UV_USE_IO_URING: "0",
+    UV_THREADPOOL_SIZE: "1",
+  });
+
+  // 4. Custom image without NODE_VERSION= detected via node executable basename (includes --no-experimental-strip-types)
+  const customRes = await runDockerImage(`${reg.host}/library/mock-custom-node:latest`, { docker });
+  assert.equal(customRes.exitCode, 0);
+  assert.deepEqual(parseVars(customRes.stdout), {
+    NODE_OPTIONS: "--jitless --v8-pool-size=1 --no-experimental-strip-types",
+    MALLOC_ARENA_MAX: "1",
+    UV_USE_IO_URING: "0",
+    UV_THREADPOOL_SIZE: "1",
+  });
+
+  // 5. Older Node image (NODE_VERSION=20.11.0 < 22) omits --no-experimental-strip-types
+  const legacyRes = await runDockerImage(`${reg.host}/library/mock-node:20-slim`, { docker });
+  assert.equal(legacyRes.exitCode, 0);
+  assert.deepEqual(parseVars(legacyRes.stdout), {
+    NODE_OPTIONS: "--jitless --v8-pool-size=1",
+    MALLOC_ARENA_MAX: "1",
+    UV_USE_IO_URING: "0",
+    UV_THREADPOOL_SIZE: "1",
+  });
+
+  // 6. Non-Node image running ["/bin/envprobe", "node"] must NOT receive Node defaults
+  const plainRes = await runDockerImage(`${reg.host}/library/mock-plain:latest`, { docker });
+  assert.equal(plainRes.exitCode, 0);
+  assert.deepEqual(parseVars(plainRes.stdout), {
+    NODE_OPTIONS: "UNSET",
+    MALLOC_ARENA_MAX: "UNSET",
+    UV_USE_IO_URING: "UNSET",
+    UV_THREADPOOL_SIZE: "UNSET",
+  });
+});
+
+// ============================================================================
 // 5. Real alpine:latest from Docker Hub via server/server.mjs
 // ============================================================================
 test("Real alpine:latest via server/server.mjs: one-shot, interactive shell, SIGINT, resize, VFS & zero child leak", async (t) => {
@@ -978,3 +1294,263 @@ test("Real alpine:latest via server/server.mjs: one-shot, interactive shell, SIG
     );
   });
 });
+
+// ============================================================================
+// 6. M8 Tier 5 Adversarial Regression Tests
+// ============================================================================
+test("Adversarial: stopContainer() during precompileFromVfs() prevents zombie container boot", async () => {
+  // Static ELF that prints ZOMBIE_BOOTED\n and blocks reading stdin forever
+  const zombieElf = buildStaticTestElf(`
+    static long sys_write(int fd, const void *buf, unsigned long len) {
+      long ret;
+      __asm__ volatile ("syscall" : "=a"(ret) : "a"(1), "D"(fd), "S"(buf), "d"(len) : "rcx", "r11", "memory");
+      return ret;
+    }
+    static long sys_read(int fd, void *buf, unsigned long len) {
+      long ret;
+      __asm__ volatile ("syscall" : "=a"(ret) : "a"(0), "D"(fd), "S"(buf), "d"(len) : "rcx", "r11", "memory");
+      return ret;
+    }
+    static void sys_exit(int code) {
+      __asm__ volatile ("syscall" :: "a"(60), "D"(code));
+      __builtin_unreachable();
+    }
+    void _start(void) {
+      static const char msg[] = "ZOMBIE_BOOTED\\n";
+      char buf[16];
+      sys_write(1, msg, sizeof(msg) - 1);
+      sys_read(0, buf, sizeof(buf));
+      sys_exit(0);
+    }
+  `);
+
+  const tarBytes = buildCustomTar([
+    { path: "bin/", type: "5", mode: 0o755 },
+    { path: "bin/sh", type: "0", mode: 0o755, content: Buffer.from(zombieElf) },
+    { path: "usr/", type: "5", mode: 0o755 },
+    { path: "usr/local/", type: "5", mode: 0o755 },
+    { path: "usr/local/bin/", type: "5", mode: 0o755 },
+    {
+      path: "usr/local/bin/docker-entrypoint.sh",
+      type: "0",
+      mode: 0o755,
+      content: Buffer.from("#!/bin/sh\nexec \"$@\"\n"),
+    },
+    { path: "usr/local/bin/node", type: "0", mode: 0o755, content: Buffer.from(zombieElf) },
+  ]);
+
+  const engine = new ContainerEngine();
+  await engine.init({
+    compilerWasm: fs.readFileSync(COMPILER_WASM_PATH),
+    runtimeWasm: fs.readFileSync(RUNTIME_WASM_PATH),
+  });
+
+  try {
+    const imgMeta = await engine.loadOciTarball(tarBytes, { name: "local/zombie-race:latest" });
+    const stdoutChunks = [];
+    const exitCodes = [];
+    const { containerId } = await engine.createContainer(
+      imgMeta.imageId,
+      {
+        entrypoint: ["/usr/local/bin/docker-entrypoint.sh"],
+        cmd: ["node"],
+        tty: false,
+      },
+      {
+        onStdout: (c) => stdoutChunks.push(textDecoder.decode(c)),
+        onExit: (code) => exitCodes.push(code),
+      }
+    );
+
+    const rec = engine.containers.get(containerId);
+    assert.ok(rec, "Container record should exist before start");
+
+    // Pause precompileFromVfs so we can deterministically call stopContainer() mid-precompile
+    let precompileEntered;
+    const precompileEnteredPromise = new Promise((r) => {
+      precompileEntered = r;
+    });
+    let releasePrecompile;
+    const precompileGate = new Promise((r) => {
+      releasePrecompile = r;
+    });
+
+    const origPrecompile = rec.sys.precompileFromVfs.bind(rec.sys);
+    rec.sys.precompileFromVfs = async (...args) => {
+      precompileEntered();
+      await precompileGate;
+      return await origPrecompile(...args);
+    };
+
+    const startPromise = engine.startContainer(containerId);
+    await precompileEnteredPromise;
+
+    await engine.stopContainer(containerId);
+    assert.equal(engine.containers.has(containerId), false);
+    assert.deepEqual(exitCodes, [137]);
+
+    // Release precompileFromVfs and let startContainer finish
+    releasePrecompile();
+    await startPromise;
+
+    // Give event loop a brief turn to ensure nothing booted asynchronously
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.equal(stdoutChunks.join(""), "", "Stopped container must emit zero stdout");
+    assert.equal(rec.sys.getActiveProcessCount(), 0, "Stopped container must have 0 active processes");
+    assert.deepEqual(exitCodes, [137], "onExit must fire exactly once with 137");
+  } finally {
+    await engine.dispose();
+  }
+});
+
+test("Adversarial: Elf2WasmSystem.runElf() aborts cleanly if stop() is called during _compileCached()", async () => {
+  const helloElf = buildStaticTestElf(`
+    static long sys_write(int fd, const void *buf, unsigned long len) {
+      long ret;
+      __asm__ volatile ("syscall" : "=a"(ret) : "a"(1), "D"(fd), "S"(buf), "d"(len) : "rcx", "r11", "memory");
+      return ret;
+    }
+    static void sys_exit(int code) {
+      __asm__ volatile ("syscall" :: "a"(60), "D"(code));
+      __builtin_unreachable();
+    }
+    void _start(void) {
+      static const char msg[] = "SHOULD_NOT_RUN\\n";
+      sys_write(1, msg, sizeof(msg) - 1);
+      sys_exit(0);
+    }
+  `);
+
+  const sys = await Elf2WasmSystem.create({
+    compilerWasm: fs.readFileSync(COMPILER_WASM_PATH),
+    runtimeWasm: fs.readFileSync(RUNTIME_WASM_PATH),
+  });
+
+  const origCompileCached = sys._compileCached.bind(sys);
+  sys._compileCached = async (...args) => {
+    const res = await origCompileCached(...args);
+    // Simulate stop() arriving while compilation was in flight
+    sys.stop();
+    return res;
+  };
+
+  let readyCalled = false;
+  let stdout = "";
+  const res = await sys.runElf(helloElf, [], ["/hello"], {
+    elfPath: "/hello",
+    onReady: () => {
+      readyCalled = true;
+    },
+    onStdout: (c) => {
+      stdout += textDecoder.decode(c);
+    },
+  });
+
+  assert.equal(res.exitCode, 137);
+  assert.equal(readyCalled, false, "onReady must not be called when stopped during compile");
+  assert.equal(stdout, "", "Aborted runElf must not emit stdout");
+  assert.equal(sys.getActiveProcessCount(), 0, "Aborted runElf must leave 0 active processes");
+});
+
+test("Adversarial: _compileCached() drops bloated/failed compilerInst on compile error and re-instantiates cleanly", async () => {
+  const validElf = buildStaticTestElf(`
+    static void sys_exit(int code) {
+      __asm__ volatile ("syscall" :: "a"(60), "D"(code));
+      __builtin_unreachable();
+    }
+    void _start(void) { sys_exit(0); }
+  `);
+
+  const compilerMod = await WebAssembly.compile(fs.readFileSync(COMPILER_WASM_PATH));
+  const compilerInst = await WebAssembly.instantiate(compilerMod, {});
+  const changes = [];
+  const sys = await Elf2WasmSystem.create({
+    compilerInst,
+    compilerMod,
+    onCompilerInstChange: (inst) => changes.push(inst === null ? "null" : "inst"),
+    runtimeWasm: fs.readFileSync(RUNTIME_WASM_PATH),
+  });
+
+  // Grow compiler memory past COMPILER_MEM_RESET_THRESHOLD (128 MiB = 2048 pages)
+  const mem = sys.compilerInst.exports.memory;
+  const curPages = mem.buffer.byteLength >>> 16;
+  const targetPages = 2050;
+  if (curPages < targetPages) {
+    mem.grow(targetPages - curPages);
+  }
+  assert.ok(mem.buffer.byteLength > 128 * 1024 * 1024);
+
+  const corruptElf = new Uint8Array([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x00, 0x00, 0x00]);
+  await assert.rejects(() => sys._compileCached(corruptElf, [], "/corrupt"));
+
+  assert.equal(sys.compilerInst, null, "Failed compile must drop compilerInst when compilerMod is available");
+  assert.deepEqual(changes, ["null"], "onCompilerInstChange must be notified with null on compile error");
+
+  // Subsequent valid compile must cleanly re-instantiate from compilerMod
+  const compiled = await sys._compileCached(validElf, [], "/valid");
+  assert.ok(compiled.mod instanceof WebAssembly.Module);
+  assert.ok(sys.compilerInst !== null, "compilerInst should be re-instantiated for next compile");
+  assert.deepEqual(changes, ["null", "inst"]);
+});
+
+test("Adversarial: MessageChannel yield exits cleanly in Node.js and falls back to setTimeout(0) when unavailable", () => {
+  const loopElf = buildStaticTestElf(`
+    static long sys_write(int fd, const void *buf, unsigned long len) {
+      long ret;
+      __asm__ volatile ("syscall" : "=a"(ret) : "a"(1), "D"(fd), "S"(buf), "d"(len) : "rcx", "r11", "memory");
+      return ret;
+    }
+    static long sys_getpid(void) {
+      long ret;
+      __asm__ volatile ("syscall" : "=a"(ret) : "a"(39) : "rcx", "r11", "memory");
+      return ret;
+    }
+    static void sys_exit(int code) {
+      __asm__ volatile ("syscall" :: "a"(60), "D"(code));
+      __builtin_unreachable();
+    }
+    void _start(void) {
+      for (int i = 0; i < 6; i++) sys_getpid();
+      static const char msg[] = "YIELD_OK\\n";
+      sys_write(1, msg, sizeof(msg) - 1);
+      sys_exit(0);
+    }
+  `);
+  const elfB64 = Buffer.from(loopElf).toString("base64");
+
+  const runChild = (disableMessageChannel) => {
+    const script = `
+      ${disableMessageChannel ? "globalThis.MessageChannel = undefined;" : ""}
+      import fs from "node:fs";
+      import { Elf2WasmSystem } from "./js/elf2wasm_shim.mjs";
+      const elf = Buffer.from(${JSON.stringify(elfB64)}, "base64");
+      const sys = await Elf2WasmSystem.create({
+        compilerWasm: fs.readFileSync(${JSON.stringify(COMPILER_WASM_PATH)}),
+        runtimeWasm: fs.readFileSync(${JSON.stringify(RUNTIME_WASM_PATH)}),
+      });
+      const res = await sys.runElf(elf, [], ["/loop"], { elfPath: "/loop", yieldEvery: 1 });
+      const out = new TextDecoder().decode(res.stdout).trim();
+      if (res.exitCode !== 0 || out !== "YIELD_OK") {
+        console.error("Unexpected:", res.exitCode, out);
+        process.exit(2);
+      }
+      console.log("CHILD_DONE:" + out);
+      // Intentionally do NOT call process.exit() — verify event loop drains cleanly
+    `;
+    return spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      timeout: 15000,
+    });
+  };
+
+  const withMc = runChild(false);
+  assert.equal(withMc.status, 0, `With MessageChannel failed: ${withMc.stderr}`);
+  assert.match(withMc.stdout, /CHILD_DONE:YIELD_OK/);
+
+  const withoutMc = runChild(true);
+  assert.equal(withoutMc.status, 0, `Without MessageChannel fallback failed: ${withoutMc.stderr}`);
+  assert.match(withoutMc.stdout, /CHILD_DONE:YIELD_OK/);
+});
+

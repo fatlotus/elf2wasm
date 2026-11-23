@@ -56,6 +56,71 @@ function mergeEnv(baseEnv, imageEnv, overrideEnv) {
   return order.map((k) => map.get(k));
 }
 
+const NODE_DEFAULT_OPTIONS = "--jitless --v8-pool-size=1 --no-experimental-strip-types";
+const NODE_LEGACY_DEFAULT_OPTIONS = "--jitless --v8-pool-size=1";
+
+const NODE_DEFAULT_ENV_TAIL = Object.freeze([
+  "MALLOC_ARENA_MAX=1",
+  "UV_USE_IO_URING=0",
+  "UV_THREADPOOL_SIZE=1",
+]);
+
+function parseNodeMajorVersion(imageEnv) {
+  if (!Array.isArray(imageEnv)) return null;
+  let versionStr = null;
+  for (const entry of imageEnv) {
+    if (typeof entry === "string" && entry.startsWith("NODE_VERSION=")) {
+      versionStr = entry.slice("NODE_VERSION=".length).trim();
+    }
+  }
+  if (!versionStr) return null;
+  const normalized = versionStr.replace(/^v/i, "");
+  const m = /^(\d+)(?:\.|$)/.exec(normalized);
+  return m ? Number(m[1]) : null;
+}
+
+function getNodeDefaultEnv(imageEnv) {
+  const major = parseNodeMajorVersion(imageEnv);
+  const nodeOptions =
+    major !== null && major < 22 ? NODE_LEGACY_DEFAULT_OPTIONS : NODE_DEFAULT_OPTIONS;
+  return [`NODE_OPTIONS=${nodeOptions}`, ...NODE_DEFAULT_ENV_TAIL];
+}
+
+function execBasename(p) {
+  const s = String(p || "");
+  const idx = s.lastIndexOf("/");
+  return idx >= 0 ? s.slice(idx + 1) : s;
+}
+
+function isNodeExecutable(arg) {
+  const base = execBasename(arg);
+  return base === "node" || base === "nodejs";
+}
+
+function isNodeContainer(imageEnv, entrypoint, cmd, fullArgv) {
+  if (Array.isArray(imageEnv)) {
+    for (const entry of imageEnv) {
+      if (typeof entry === "string" && entry.startsWith("NODE_VERSION=")) {
+        return true;
+      }
+    }
+  }
+  if (fullArgv.length > 0 && isNodeExecutable(fullArgv[0])) {
+    return true;
+  }
+  if (entrypoint.length > 0 && cmd.length > 0 && isNodeExecutable(cmd[0])) {
+    return true;
+  }
+  if (
+    fullArgv.length > 1 &&
+    execBasename(fullArgv[0]) === "env" &&
+    isNodeExecutable(fullArgv[1])
+  ) {
+    return true;
+  }
+  return false;
+}
+
 function resolveUserUidGid(sys, userSpec, explicitUid, explicitGid) {
   if (explicitUid !== undefined || explicitGid !== undefined) {
     return {
@@ -218,16 +283,23 @@ export class ContainerEngine {
     // Touch entry to keep active images warm in LRU order.
     this.images.delete(imageId);
     this.images.set(imageId, image);
-    if (!this.compilerInst || !this.runtimeMod) {
+    if ((!this.compilerInst && !this.compilerMod) || !this.runtimeMod) {
       throw new Error("ContainerEngine has not been initialized");
     }
 
     const onProgress = typeof options.onProgress === "function" ? options.onProgress : null;
     const sys = await Elf2WasmSystem.create({
       compilerInst: this.compilerInst,
+      compilerMod: this.compilerMod,
       runtimeWasm: this.runtimeMod,
       moduleCache: this.moduleCache,
+      onCompilerInstChange: (inst) => {
+        this.compilerInst = inst;
+      },
     });
+    if (sys.compilerInst) {
+      this.compilerInst = sys.compilerInst;
+    }
 
     const layerCount = image.layers.length;
     for (let i = 0; i < layerCount; i++) {
@@ -276,6 +348,9 @@ export class ContainerEngine {
       `PWD=${cwd}`,
     ];
     if (tty) baseEnv.push("TERM=xterm-256color");
+    if (isNodeContainer(image.config.env, entrypoint, cmd, fullArgv)) {
+      baseEnv.push(...getNodeDefaultEnv(image.config.env));
+    }
     const env = mergeEnv(baseEnv, image.config.env, options.env);
 
     const { uid, gid } = resolveUserUidGid(
@@ -301,6 +376,7 @@ export class ContainerEngine {
       onProgress,
       callbacks,
       started: false,
+      stopped: false,
       exited: false,
       exitCode: 0,
       runPromise: null,
@@ -322,6 +398,9 @@ export class ContainerEngine {
     if (rec.started) {
       throw new Error(`Container ${containerId} has already been started`);
     }
+    if (rec.stopped || rec.exited || !this.containers.has(containerId)) {
+      return;
+    }
     rec.started = true;
 
     if (rec.onProgress) {
@@ -333,6 +412,40 @@ export class ContainerEngine {
         loaded: 0,
         total: 0,
       });
+    }
+
+    if (rec.argv.length > 0 && typeof rec.sys.precompileFromVfs === "function") {
+      const entryPath = rec.sys.resolveCommandPath(rec.argv[0], rec.env);
+      const entryBytes = entryPath ? rec.sys.readVfsFile(entryPath) : null;
+      if (entryBytes && entryBytes.length >= 2 && entryBytes[0] === 0x23 && entryBytes[1] === 0x21) {
+        let targetCmd = null;
+        if (rec.argv.length >= 2 && !rec.argv[1].startsWith("-")) {
+          targetCmd = rec.argv[1];
+        } else if (rec.argv[0].endsWith("docker-entrypoint.sh")) {
+          targetCmd = "node";
+        }
+        if (targetCmd) {
+          if (rec.onProgress) {
+            rec.onProgress({
+              stage: "compile",
+              message: `Compiling ${targetCmd} to WebAssembly...`,
+              layerIndex: 0,
+              layerCount: 0,
+              loaded: 0,
+              total: 0,
+            });
+          }
+          try {
+            await rec.sys.precompileFromVfs(targetCmd, { env: rec.env });
+          } catch {
+            // best-effort precompile
+          }
+        }
+      }
+    }
+
+    if (rec.stopped || rec.exited || !this.containers.has(containerId)) {
+      return;
     }
 
     let resolveReady;
@@ -454,6 +567,7 @@ export class ContainerEngine {
   async stopContainer(containerId) {
     const rec = this.containers.get(containerId);
     if (!rec) return;
+    rec.stopped = true;
     rec.sys.stop();
     if (rec.runPromise) {
       try {
@@ -1120,6 +1234,16 @@ export async function runDockerImage(imageRef, options = {}) {
       stdin,
       onProgress: options.onProgress,
     });
+    // Release uncompressed layer tarBytes immediately after VFS extraction
+    // before ELF-to-WASM compilation and guest instantiation.
+    if (image) {
+      try {
+        await image.dispose();
+      } catch {
+        // ignore cleanup error
+      }
+      image = null;
+    }
     if (typeof options.onStdout === "function") container.onStdout(options.onStdout);
     if (typeof options.onStderr === "function") container.onStderr(options.onStderr);
     await container.start();
