@@ -8,7 +8,7 @@ use elf2wasm_core::lifter::{CTX_SIZE, YIELD_SYSCALL_PENDING};
 use elf2wasm_core::meta::WasmMeta;
 use elf2wasm_runtime_core::context::{GuestContext, HostFsProvider};
 use elf2wasm_runtime_core::scheduler::ThreadState;
-use elf2wasm_runtime_core::stack::setup_guest_stack_ctx_with_ids;
+use elf2wasm_runtime_core::stack::setup_guest_stack_ctx_with_ids_and_random;
 use elf2wasm_runtime_core::syscalls::{handle_syscall, HostState, PendingHostAction};
 use elf2wasm_runtime_core::vfs::{
     path_hash, DirEntry, FileStat, VirtualFs, AT_FDCWD, EFAULT, EINVAL, ENOMEM,
@@ -599,10 +599,17 @@ pub extern "C" fn runtime_init_guest_stack(
     state.vfs.elf_path = meta.elf_path.clone();
     state.vfs.cmdline = args.clone();
 
+    let at_random = state.at_random_bytes();
     let mut ctx = WasmGuestContext;
-    let Ok(rsp) =
-        setup_guest_stack_ctx_with_ids(&mut ctx, &meta, &args, &env, state.uid, state.gid)
-    else {
+    let Ok(rsp) = setup_guest_stack_ctx_with_ids_and_random(
+        &mut ctx,
+        &meta,
+        &args,
+        &env,
+        state.uid,
+        state.gid,
+        at_random,
+    ) else {
         return -3;
     };
     ctx.set_rsp(rsp as i64);
@@ -884,6 +891,9 @@ pub extern "C" fn runtime_get_stderr(out_len_ptr: *mut usize) -> *const u8 {
 
 #[no_mangle]
 pub extern "C" fn runtime_get_exit_code() -> i32 {
+    if let Some(code) = state_ref().and_then(|s| s.main_exit_code()) {
+        return code;
+    }
     unsafe { host_get_global(GLOBAL_ID_EXIT_CODE) as i32 }
 }
 
@@ -1051,4 +1061,42 @@ pub extern "C" fn runtime_remove_vfs_path(path_ptr: *const u8, path_len: usize) 
     };
     state.vfs.vfs_remove_path(path);
     0
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_set_delay_config(stddev_ns: u64, seed: u64) {
+    if let Some(state) = state_mut() {
+        state.set_delay_config(stddev_ns, seed);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_reset_virtual_time() {
+    if let Some(state) = state_mut() {
+        state.reset_virtual_time();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_snapshot_vfs() -> u32 {
+    let Some(state) = state_mut() else {
+        return 0;
+    };
+    state.vfs.snapshot_vfs()
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_restore_vfs(snapshot_id: u32) -> i32 {
+    let Some(state) = state_mut() else {
+        return -1;
+    };
+    state.vfs.restore_vfs(snapshot_id)
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_drop_vfs_snapshot(snapshot_id: u32) -> i32 {
+    let Some(state) = state_mut() else {
+        return -1;
+    };
+    state.vfs.drop_vfs_snapshot(snapshot_id)
 }

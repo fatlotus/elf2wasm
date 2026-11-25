@@ -35,6 +35,12 @@ enum Commands {
         /// Read-only VFS mount in host:guest format (repeatable)
         #[arg(long = "vfs-ro")]
         vfs_ro: Vec<String>,
+        /// Standard deviation of simulated network/scheduling delay in milliseconds (>= 0)
+        #[arg(long = "delay-stddev-ms", default_value_t = 0.0)]
+        delay_stddev_ms: f64,
+        /// 64-bit PRNG seed for deterministic delay injection and randomness
+        #[arg(long = "delay-seed")]
+        delay_seed: Option<u64>,
         /// Arguments passed to the guest program (after --)
         #[arg(last = true)]
         args: Vec<String>,
@@ -58,6 +64,24 @@ fn parse_vfs_ro(spec: &str) -> Result<(PathBuf, String)> {
 }
 
 
+fn delay_stddev_ms_to_ns(ms: f64) -> Result<u64> {
+    if !ms.is_finite() || ms < 0.0 {
+        bail!(
+            "Invalid --delay-stddev-ms '{}': must be a finite non-negative number",
+            ms
+        );
+    }
+    let ns_f64 = (ms * 1_000_000.0).round();
+    let max_ns = (u64::MAX / 10) as f64;
+    if ns_f64 > max_ns {
+        bail!(
+            "Invalid --delay-stddev-ms '{}': exceeds maximum supported delay",
+            ms
+        );
+    }
+    Ok(ns_f64 as u64)
+}
+
 fn run_cli() -> Result<i32> {
     let cli = Cli::parse();
     match cli.command {
@@ -75,7 +99,14 @@ fn run_cli() -> Result<i32> {
             let _ = runtime::prewarm_cwasm_cache(&wasm_bytes);
             Ok(0)
         }
-        Commands::Run { wasm, vfs_ro, args } => {
+        Commands::Run {
+            wasm,
+            vfs_ro,
+            delay_stddev_ms,
+            delay_seed,
+            args,
+        } => {
+            let delay_stddev_ns = delay_stddev_ms_to_ns(delay_stddev_ms)?;
             let wasm_bytes =
                 fs::read(&wasm).with_context(|| format!("Failed to read {}", wasm.display()))?;
             let mut mounts = Vec::with_capacity(vfs_ro.len());
@@ -104,6 +135,8 @@ fn run_cli() -> Result<i32> {
                     vfs_ro: mounts,
                     stdin: Vec::new(),
                     inherit_stdin: true,
+                    delay_stddev_ns,
+                    delay_seed,
                 },
             )?;
 

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use elf2wasm_core::lifter::{CTX_SIZE, YIELD_SYSCALL_PENDING};
 use elf2wasm_runtime_core::context::GuestContext;
 pub use elf2wasm_runtime_core::stack::{
-    extract_elf2wasm_meta, setup_guest_stack, RunConfig, RunOutput,
+    extract_elf2wasm_meta, setup_guest_stack_with_random, RunConfig, RunOutput,
 };
 use elf2wasm_runtime_core::scheduler::ThreadState;
 use elf2wasm_runtime_core::syscalls::{handle_syscall, HostState, PendingHostAction};
@@ -350,6 +350,10 @@ pub fn run_wasm(wasm_bytes: &[u8], config: RunConfig) -> Result<RunOutput> {
     let mut host_state = HostState::new(vfs);
     host_state.apply_meta_layout(&meta);
     host_state.multiproc_enabled = true;
+    if config.delay_stddev_ns > 0 || config.delay_seed.is_some() {
+        host_state.set_delay_config(config.delay_stddev_ns, config.delay_seed.unwrap_or(0));
+    }
+    let at_random = host_state.at_random_bytes();
     let mut store = Store::new(&engine, Some(host_state));
 
     let main_inst = Instance::new(&mut store, &module, &[])?;
@@ -359,7 +363,7 @@ pub fn run_wasm(wasm_bytes: &[u8], config: RunConfig) -> Result<RunOutput> {
 
     let initial_rsp = {
         let mem_slice = main_mem.data_mut(&mut store);
-        setup_guest_stack(mem_slice, &meta, &config)?
+        setup_guest_stack_with_random(mem_slice, &meta, &config, at_random)?
     };
 
     main_inst
@@ -440,10 +444,12 @@ pub fn run_wasm(wasm_bytes: &[u8], config: RunConfig) -> Result<RunOutput> {
             let main_exited = host_state.is_main_exited();
             let has_pending = host_state.pending_action.is_some();
             if main_exited {
-                let ec = processes[&1000]
-                    .get_global(&mut store, "exit_code")
-                    .and_then(|g| g.get(&mut store).i32())
-                    .unwrap_or(code);
+                let ec = host_state.main_exit_code().unwrap_or_else(|| {
+                    processes[&1000]
+                        .get_global(&mut store, "exit_code")
+                        .and_then(|g| g.get(&mut store).i32())
+                        .unwrap_or(code)
+                });
                 *store.data_mut() = Some(host_state);
                 break ec;
             }
@@ -489,10 +495,12 @@ pub fn run_wasm(wasm_bytes: &[u8], config: RunConfig) -> Result<RunOutput> {
             .take()
             .expect("HostState missing during yield");
         if host_state.is_main_exited() {
-            let ec = processes[&1000]
-                .get_global(&mut store, "exit_code")
-                .and_then(|g| g.get(&mut store).i32())
-                .unwrap_or(code);
+            let ec = host_state.main_exit_code().unwrap_or_else(|| {
+                processes[&1000]
+                    .get_global(&mut store, "exit_code")
+                    .and_then(|g| g.get(&mut store).i32())
+                    .unwrap_or(code)
+            });
             *store.data_mut() = Some(host_state);
             break ec;
         }
@@ -515,10 +523,12 @@ pub fn run_wasm(wasm_bytes: &[u8], config: RunConfig) -> Result<RunOutput> {
             .map_err(|e| anyhow::anyhow!("on_yield_multiproc failed: {}", e))?;
         match action {
             0 => {
-                let ec = processes[&1000]
-                    .get_global(&mut store, "exit_code")
-                    .and_then(|g| g.get(&mut store).i32())
-                    .unwrap_or(code);
+                let ec = host_state.main_exit_code().unwrap_or_else(|| {
+                    processes[&1000]
+                        .get_global(&mut store, "exit_code")
+                        .and_then(|g| g.get(&mut store).i32())
+                        .unwrap_or(code)
+                });
                 *store.data_mut() = Some(host_state);
                 break ec;
             }
