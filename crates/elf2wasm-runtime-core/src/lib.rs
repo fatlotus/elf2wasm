@@ -1816,4 +1816,632 @@ mod tests {
         assert_eq!(i32::from_le_bytes(si[24..28].try_into().unwrap()), 55);
         assert!(!state.processes.contains_key(&child_pid));
     }
+
+    fn m16_make_tcp_pair(ctx: &mut MockCtx, state: &mut HostState, nonblock_server: bool) -> (i32, i32, i32) {
+        let lfd = handle_syscall(ctx, state, 41 /* socket */, 2, 1 | 0x800, 0, 0, 0, 0) as i32;
+        assert!(lfd >= 3);
+        let mut sa = [0u8; 16];
+        sa[0..2].copy_from_slice(&2u16.to_le_bytes()); // AF_INET
+        sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        ctx.mem_write(0x1000, &sa).unwrap();
+        assert_eq!(handle_syscall(ctx, state, 49 /* bind */, lfd as i64, 0x1000, 16, 0, 0, 0), 0);
+        ctx.mem_write(0x1020, &16u32.to_le_bytes()).unwrap();
+        assert_eq!(handle_syscall(ctx, state, 51 /* getsockname */, lfd as i64, 0x1010, 0x1020, 0, 0, 0), 0);
+        ctx.mem_read(0x1010, &mut sa).unwrap();
+        let port = u16::from_be_bytes([sa[2], sa[3]]);
+        assert_eq!(handle_syscall(ctx, state, 50 /* listen */, lfd as i64, 16, 0, 0, 0, 0), 0);
+        let cfd = handle_syscall(ctx, state, 41 /* socket */, 2, 1, 0, 0, 0, 0) as i32;
+        sa[2..4].copy_from_slice(&port.to_be_bytes());
+        ctx.mem_write(0x1030, &sa).unwrap();
+        assert_eq!(handle_syscall(ctx, state, 42 /* connect */, cfd as i64, 0x1030, 16, 0, 0, 0), 0);
+        let accept_flags = if nonblock_server { 0x800 } else { 0 };
+        let sfd = handle_syscall(ctx, state, 288 /* accept4 */, lfd as i64, 0, 0, accept_flags, 0, 0) as i32;
+        assert!(sfd >= 3);
+        (lfd, cfd, sfd)
+    }
+
+    #[test]
+    fn test_m16_zero_delay_backward_compat() {
+        use crate::stack::LEGACY_AT_RANDOM;
+        use crate::syscalls::LEGACY_PRNG_SEED;
+
+        let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+        let mut ctx = MockCtx::new(0x0B00_0000);
+
+        assert_eq!(state.delay_stddev_ns, 0);
+        assert!(!state.seed_configured);
+        assert_eq!(state.vfs.prng_state, LEGACY_PRNG_SEED);
+        assert_eq!(state.at_random_bytes(), LEGACY_AT_RANDOM);
+
+        let (_lfd, cfd, sfd) = m16_make_tcp_pair(&mut ctx, &mut state, true);
+        ctx.mem_write(0x2000, b"immediate").unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 1 /* write */, cfd as i64, 0x2000, 9, 0, 0, 0), 9);
+        assert!(state.min_in_flight_ns().is_none());
+
+        let mut buf = [0u8; 9];
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 0 /* read */, sfd as i64, 0x2100, 9, 0, 0, 0), 9);
+        ctx.mem_read(0x2100, &mut buf).unwrap();
+        assert_eq!(&buf, b"immediate");
+
+        // Switching to a non-zero delay config changes seeds; switching back to (0, 0) restores legacy behavior.
+        state.set_delay_config(10_000_000, 42);
+        assert!(state.seed_configured);
+        assert_ne!(state.at_random_bytes(), LEGACY_AT_RANDOM);
+        assert_ne!(state.vfs.prng_state, LEGACY_PRNG_SEED);
+
+        state.set_delay_config(0, 0);
+        assert!(!state.seed_configured);
+        assert_eq!(state.at_random_bytes(), LEGACY_AT_RANDOM);
+        assert_eq!(state.vfs.prng_state, LEGACY_PRNG_SEED);
+        ctx.mem_write(0x2000, b"again").unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 1, cfd as i64, 0x2000, 5, 0, 0, 0), 5);
+        assert!(state.min_in_flight_ns().is_none());
+        let mut buf2 = [0u8; 5];
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 0, sfd as i64, 0x2100, 5, 0, 0, 0), 5);
+        ctx.mem_read(0x2100, &mut buf2).unwrap();
+        assert_eq!(&buf2, b"again");
+    }
+
+    #[test]
+    fn test_m16_simulated_time_fast_forward_zero_wall_clock() {
+        let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+        state.multiproc_enabled = true;
+        // Huge 60-second stddev — must complete in milliseconds of wall-clock time!
+        state.set_delay_config(60_000_000_000, 12345);
+        let mut ctx = MockCtx::new(0x0B00_0000);
+
+        let wall_start = std::time::Instant::now();
+        let (_lfd, cfd, sfd) = m16_make_tcp_pair(&mut ctx, &mut state, false);
+
+        ctx.mem_write(0x2000, b"hello-sim").unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 1 /* write */, cfd as i64, 0x2000, 9, 0, 0, 0), 9);
+
+        let deliver_ns = state.min_in_flight_ns().expect("packet should be in flight");
+        assert!(deliver_ns > state.scheduler.virtual_mono_ns);
+
+        // FIONREAD (0x541b) on sfd must report 0 while bytes are still in flight
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 16 /* ioctl */, sfd as i64, 0x541b, 0x2200, 0, 0, 0), 0);
+        let mut fionread = [0u8; 4];
+        ctx.mem_read(0x2200, &mut fionread).unwrap();
+        assert_eq!(i32::from_le_bytes(fionread), 0);
+
+        // Blocking read on sfd -> enters PipeReadWait -> on_yield_multiproc fast-forwards virtual time
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 0 /* read */, sfd as i64, 0x2100, 16, 0, 0, 0), 0);
+        assert_eq!(ctx.yield_flag, 1);
+
+        let status = state.on_yield_multiproc(&mut ctx, 1).unwrap();
+        assert_eq!(status, 1);
+        assert!(state.scheduler.virtual_mono_ns >= deliver_ns);
+        let cur_tid = state.scheduler.current_tid;
+        let woken_rax = i64::from_le_bytes(state.scheduler.threads[&cur_tid].regs[0..8].try_into().unwrap());
+        assert_eq!(woken_rax, 9);
+        let mut out = [0u8; 9];
+        ctx.mem_read(0x2100, &mut out).unwrap();
+        assert_eq!(&out, b"hello-sim");
+
+        assert!(
+            wall_start.elapsed() < std::time::Duration::from_millis(500),
+            "simulated-time fast-forward must not wait in real time"
+        );
+    }
+
+    #[test]
+    fn test_m16_tcp_per_connection_fifo_and_cross_connection_reordering() {
+        let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+        state.set_delay_config(10_000_000 /* 10ms */, 777);
+        let mut ctx = MockCtx::new(0x0B00_0000);
+
+        // 1. Per-connection FIFO across 20 messages
+        let (_lfd1, cfd1, sfd1) = m16_make_tcp_pair(&mut ctx, &mut state, true);
+        let mut expected = Vec::new();
+        for i in 0..20u8 {
+            let tag = format!("{:02}", i);
+            expected.extend_from_slice(tag.as_bytes());
+            ctx.mem_write(0x2000, tag.as_bytes()).unwrap();
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 1, cfd1 as i64, 0x2000, 2, 0, 0, 0), 2);
+        }
+        let sfd1_sid = state.vfs.get_fd(sfd1).unwrap().tcp_socket_id.unwrap();
+        let read_pipe_id = match state.vfs.tcp_sockets[&sfd1_sid].state {
+            crate::vfs::TcpSocketState::Connected { read_pipe_id, .. } => read_pipe_id,
+            _ => panic!("expected Connected"),
+        };
+        let times: Vec<u64> = state.vfs.pipes[&read_pipe_id]
+            .in_flight
+            .iter()
+            .map(|&(t, _)| t)
+            .collect();
+        assert!(!times.is_empty());
+        for w in times.windows(2) {
+            assert!(w[0] <= w[1], "per-connection FIFO violated: {} > {}", w[0], w[1]);
+        }
+        let max_t = *times.last().unwrap();
+        state.scheduler.virtual_mono_ns = max_t;
+        state.flush_in_flight_pipes(max_t);
+        let mut received = [0u8; 40];
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 0, sfd1 as i64, 0x2100, 40, 0, 0, 0), 40);
+        ctx.mem_read(0x2100, &mut received).unwrap();
+        assert_eq!(received.as_slice(), expected.as_slice());
+
+        // 2. Cross-connection reordering: send on A then immediately on B across rounds
+        let (_lfd_a, cfd_a, sfd_a) = m16_make_tcp_pair(&mut ctx, &mut state, true);
+        let (_lfd_b, cfd_b, sfd_b) = m16_make_tcp_pair(&mut ctx, &mut state, true);
+        let pipe_a = match state.vfs.tcp_sockets[&state.vfs.get_fd(sfd_a).unwrap().tcp_socket_id.unwrap()].state {
+            crate::vfs::TcpSocketState::Connected { read_pipe_id, .. } => read_pipe_id,
+            _ => panic!("expected Connected"),
+        };
+        let pipe_b = match state.vfs.tcp_sockets[&state.vfs.get_fd(sfd_b).unwrap().tcp_socket_id.unwrap()].state {
+            crate::vfs::TcpSocketState::Connected { read_pipe_id, .. } => read_pipe_id,
+            _ => panic!("expected Connected"),
+        };
+
+        let mut reordered_count = 0usize;
+        for _ in 0..30 {
+            ctx.mem_write(0x2000, b"A").unwrap();
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 1, cfd_a as i64, 0x2000, 1, 0, 0, 0), 1);
+            ctx.mem_write(0x2001, b"B").unwrap();
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 1, cfd_b as i64, 0x2001, 1, 0, 0, 0), 1);
+
+            let ta = state.vfs.pipes[&pipe_a].in_flight.front().map(|&(t, _)| t).unwrap_or(0);
+            let tb = state.vfs.pipes[&pipe_b].in_flight.front().map(|&(t, _)| t).unwrap_or(0);
+            if tb < ta {
+                reordered_count += 1;
+            }
+            let flush_t = ta.max(tb);
+            state.scheduler.virtual_mono_ns = state.scheduler.virtual_mono_ns.max(flush_t);
+            state.flush_in_flight_pipes(state.scheduler.virtual_mono_ns);
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 0, sfd_a as i64, 0x2100, 1, 0, 0, 0), 1);
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 0, sfd_b as i64, 0x2101, 1, 0, 0, 0), 1);
+        }
+        assert!(reordered_count > 0, "expected cross-connection reordering in simulated time");
+    }
+
+    #[test]
+    fn test_m16_tcp_eof_deferred_until_in_flight_drained() {
+        for use_close in [false, true] {
+            let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+            state.multiproc_enabled = true;
+            state.set_delay_config(50_000_000 /* 50ms */, 7);
+            let mut ctx = MockCtx::new(0x0B00_0000);
+
+            let (_lfd, cfd, sfd) = m16_make_tcp_pair(&mut ctx, &mut state, true);
+            let epfd = handle_syscall(&mut ctx, &mut state, 291 /* epoll_create1 */, 0, 0, 0, 0, 0, 0) as i32;
+            assert!(epfd >= 3);
+            // Register sfd with EPOLLIN (0x1) | EPOLLRDHUP (0x2000)
+            let mut ev = [0u8; 12];
+            ev[0..4].copy_from_slice(&(0x2001u32).to_le_bytes());
+            ev[4..12].copy_from_slice(&(sfd as u64).to_le_bytes());
+            ctx.mem_write(0x3000, &ev).unwrap();
+            assert_eq!(
+                handle_syscall(&mut ctx, &mut state, 233 /* epoll_ctl */, epfd as i64, 1, sfd as i64, 0x3000, 0, 0),
+                0
+            );
+
+            ctx.mem_write(0x2000, b"payload").unwrap();
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 1, cfd as i64, 0x2000, 7, 0, 0, 0), 7);
+            let deliver_ns = state.min_in_flight_ns().expect("payload should be in flight");
+
+            if use_close {
+                assert_eq!(handle_syscall(&mut ctx, &mut state, 3 /* close */, cfd as i64, 0, 0, 0, 0, 0), 0);
+            } else {
+                assert_eq!(handle_syscall(&mut ctx, &mut state, 48 /* shutdown */, cfd as i64, 1 /* SHUT_WR */, 0, 0, 0, 0), 0);
+            }
+
+            // Before deliver_ns: read must return -EAGAIN (-11), NOT 0 (EOF), and
+            // epoll_wait(timeout=0) must return 0 (no premature POLLERR/POLLIN/POLLRDHUP/POLLHUP)
+            assert_eq!(
+                handle_syscall(&mut ctx, &mut state, 0 /* read */, sfd as i64, 0x2100, 16, 0, 0, 0),
+                -11
+            );
+            assert_eq!(
+                handle_syscall(&mut ctx, &mut state, 232 /* epoll_wait */, epfd as i64, 0x3100, 4, 0, 0, 0),
+                0,
+                "use_close={}: epoll_wait must not fire prematurely while in-flight chunks remain",
+                use_close
+            );
+
+            // Blocking epoll_wait(timeout=-1) -> fast-forwards to deliver_ns via on_yield_multiproc
+            assert_eq!(
+                handle_syscall(&mut ctx, &mut state, 232 /* epoll_wait */, epfd as i64, 0x3100, 4, -1, 0, 0),
+                0
+            );
+            assert_eq!(ctx.yield_flag, 1);
+            assert_eq!(state.on_yield_multiproc(&mut ctx, 1).unwrap(), 1);
+            assert!(state.scheduler.virtual_mono_ns >= deliver_ns);
+            let cur_tid = state.scheduler.current_tid;
+            let woken_rax = i64::from_le_bytes(state.scheduler.threads[&cur_tid].regs[0..8].try_into().unwrap());
+            assert_eq!(woken_rax, 1);
+            let mut out_ev = [0u8; 12];
+            ctx.mem_read(0x3100, &mut out_ev).unwrap();
+            let revents = u32::from_le_bytes(out_ev[0..4].try_into().unwrap());
+            assert_ne!(revents & 0x1, 0, "expected EPOLLIN after delivery");
+            assert_ne!(revents & 0x2000, 0, "expected EPOLLRDHUP after last chunk drained");
+            if use_close {
+                assert_ne!(revents & 0x10, 0, "expected EPOLLHUP after close + drain");
+            }
+
+            // First read returns "payload"; second read returns 0 (EOF)
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 0, sfd as i64, 0x2100, 16, 0, 0, 0), 7);
+            let mut payload = [0u8; 7];
+            ctx.mem_read(0x2100, &mut payload).unwrap();
+            assert_eq!(&payload, b"payload");
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 0, sfd as i64, 0x2100, 16, 0, 0, 0), 0);
+        }
+    }
+
+    #[test]
+    fn test_m16_tcp_close_with_in_flight_chunks_epoll_wait() {
+        // Regression test for Probe 3b: writer writes multiple chunks under delay_stddev_ns > 0
+        // and immediately calls SYS_CLOSE(cfd), while reader monitors sfd via level-triggered
+        // epoll_wait(POLLIN | POLLRDHUP) with timeout=0 and blocking timeout=-1.
+        let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+        state.multiproc_enabled = true;
+        state.set_delay_config(50_000_000 /* 50ms */, 7777);
+        let mut ctx = MockCtx::new(0x0B00_0000);
+
+        let (_lfd, cfd, sfd) = m16_make_tcp_pair(&mut ctx, &mut state, true);
+        let epfd = handle_syscall(&mut ctx, &mut state, 291 /* epoll_create1 */, 0, 0, 0, 0, 0, 0) as i32;
+        assert!(epfd >= 3);
+        let mut ev = [0u8; 12];
+        ev[0..4].copy_from_slice(&0x2001u32.to_le_bytes()); // EPOLLIN | EPOLLRDHUP
+        ev[4..12].copy_from_slice(&(sfd as u64).to_le_bytes());
+        ctx.mem_write(0x3000, &ev).unwrap();
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 233 /* epoll_ctl */, epfd as i64, 1, sfd as i64, 0x3000, 0, 0),
+            0
+        );
+
+        let mut expected = Vec::new();
+        for i in 0..8u8 {
+            let chunk = format!("chunk-{:02}|", i);
+            expected.extend_from_slice(chunk.as_bytes());
+            ctx.mem_write(0x2000, chunk.as_bytes()).unwrap();
+            assert_eq!(
+                handle_syscall(&mut ctx, &mut state, 1 /* write */, cfd as i64, 0x2000, chunk.len() as i64, 0, 0, 0),
+                chunk.len() as i64
+            );
+        }
+        assert!(state.min_in_flight_ns().is_some(), "chunks must be in flight");
+
+        // Immediately close writer fd while all 8 chunks are still in flight
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 3 /* close */, cfd as i64, 0, 0, 0, 0, 0), 0);
+
+        // FIONREAD must be 0, non-blocking read must return -EAGAIN, and epoll_wait(timeout=0) must return 0
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 16 /* ioctl */, sfd as i64, 0x541B /* FIONREAD */, 0x2200, 0, 0, 0),
+            0
+        );
+        let mut avail = [0u8; 4];
+        ctx.mem_read(0x2200, &mut avail).unwrap();
+        assert_eq!(i32::from_le_bytes(avail), 0, "FIONREAD must be 0 while all chunks are in-flight");
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 0 /* read */, sfd as i64, 0x2100, 64, 0, 0, 0),
+            -11
+        );
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 232 /* epoll_wait */, epfd as i64, 0x3100, 4, 0, 0, 0),
+            0,
+            "epoll_wait(timeout=0) must NOT fire premature POLLERR/POLLHUP while in-flight chunks remain"
+        );
+
+        // Drain all 8 chunks via blocking level-triggered epoll_wait(timeout=-1) + on_yield_multiproc
+        let mut received = Vec::new();
+        let mut saw_eof_events = false;
+        for _ in 0..32 {
+            ctx.yield_flag = 0;
+            let n = handle_syscall(&mut ctx, &mut state, 232 /* epoll_wait */, epfd as i64, 0x3100, 4, -1, 0, 0);
+            let ready = if ctx.yield_flag == 1 {
+                assert_eq!(state.on_yield_multiproc(&mut ctx, 1).unwrap(), 1);
+                let cur_tid = state.scheduler.current_tid;
+                i64::from_le_bytes(state.scheduler.threads[&cur_tid].regs[0..8].try_into().unwrap())
+            } else {
+                n
+            };
+            assert_eq!(ready, 1);
+
+            let mut out_ev = [0u8; 12];
+            ctx.mem_read(0x3100, &mut out_ev).unwrap();
+            let revents = u32::from_le_bytes(out_ev[0..4].try_into().unwrap());
+            let still_in_flight = state.min_in_flight_ns().is_some();
+            if still_in_flight {
+                assert_eq!(
+                    revents & (0x8 | 0x10 | 0x2000),
+                    0,
+                    "must NOT report POLLERR/POLLHUP/POLLRDHUP while chunks remain in flight, got 0x{:x}",
+                    revents
+                );
+                assert_ne!(revents & 0x1, 0, "expected EPOLLIN for delivered in-flight chunk");
+            } else if (revents & (0x10 | 0x2000)) != 0 {
+                saw_eof_events = true;
+            }
+
+            loop {
+                let r = handle_syscall(&mut ctx, &mut state, 0 /* read */, sfd as i64, 0x2100, 64, 0, 0, 0);
+                if r > 0 {
+                    let mut buf = vec![0u8; r as usize];
+                    ctx.mem_read(0x2100, &mut buf).unwrap();
+                    received.extend_from_slice(&buf);
+                } else if r == 0 {
+                    assert!(
+                        state.min_in_flight_ns().is_none(),
+                        "0-byte EOF must only occur after all in-flight chunks drained"
+                    );
+                    break;
+                } else {
+                    assert_eq!(r, -11, "expected -EAGAIN when buffer drained");
+                    break;
+                }
+            }
+            if received.len() == expected.len() && state.min_in_flight_ns().is_none() {
+                // Verify subsequent read returns 0 (EOF) and epoll_wait reports EPOLLHUP | EPOLLRDHUP
+                assert_eq!(
+                    handle_syscall(&mut ctx, &mut state, 0 /* read */, sfd as i64, 0x2100, 64, 0, 0, 0),
+                    0
+                );
+                if !saw_eof_events {
+                    assert_eq!(
+                        handle_syscall(&mut ctx, &mut state, 232 /* epoll_wait */, epfd as i64, 0x3100, 4, 0, 0, 0),
+                        1
+                    );
+                    ctx.mem_read(0x3100, &mut out_ev).unwrap();
+                    let rev = u32::from_le_bytes(out_ev[0..4].try_into().unwrap());
+                    assert_ne!(rev & 0x10, 0, "expected EPOLLHUP after drain");
+                    assert_ne!(rev & 0x2000, 0, "expected EPOLLRDHUP after drain");
+                    saw_eof_events = true;
+                }
+                break;
+            }
+        }
+        assert_eq!(received, expected, "all 8 chunks must arrive in strict FIFO order");
+        assert!(saw_eof_events, "expected EPOLLHUP/EPOLLRDHUP after all in-flight chunks drained");
+
+        // Also verify edge-triggered (EPOLLET | EPOLLIN | EPOLLOUT | EPOLLRDHUP) like Go's netpoller:
+        // peer SYS_CLOSE while chunks are in flight must not spuriously rearm EPOLLOUT/EPOLLERR before drain,
+        // and must rearm & deliver EPOLLHUP/EPOLLRDHUP once the last chunk drains.
+        let (_lfd2, cfd2, sfd2) = m16_make_tcp_pair(&mut ctx, &mut state, true);
+        let epfd2 = handle_syscall(&mut ctx, &mut state, 291, 0, 0, 0, 0, 0, 0) as i32;
+        let mut ev2 = [0u8; 12];
+        ev2[0..4].copy_from_slice(&(0x8000_2005u32).to_le_bytes()); // EPOLLET | EPOLLRDHUP | EPOLLOUT | EPOLLIN
+        ev2[4..12].copy_from_slice(&(sfd2 as u64).to_le_bytes());
+        ctx.mem_write(0x3000, &ev2).unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 233, epfd2 as i64, 1, sfd2 as i64, 0x3000, 0, 0), 0);
+        // Consume initial edge-triggered EPOLLOUT
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 232, epfd2 as i64, 0x3100, 4, 0, 0, 0), 1);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 232, epfd2 as i64, 0x3100, 4, 0, 0, 0), 0);
+
+        ctx.mem_write(0x2000, b"et-msg").unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 1, cfd2 as i64, 0x2000, 6, 0, 0, 0), 6);
+        let et_deliver_ns = state.min_in_flight_ns().expect("et-msg should be in flight");
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 3, cfd2 as i64, 0, 0, 0, 0, 0), 0);
+
+        // Must NOT fire spuriously before et_deliver_ns
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 232, epfd2 as i64, 0x3100, 4, 0, 0, 0),
+            0,
+            "EPOLLET must not spuriously rearm EPOLLOUT/EPOLLERR while in-flight chunks remain"
+        );
+        // Blocking epoll_wait fast-forwards to et_deliver_ns and delivers EPOLLIN | EPOLLRDHUP | EPOLLHUP
+        ctx.yield_flag = 0;
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 232, epfd2 as i64, 0x3100, 4, -1, 0, 0), 0);
+        assert_eq!(ctx.yield_flag, 1);
+        assert_eq!(state.on_yield_multiproc(&mut ctx, 1).unwrap(), 1);
+        assert!(state.scheduler.virtual_mono_ns >= et_deliver_ns);
+        let mut out_ev2 = [0u8; 12];
+        ctx.mem_read(0x3100, &mut out_ev2).unwrap();
+        let rev2 = u32::from_le_bytes(out_ev2[0..4].try_into().unwrap());
+        assert_ne!(rev2 & 0x1, 0, "EPOLLET expected EPOLLIN after drain");
+        assert_ne!(rev2 & 0x10, 0, "EPOLLET expected EPOLLHUP after drain");
+        assert_ne!(rev2 & 0x2000, 0, "EPOLLET expected EPOLLRDHUP after drain");
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 0, sfd2 as i64, 0x2100, 16, 0, 0, 0), 6);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 0, sfd2 as i64, 0x2100, 16, 0, 0, 0), 0);
+    }
+
+    #[test]
+    fn test_m16_determinism_identical_seeds_and_reset_for_new_run() {
+        fn run_trace(state: &mut HostState) -> ([u8; 16], [u8; 32], [u8; 16], Vec<u64>, Vec<u64>) {
+            let mut ctx = MockCtx::new(0x0B00_0000);
+            let at_rand = state.at_random_bytes();
+
+            // 1. SYS_GETRANDOM (318)
+            assert_eq!(handle_syscall(&mut ctx, state, 318, 0x2000, 32, 0, 0, 0, 0), 32);
+            let mut getrand = [0u8; 32];
+            ctx.mem_read(0x2000, &mut getrand).unwrap();
+
+            // 2. /dev/urandom
+            write_cstr(&mut ctx, 0x2100, "/dev/urandom");
+            let ufd = handle_syscall(&mut ctx, state, 257 /* openat */, -100, 0x2100, 0, 0, 0, 0) as i32;
+            assert!(ufd >= 3);
+            assert_eq!(handle_syscall(&mut ctx, state, 0, ufd as i64, 0x2200, 16, 0, 0, 0), 16);
+            let mut urand = [0u8; 16];
+            ctx.mem_read(0x2200, &mut urand).unwrap();
+
+            // 3. 10 TCP deliver_ns timestamps
+            let (_lfd, cfd, sfd) = m16_make_tcp_pair(&mut ctx, state, true);
+            for i in 0..10u8 {
+                ctx.mem_write(0x2300, &[i]).unwrap();
+                assert_eq!(handle_syscall(&mut ctx, state, 1, cfd as i64, 0x2300, 1, 0, 0, 0), 1);
+            }
+            let sid = state.vfs.get_fd(sfd).unwrap().tcp_socket_id.unwrap();
+            let rpid = match state.vfs.tcp_sockets[&sid].state {
+                crate::vfs::TcpSocketState::Connected { read_pipe_id, .. } => read_pipe_id,
+                _ => panic!("expected Connected"),
+            };
+            let deliver_times: Vec<u64> = state.vfs.pipes[&rpid]
+                .in_flight
+                .iter()
+                .map(|&(t, _)| t)
+                .collect();
+
+            // 4. epoll_wait order across 6 ready eventfds
+            let epfd = handle_syscall(&mut ctx, state, 291, 0, 0, 0, 0, 0, 0) as i32;
+            for i in 0..6u64 {
+                let efd = handle_syscall(&mut ctx, state, 290 /* eventfd2 */, 1, 0, 0, 0, 0, 0) as i32;
+                let mut ev = [0u8; 12];
+                ev[0..4].copy_from_slice(&1u32.to_le_bytes());
+                ev[4..12].copy_from_slice(&(100 + i).to_le_bytes());
+                ctx.mem_write(0x3000, &ev).unwrap();
+                assert_eq!(handle_syscall(&mut ctx, state, 233, epfd as i64, 1, efd as i64, 0x3000, 0, 0), 0);
+            }
+            assert_eq!(handle_syscall(&mut ctx, state, 232, epfd as i64, 0x3100, 6, 0, 0, 0), 6);
+            let mut epoll_order = Vec::with_capacity(6);
+            for i in 0..6usize {
+                let mut ev = [0u8; 12];
+                ctx.mem_read(0x3100 + (i as u64) * 12, &mut ev).unwrap();
+                epoll_order.push(u64::from_le_bytes(ev[4..12].try_into().unwrap()));
+            }
+            (at_rand, getrand, urand, deliver_times, epoll_order)
+        }
+
+        let mut state_a = HostState::new(VirtualFs::new_in_memory(&[]));
+        state_a.set_delay_config(10_000_000, 999);
+        let trace_a1 = run_trace(&mut state_a);
+
+        let mut state_b = HostState::new(VirtualFs::new_in_memory(&[]));
+        state_b.set_delay_config(10_000_000, 999);
+        let trace_b = run_trace(&mut state_b);
+        assert_eq!(trace_a1, trace_b, "identical seeds must produce bit-identical traces");
+
+        // Reset state_a for a new run (like sweep iteration k) -> must match standalone trace exactly
+        state_a.reset_for_new_run();
+        assert_eq!(state_a.scheduler.virtual_mono_ns, 0);
+        assert_eq!(state_a.vfs.uptime_ns, 0);
+        let trace_a2 = run_trace(&mut state_a);
+        assert_eq!(trace_a1, trace_a2, "reset_for_new_run must match fresh standalone run");
+
+        // Different seed must diverge
+        let mut state_c = HostState::new(VirtualFs::new_in_memory(&[]));
+        state_c.set_delay_config(10_000_000, 1000);
+        let trace_c = run_trace(&mut state_c);
+        assert_ne!(trace_a1, trace_c, "different seeds must produce distinct traces");
+    }
+
+    #[test]
+    fn test_m16_cow_vfs_snapshot_restore_drop() {
+        let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+        state.vfs.vfs_write_file("/workspace/app.bin", b"v1", 0o755);
+        state.vfs.vfs_write_file("/workspace/keep.txt", b"orig", 0o644);
+
+        let snap = state.vfs.snapshot_vfs();
+        assert!(snap >= 1);
+
+        // Mutate, delete, and create files
+        state.vfs.vfs_write_file("/workspace/app.bin", b"v2-mutated", 0o755);
+        state.vfs.vfs_remove_path("/workspace/keep.txt");
+        state.vfs.vfs_write_file("/workspace/temp.log", b"dirty", 0o644);
+        assert_eq!(state.vfs.vfs_read_file("/workspace/app.bin").as_deref(), Some(&b"v2-mutated"[..]));
+        assert!(state.vfs.vfs_read_file("/workspace/keep.txt").is_none());
+
+        // Restore reverts all mutations cleanly
+        assert_eq!(state.vfs.restore_vfs(snap), 0);
+        assert_eq!(state.vfs.vfs_read_file("/workspace/app.bin").as_deref(), Some(&b"v1"[..]));
+        assert_eq!(state.vfs.vfs_read_file("/workspace/keep.txt").as_deref(), Some(&b"orig"[..]));
+        assert!(state.vfs.vfs_read_file("/workspace/temp.log").is_none());
+
+        // Snapshot survives reset_for_new_run() and can be restored repeatedly
+        state.vfs.vfs_write_file("/workspace/app.bin", b"v3", 0o755);
+        state.reset_for_new_run();
+        assert_eq!(state.vfs.restore_vfs(snap), 0);
+        assert_eq!(state.vfs.vfs_read_file("/workspace/app.bin").as_deref(), Some(&b"v1"[..]));
+
+        // Dropping snapshot invalidates it
+        assert_eq!(state.vfs.drop_vfs_snapshot(snap), 0);
+        assert_eq!(state.vfs.restore_vfs(snap), -1);
+        assert_eq!(state.vfs.drop_vfs_snapshot(snap), -1);
+
+        // Invalid / zero IDs return -1
+        assert_eq!(state.vfs.restore_vfs(0), -1);
+        assert_eq!(state.vfs.restore_vfs(99999), -1);
+        assert_eq!(state.vfs.drop_vfs_snapshot(0), -1);
+    }
+
+    #[test]
+    fn test_m16_tcp_socket_and_stdin_reset_across_runs() {
+        let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+        let mut ctx = MockCtx::new(0x0B00_0000);
+
+        // Bind explicit port 18080
+        let lfd = handle_syscall(&mut ctx, &mut state, 41, 2, 1, 0, 0, 0, 0) as i32;
+        let mut sa = [0u8; 16];
+        sa[0..2].copy_from_slice(&2u16.to_le_bytes());
+        sa[2..4].copy_from_slice(&18080u16.to_be_bytes());
+        sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        ctx.mem_write(0x1000, &sa).unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 49, lfd as i64, 0x1000, 16, 0, 0, 0), 0);
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 50, lfd as i64, 8, 0, 0, 0, 0), 0);
+
+        // Also open an ephemeral connected pair, push stdin, advance virtual time
+        let _ = m16_make_tcp_pair(&mut ctx, &mut state, true);
+        state.vfs.push_stdin(b"leftover");
+        state.scheduler.virtual_mono_ns = 999_999;
+        state.vfs.uptime_ns = 999_999;
+
+        state.reset_for_new_run();
+
+        assert!(state.vfs.tcp_sockets.is_empty());
+        assert!(state.vfs.tcp_bound_ports.is_empty());
+        assert!(state.vfs.tcp_listeners.is_empty());
+        assert_eq!(state.vfs.next_tcp_socket_id, 1);
+        assert_eq!(state.vfs.next_ephemeral_port, 32768);
+        assert!(state.vfs.stdin_data.is_empty());
+        assert_eq!(state.scheduler.virtual_mono_ns, 0);
+        assert_eq!(state.vfs.uptime_ns, 0);
+
+        // Re-binding port 18080 on the new run must succeed (not -EADDRINUSE)
+        let lfd2 = handle_syscall(&mut ctx, &mut state, 41, 2, 1, 0, 0, 0, 0) as i32;
+        ctx.mem_write(0x1000, &sa).unwrap();
+        assert_eq!(handle_syscall(&mut ctx, &mut state, 49, lfd2 as i64, 0x1000, 16, 0, 0, 0), 0);
+    }
+
+    #[test]
+    fn test_m16_epoll_shuffle_and_run_queue_jitter() {
+        use crate::scheduler::ThreadContext;
+
+        let collect_epoll_order = |stddev_ns: u64, seed: u64| -> Vec<u64> {
+            let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+            state.set_delay_config(stddev_ns, seed);
+            let mut ctx = MockCtx::new(0x0B00_0000);
+            let epfd = handle_syscall(&mut ctx, &mut state, 291, 0, 0, 0, 0, 0, 0) as i32;
+            for i in 0..8u64 {
+                let efd = handle_syscall(&mut ctx, &mut state, 290, 1, 0, 0, 0, 0, 0) as i32;
+                let mut ev = [0u8; 12];
+                ev[0..4].copy_from_slice(&1u32.to_le_bytes());
+                ev[4..12].copy_from_slice(&i.to_le_bytes());
+                ctx.mem_write(0x3000, &ev).unwrap();
+                assert_eq!(handle_syscall(&mut ctx, &mut state, 233, epfd as i64, 1, efd as i64, 0x3000, 0, 0), 0);
+            }
+            assert_eq!(handle_syscall(&mut ctx, &mut state, 232, epfd as i64, 0x3100, 8, 0, 0, 0), 8);
+            let mut out = Vec::with_capacity(8);
+            for i in 0..8usize {
+                let mut ev = [0u8; 12];
+                ctx.mem_read(0x3100 + (i as u64) * 12, &mut ev).unwrap();
+                out.push(u64::from_le_bytes(ev[4..12].try_into().unwrap()));
+            }
+            out
+        };
+
+        let baseline = collect_epoll_order(0, 0);
+        assert_eq!(baseline, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+
+        let shuffled1 = collect_epoll_order(5_000_000, 42);
+        let shuffled2 = collect_epoll_order(5_000_000, 42);
+        assert_eq!(shuffled1, shuffled2);
+        assert_ne!(shuffled1, baseline);
+        let mut sorted = shuffled1.clone();
+        sorted.sort();
+        assert_eq!(sorted, baseline);
+
+        // Scheduler run_queue perturbation
+        let mut sched = crate::scheduler::Scheduler::new();
+        for tid in 2001..=2008 {
+            sched.threads.insert(tid, ThreadContext::new(tid));
+            sched.run_queue.push_back(tid);
+        }
+        let mut rng_state = 0x1234_5678_9abc_def0u64;
+        let mut popped = Vec::new();
+        while let Some(tid) = sched.pop_next_runnable_with_rng(|| crate::syscalls::splitmix64_next(&mut rng_state)) {
+            popped.push(tid);
+        }
+        assert_ne!(popped, (2001..=2008).collect::<Vec<_>>());
+        popped.sort();
+        assert_eq!(popped, (2001..=2008).collect::<Vec<_>>());
+    }
 }

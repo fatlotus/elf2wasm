@@ -226,6 +226,22 @@ impl Scheduler {
         None
     }
 
+    pub fn pop_next_runnable_with_rng<F: FnMut() -> u64>(&mut self, mut next_u64: F) -> Option<i32> {
+        self.run_queue.retain(|tid| {
+            self.threads
+                .get(tid)
+                .map_or(false, |t| t.state == ThreadState::Runnable)
+        });
+        if self.run_queue.is_empty() {
+            return None;
+        }
+        if self.run_queue.len() > 1 {
+            let idx = (next_u64() % (self.run_queue.len() as u64)) as usize;
+            return self.run_queue.remove(idx);
+        }
+        self.run_queue.pop_front()
+    }
+
     pub fn min_wake_ns(&self) -> Option<u64> {
         self.threads
             .values()

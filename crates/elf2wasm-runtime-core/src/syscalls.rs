@@ -3,7 +3,7 @@ use crate::scheduler::{
     PendingWakeup, PollFdSpec, PollKind, Scheduler, ThreadContext, ThreadState, MAIN_PID,
     QUANTUM_TIME_STEP_NS,
 };
-use crate::stack::setup_guest_stack_ctx_with_ids;
+use crate::stack::{setup_guest_stack_ctx_with_ids_and_random, LEGACY_AT_RANDOM};
 use crate::vfs::{
     EpollEntry, FileStat, OpenFile, PipeBuffer, SoEntry, TcpSocket, TcpSocketState, VirtualDevice,
     VirtualFs, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, EACCES, EADDRINUSE, EADDRNOTAVAIL,
@@ -757,6 +757,51 @@ pub enum PendingHostAction {
     },
 }
 
+pub const LEGACY_PRNG_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+
+#[inline]
+pub fn splitmix64_next(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+#[inline]
+fn nonzero_seed(v: u64) -> u64 {
+    if v == 0 {
+        LEGACY_PRNG_SEED
+    } else {
+        v
+    }
+}
+
+#[inline]
+fn xorshift64star_next(state: &mut u64) -> u64 {
+    let mut x = *state;
+    if x == 0 {
+        x = LEGACY_PRNG_SEED;
+    }
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+}
+
+fn pop_runnable_from_scheduler(
+    sched: &mut Scheduler,
+    delay_stddev_ns: u64,
+    delay_rng_state: &mut u64,
+) -> Option<i32> {
+    if delay_stddev_ns > 0 {
+        sched.pop_next_runnable_with_rng(|| xorshift64star_next(delay_rng_state))
+    } else {
+        sched.pop_next_runnable()
+    }
+}
+
 pub struct HostState {
     pub vfs: VirtualFs,
     pub scheduler: Scheduler,
@@ -766,6 +811,10 @@ pub struct HostState {
     pub mmap_end: u32,
     pub mmap_alloc: MmapAllocator,
     pub prng_state: u64,
+    pub delay_stddev_ns: u64,
+    pub delay_seed: u64,
+    pub delay_rng_state: u64,
+    pub seed_configured: bool,
     pub active_pid: i32,
     pub next_pid: i32,
     pub next_tid: i32,
@@ -797,7 +846,11 @@ impl HostState {
             mmap_start: MMAP_START,
             mmap_end: MMAP_END,
             mmap_alloc: MmapAllocator::new(),
-            prng_state: 0x9e37_79b9_7f4a_7c15,
+            prng_state: LEGACY_PRNG_SEED,
+            delay_stddev_ns: 0,
+            delay_seed: 0,
+            delay_rng_state: LEGACY_PRNG_SEED,
+            seed_configured: false,
             active_pid: MAIN_PID,
             next_pid: MAIN_PID + 1,
             next_tid: MAIN_PID + 1,
@@ -813,6 +866,108 @@ impl HostState {
             groups: vec![1000],
             reaped_pids: Vec::new(),
         }
+    }
+
+    pub fn set_delay_config(&mut self, stddev_ns: u64, seed: u64) {
+        self.set_delay_config_explicit(stddev_ns, seed, stddev_ns > 0 || seed != 0);
+    }
+
+    pub fn set_delay_config_explicit(
+        &mut self,
+        stddev_ns: u64,
+        seed: u64,
+        seed_configured: bool,
+    ) {
+        self.delay_stddev_ns = stddev_ns;
+        self.delay_seed = seed;
+        self.seed_configured = seed_configured || stddev_ns > 0;
+        self.apply_prng_seeds();
+    }
+
+    pub fn apply_prng_seeds(&mut self) {
+        if self.delay_stddev_ns == 0 && !self.seed_configured {
+            self.vfs.prng_state = LEGACY_PRNG_SEED;
+            self.prng_state = LEGACY_PRNG_SEED;
+            self.delay_rng_state = LEGACY_PRNG_SEED;
+        } else {
+            let mut sm = self.delay_seed;
+            let vfs_seed = nonzero_seed(splitmix64_next(&mut sm));
+            let delay_seed = nonzero_seed(splitmix64_next(&mut sm));
+            self.vfs.prng_state = vfs_seed;
+            self.prng_state = vfs_seed;
+            self.delay_rng_state = delay_seed;
+        }
+    }
+
+    /// Deterministic 16-byte AT_RANDOM derived independently from `delay_seed`
+    /// without mutating `vfs.prng_state` or `delay_rng_state`.
+    pub fn at_random_bytes(&self) -> [u8; 16] {
+        if self.delay_stddev_ns == 0 && !self.seed_configured {
+            return LEGACY_AT_RANDOM;
+        }
+        let mut sm = self.delay_seed;
+        let _ = splitmix64_next(&mut sm); // stream 1: vfs.prng_state
+        let _ = splitmix64_next(&mut sm); // stream 2: delay_rng_state
+        let lo = splitmix64_next(&mut sm);
+        let hi = splitmix64_next(&mut sm);
+        let mut out = [0u8; 16];
+        out[0..8].copy_from_slice(&lo.to_le_bytes());
+        out[8..16].copy_from_slice(&hi.to_le_bytes());
+        out
+    }
+
+    pub fn next_delay_u64(&mut self) -> u64 {
+        xorshift64star_next(&mut self.delay_rng_state)
+    }
+
+    /// Sample a non-negative delay from half-normal `|N(0, delay_stddev_ns^2)|`
+    /// using Box-Muller on 53-bit uniforms, clamped to `[0, delay_stddev_ns.saturating_mul(10)]`.
+    pub fn sample_delay_ns(&mut self) -> u64 {
+        if self.delay_stddev_ns == 0 {
+            return 0;
+        }
+        const INV_2_53: f64 = 1.0 / ((1u64 << 53) as f64);
+        let r1 = self.next_delay_u64() >> 11;
+        let r2 = self.next_delay_u64() >> 11;
+        let u1 = ((r1 as f64) + 0.5) * INV_2_53;
+        let u2 = (r2 as f64) * INV_2_53;
+        let z = (-2.0 * u1.ln()).sqrt() * (core::f64::consts::TAU * u2).cos();
+        let abs_z = z.abs();
+        let max_ns = self.delay_stddev_ns.saturating_mul(10);
+        if !abs_z.is_finite() {
+            return max_ns;
+        }
+        let scaled = (abs_z * (self.delay_stddev_ns as f64)).round();
+        if scaled <= 0.0 {
+            0
+        } else if scaled >= (max_ns as f64) {
+            max_ns
+        } else {
+            scaled as u64
+        }
+    }
+
+    pub fn reset_virtual_time(&mut self) {
+        self.scheduler.virtual_mono_ns = 0;
+        self.vfs.uptime_ns = 0;
+        for p in self.processes.values_mut() {
+            p.scheduler.virtual_mono_ns = 0;
+        }
+    }
+
+    pub fn min_in_flight_ns(&self) -> Option<u64> {
+        self.vfs.min_in_flight_ns()
+    }
+
+    pub fn flush_in_flight_pipes(&mut self, now_ns: u64) -> bool {
+        let flushed = self.vfs.flush_in_flight_pipes(now_ns);
+        for &(pipe_id, became_eof) in &flushed {
+            self.wake_pipe_waiters(pipe_id, PipeEvent::Write);
+            if became_eof {
+                self.wake_pipe_waiters(pipe_id, PipeEvent::Close);
+            }
+        }
+        !flushed.is_empty()
     }
 
     pub fn apply_meta_layout(&mut self, meta: &WasmMeta) {
@@ -1187,6 +1342,19 @@ impl HostState {
         self.processes.get(&MAIN_PID).map_or(false, |p| p.exited)
     }
 
+    pub fn main_exit_code(&self) -> Option<i32> {
+        let p = self.processes.get(&MAIN_PID)?;
+        if !p.exited {
+            return None;
+        }
+        let sig = p.exit_status & 0x7f;
+        if sig != 0 {
+            Some(128 + sig)
+        } else {
+            Some((p.exit_status >> 8) & 0xff)
+        }
+    }
+
     pub fn current_ppid(&self) -> i32 {
         self.processes
             .get(&self.active_pid)
@@ -1330,11 +1498,11 @@ impl HostState {
             PipeEvent::Write => (POLLIN as u16, 0),
             PipeEvent::Read { was_full } => (0, if was_full { POLLOUT as u16 } else { 0 }),
             PipeEvent::Close => {
-                let (writers, readers) = match self.vfs.pipes.get(&pipe_id) {
-                    Some(p) => (p.writers, p.readers),
-                    None => (0, 0),
+                let (is_eof, readers) = match self.vfs.pipes.get(&pipe_id) {
+                    Some(p) => (p.is_eof(), p.readers),
+                    None => (true, 0),
                 };
-                let rmask = if writers == 0 {
+                let rmask = if is_eof {
                     (POLLHUP | POLLIN | POLLRDHUP) as u16
                 } else {
                     0
@@ -1352,16 +1520,46 @@ impl HostState {
         }
         let mut fd_masks: Vec<(i32, u16)> = Vec::new();
         let tcp_sockets = &self.vfs.tcp_sockets;
+        let pipes = &self.vfs.pipes;
+        let is_close = matches!(event, PipeEvent::Close);
         let mut collect_from = |fds: &BTreeMap<i32, OpenFile>| {
             for (&fd, f) in fds {
-                let (is_read_end, is_write_end) = if let Some(sid) = f.tcp_socket_id {
-                    match tcp_sockets.get(&sid).map(|s| &s.state) {
-                        Some(TcpSocketState::Connected {
-                            read_pipe_id,
-                            write_pipe_id,
-                            ..
-                        }) => (*read_pipe_id == pipe_id, *write_pipe_id == pipe_id),
-                        _ => (false, false),
+                let mut mask = 0u16;
+                if let Some(sid) = f.tcp_socket_id {
+                    if let Some(TcpSocketState::Connected {
+                        read_pipe_id,
+                        write_pipe_id,
+                        shut_rd,
+                        shut_wr,
+                        ..
+                    }) = tcp_sockets.get(&sid).map(|s| &s.state)
+                    {
+                        if *read_pipe_id == pipe_id {
+                            mask |= read_clear_mask;
+                            // When the read pipe transitions to EOF after draining in-flight
+                            // chunks, also rearm any deferred write-side close events if the
+                            // peer already closed its read end (write_pipe_id.readers == 0).
+                            if is_close && read_clear_mask != 0 && !*shut_wr {
+                                let write_peer_closed = pipes
+                                    .get(write_pipe_id)
+                                    .map_or(true, |p| p.readers == 0);
+                                if write_peer_closed {
+                                    mask |= (POLLERR | POLLOUT | POLLHUP) as u16;
+                                }
+                            }
+                        }
+                        if *write_pipe_id == pipe_id {
+                            // Do not prematurely rearm write-side close events while the
+                            // socket's read pipe still has undelivered in-flight chunks.
+                            let defer_close = is_close
+                                && !*shut_rd
+                                && pipes
+                                    .get(read_pipe_id)
+                                    .map_or(false, |p| !p.in_flight.is_empty());
+                            if !defer_close {
+                                mask |= write_clear_mask;
+                            }
+                        }
                     }
                 } else {
                     let is_r = f.pipe_id == Some(pipe_id)
@@ -1370,14 +1568,12 @@ impl HostState {
                         || (f.pipe_id == Some(pipe_id)
                             && f.writable
                             && f.sock_write_pipe_id.is_none());
-                    (is_r, is_w)
-                };
-                let mut mask = 0u16;
-                if is_read_end {
-                    mask |= read_clear_mask;
-                }
-                if is_write_end {
-                    mask |= write_clear_mask;
+                    if is_r {
+                        mask |= read_clear_mask;
+                    }
+                    if is_w {
+                        mask |= write_clear_mask;
+                    }
                 }
                 if mask != 0 {
                     fd_masks.push((fd, mask));
@@ -1429,9 +1625,14 @@ impl HostState {
 
     fn wake_pipe_waiters(&mut self, pipe_id: u64, event: PipeEvent) {
         self.rearm_epoll_for_pipe(pipe_id, event);
-        let (has_data, writers, readers, has_space) = match self.vfs.pipes.get(&pipe_id) {
-            Some(p) => (!p.buf.is_empty(), p.writers, p.readers, p.buf.len() < p.capacity),
-            None => (false, 0, 0, false),
+        let (has_data, is_eof, readers, has_space) = match self.vfs.pipes.get(&pipe_id) {
+            Some(p) => (
+                !p.buf.is_empty(),
+                p.is_eof(),
+                p.readers,
+                p.total_buffered() < p.capacity,
+            ),
+            None => (false, true, 0, false),
         };
         let wake_in_sched = |sched: &mut Scheduler| {
             let tids: Vec<i32> = sched.threads.keys().copied().collect();
@@ -1442,7 +1643,7 @@ impl HostState {
                             pipe_id: pid,
                             buf_addr,
                             count,
-                        } if pid == pipe_id && (has_data || writers == 0) => {
+                        } if pid == pipe_id && (has_data || is_eof) => {
                             t.state = ThreadState::Runnable;
                             t.pending_wakeup = Some(PendingWakeup::PipeRead {
                                 pipe_id,
@@ -1511,17 +1712,17 @@ impl HostState {
                     ..
                 } => {
                     let mut revents = 0i16;
-                    let peer_wr_closed = if *shut_rd {
-                        true
+                    let (peer_wr_closed, read_has_in_flight) = if *shut_rd {
+                        (true, false)
                     } else {
                         match self.vfs.pipes.get(read_pipe_id) {
                             Some(p) => {
                                 if !p.buf.is_empty() && (events & POLLIN) != 0 {
                                     revents |= POLLIN;
                                 }
-                                p.writers == 0
+                                (p.is_eof(), !p.in_flight.is_empty())
                             }
-                            None => true,
+                            None => (true, false),
                         }
                     };
                     if peer_wr_closed {
@@ -1538,21 +1739,34 @@ impl HostState {
                         match self.vfs.pipes.get(write_pipe_id) {
                             Some(p) => {
                                 if p.readers == 0 {
-                                    revents |= POLLERR;
-                                    if (events & POLLOUT) != 0 {
-                                        revents |= POLLOUT;
+                                    if !read_has_in_flight {
+                                        revents |= POLLERR;
+                                        if (events & POLLOUT) != 0 {
+                                            revents |= POLLOUT;
+                                        }
+                                        true
+                                    } else {
+                                        if p.total_buffered() < p.capacity
+                                            && (events & POLLOUT) != 0
+                                        {
+                                            revents |= POLLOUT;
+                                        }
+                                        false
                                     }
-                                    true
                                 } else {
-                                    if p.buf.len() < p.capacity && (events & POLLOUT) != 0 {
+                                    if p.total_buffered() < p.capacity && (events & POLLOUT) != 0 {
                                         revents |= POLLOUT;
                                     }
                                     false
                                 }
                             }
                             None => {
-                                revents |= POLLERR;
-                                true
+                                if !read_has_in_flight {
+                                    revents |= POLLERR;
+                                    true
+                                } else {
+                                    false
+                                }
                             }
                         }
                     };
@@ -1578,7 +1792,7 @@ impl HostState {
                         if !p.buf.is_empty() && (events & POLLIN) != 0 {
                             revents |= POLLIN;
                         }
-                        if p.writers == 0 {
+                        if p.is_eof() {
                             revents |= POLLHUP;
                         }
                     }
@@ -1589,7 +1803,7 @@ impl HostState {
                 Some(p) => {
                     if p.readers == 0 {
                         revents |= POLLERR;
-                    } else if p.buf.len() < p.capacity && (events & POLLOUT) != 0 {
+                    } else if p.total_buffered() < p.capacity && (events & POLLOUT) != 0 {
                         revents |= POLLOUT;
                     }
                 }
@@ -1618,13 +1832,13 @@ impl HostState {
                 if !p.buf.is_empty() && (events & POLLIN) != 0 {
                     revents |= POLLIN;
                 }
-                if p.writers == 0 {
+                if p.is_eof() {
                     revents |= POLLHUP;
                 }
             } else {
                 if p.readers == 0 {
                     revents |= POLLERR;
-                } else if p.buf.len() < p.capacity && (events & POLLOUT) != 0 {
+                } else if p.total_buffered() < p.capacity && (events & POLLOUT) != 0 {
                     revents |= POLLOUT;
                 }
             }
@@ -1821,7 +2035,7 @@ impl HostState {
                         count,
                     } => {
                         let ready = match self.vfs.pipes.get(&pipe_id) {
-                            Some(p) => !p.buf.is_empty() || p.writers == 0,
+                            Some(p) => !p.buf.is_empty() || p.is_eof(),
                             None => true,
                         };
                         if ready {
@@ -1840,7 +2054,7 @@ impl HostState {
                         written,
                     } => {
                         let ready = match self.vfs.pipes.get(&pipe_id) {
-                            Some(p) => p.readers == 0 || p.buf.len() < p.capacity,
+                            Some(p) => p.readers == 0 || p.total_buffered() < p.capacity,
                             None => true,
                         };
                         if ready {
@@ -1989,11 +2203,11 @@ impl HostState {
                 count,
             } => {
                 let mut drained = Vec::new();
-                let mut writers = 0usize;
+                let mut is_eof = true;
                 let mut was_full = false;
                 if let Some(p) = self.vfs.pipes.get_mut(&pipe_id) {
-                    writers = p.writers;
-                    was_full = p.buf.len() >= p.capacity;
+                    is_eof = p.is_eof();
+                    was_full = p.total_buffered() >= p.capacity;
                     let n = count.min(p.buf.len());
                     drained.reserve(n);
                     for _ in 0..n {
@@ -2002,7 +2216,7 @@ impl HostState {
                         }
                     }
                 }
-                if drained.is_empty() && writers > 0 {
+                if drained.is_empty() && !is_eof {
                     if let Some(t) = self.scheduler.threads.get_mut(&cur_tid) {
                         t.state = ThreadState::PipeReadWait {
                             pipe_id,
@@ -2031,31 +2245,70 @@ impl HostState {
                 data,
                 written,
             } => {
-                let ret = match self.vfs.pipes.get_mut(&pipe_id) {
-                    None => -EPIPE,
+                enum WritePlan {
+                    Err(i64),
+                    Reblock,
+                    Write { n: usize, is_tcp: bool },
+                }
+                let plan = match self.vfs.pipes.get(&pipe_id) {
+                    None => WritePlan::Err(-EPIPE),
                     Some(p) if p.readers == 0 => {
                         if written > 0 {
-                            written as i64
+                            WritePlan::Err(written as i64)
                         } else {
-                            -EPIPE
+                            WritePlan::Err(-EPIPE)
                         }
                     }
                     Some(p) => {
-                        let space = p.capacity.saturating_sub(p.buf.len());
+                        let space = p.capacity.saturating_sub(p.total_buffered());
                         if space == 0 {
-                            if let Some(t) = self.scheduler.threads.get_mut(&cur_tid) {
-                                t.state = ThreadState::PipeWriteWait {
-                                    pipe_id,
-                                    data,
-                                    written,
-                                };
+                            WritePlan::Reblock
+                        } else {
+                            let rem = data.len().saturating_sub(written);
+                            let n = rem.min(space);
+                            WritePlan::Write {
+                                n,
+                                is_tcp: p.is_tcp,
                             }
-                            return Ok(false);
                         }
-                        let rem = data.len().saturating_sub(written);
-                        let n = rem.min(space);
-                        p.buf.extend(&data[written..written + n]);
-                        self.wake_pipe_waiters(pipe_id, PipeEvent::Write);
+                    }
+                };
+                let ret = match plan {
+                    WritePlan::Err(e) => e,
+                    WritePlan::Reblock => {
+                        if let Some(t) = self.scheduler.threads.get_mut(&cur_tid) {
+                            t.state = ThreadState::PipeWriteWait {
+                                pipe_id,
+                                data,
+                                written,
+                            };
+                        }
+                        return Ok(false);
+                    }
+                    WritePlan::Write { n, is_tcp } => {
+                        let use_delay = is_tcp && self.delay_stddev_ns > 0 && n > 0;
+                        let delay_ns = if use_delay {
+                            self.sample_delay_ns()
+                        } else {
+                            0
+                        };
+                        let mono_now = self.scheduler.virtual_mono_ns;
+                        let mut wake_now = false;
+                        if let Some(p) = self.vfs.pipes.get_mut(&pipe_id) {
+                            if use_delay && (delay_ns > 0 || !p.in_flight.is_empty()) {
+                                p.push_in_flight(
+                                    mono_now,
+                                    delay_ns,
+                                    data[written..written + n].to_vec(),
+                                );
+                            } else {
+                                p.buf.extend(&data[written..written + n]);
+                                wake_now = true;
+                            }
+                        }
+                        if wake_now {
+                            self.wake_pipe_waiters(pipe_id, PipeEvent::Write);
+                        }
                         (written + n) as i64
                     }
                 };
@@ -2284,7 +2537,7 @@ impl HostState {
                 let Some(eid) = self.vfs.fds.get(epfd).and_then(|f| f.epoll_id) else {
                     return -EBADF;
                 };
-                let evaluated: Vec<(i32, u32, u64, u16, u16)> = {
+                let mut evaluated: Vec<(i32, u32, u64, u16, u16)> = {
                     let Some(inst) = self.vfs.epolls.get(&eid) else {
                         return -EBADF;
                     };
@@ -2298,6 +2551,12 @@ impl HostState {
                         })
                         .collect()
                 };
+                if self.delay_stddev_ns > 0 && evaluated.len() > 1 {
+                    for i in (1..evaluated.len()).rev() {
+                        let j = (self.next_delay_u64() % ((i + 1) as u64)) as usize;
+                        evaluated.swap(i, j);
+                    }
+                }
                 let mut count = 0usize;
                 let mut updates: Vec<(i32, u16)> = Vec::new();
                 for (fd, events, data, rev_u16, last_reported) in evaluated {
@@ -2346,6 +2605,9 @@ impl HostState {
 
     pub fn has_expired_timed_waiter(&self) -> bool {
         let now_ns = self.scheduler.virtual_mono_ns;
+        if self.min_in_flight_ns().map_or(false, |t| t <= now_ns) {
+            return true;
+        }
         if self.scheduler.min_wake_ns().map_or(false, |w| w <= now_ns) {
             return true;
         }
@@ -2358,6 +2620,7 @@ impl HostState {
 
     pub fn wake_expired_timed_waiters(&mut self) {
         let now_ns = self.scheduler.virtual_mono_ns;
+        self.flush_in_flight_pipes(now_ns);
         self.scheduler.wake_timed_waiters(now_ns);
         let active_pid = self.active_pid;
         for (&pid, p) in self.processes.iter_mut() {
@@ -2413,6 +2676,7 @@ impl HostState {
                 .scheduler
                 .virtual_mono_ns
                 .saturating_add(QUANTUM_TIME_STEP_NS);
+            self.vfs.uptime_ns = self.scheduler.virtual_mono_ns;
             self.wake_expired_timed_waiters();
             let other_runnable = self.processes.iter().any(|(&pid, p)| {
                 pid != self.active_pid
@@ -2464,7 +2728,11 @@ impl HostState {
                 .get(&self.active_pid)
                 .map_or(false, |p| p.exited)
             {
-                if let Some(next_tid) = self.scheduler.pop_next_runnable() {
+                if let Some(next_tid) = pop_runnable_from_scheduler(
+                    &mut self.scheduler,
+                    self.delay_stddev_ns,
+                    &mut self.delay_rng_state,
+                ) {
                     if preempt_cur {
                         self.scheduler.run_queue.push_back(self.scheduler.current_tid);
                         preempt_cur = false;
@@ -2495,7 +2763,11 @@ impl HostState {
                 }
                 if let Some(p) = self.processes.get_mut(&pid) {
                     if !p.exited {
-                        if let Some(tid) = p.scheduler.pop_next_runnable() {
+                        if let Some(tid) = pop_runnable_from_scheduler(
+                            &mut p.scheduler,
+                            self.delay_stddev_ns,
+                            &mut self.delay_rng_state,
+                        ) {
                             chosen = Some((pid, tid));
                             break;
                         }
@@ -2526,7 +2798,7 @@ impl HostState {
                 preempt_cur = false;
             }
 
-            // Fast-forward virtual time to earliest timer across all non-exited processes
+            // Fast-forward virtual time to earliest timer or in-flight packet across all non-exited processes
             let mut min_wake = if !self
                 .processes
                 .get(&self.active_pid)
@@ -2542,6 +2814,9 @@ impl HostState {
                         min_wake = Some(min_wake.map_or(w, |m| m.min(w)));
                     }
                 }
+            }
+            if let Some(t) = self.min_in_flight_ns() {
+                min_wake = Some(min_wake.map_or(t, |m| m.min(t)));
             }
 
             let Some(target_ns) = min_wake else {
@@ -2561,6 +2836,11 @@ impl HostState {
                 return Ok(0);
             };
             let now_ns = self.scheduler.virtual_mono_ns.max(target_ns);
+            self.scheduler.virtual_mono_ns = now_ns;
+            self.vfs.uptime_ns = now_ns;
+            // Flush in-flight packets BEFORE waking timed waiters so packets arriving at
+            // the exact timeout wake PollWait with timed_out=false rather than timing out.
+            self.flush_in_flight_pipes(now_ns);
             self.scheduler.wake_timed_waiters(now_ns);
             let active_pid = self.active_pid;
             for (&pid, p) in self.processes.iter_mut() {
@@ -2604,7 +2884,11 @@ impl HostState {
             .get(&cur_tid)
             .map_or(false, |t| t.state == ThreadState::Runnable);
         if !cur_runnable {
-            if let Some(next_tid) = self.scheduler.pop_next_runnable() {
+            if let Some(next_tid) = pop_runnable_from_scheduler(
+                &mut self.scheduler,
+                self.delay_stddev_ns,
+                &mut self.delay_rng_state,
+            ) {
                 self.scheduler.current_tid = next_tid;
             } else {
                 ctx.set_yield_flag(1);
@@ -2666,8 +2950,11 @@ impl HostState {
         self.scheduler = Scheduler::new_with_tid(pid, mono, rt_base);
         self.scheduler.scratch_addr = mmap_alloc_end;
 
-        let rsp = setup_guest_stack_ctx_with_ids(ctx, meta, args, env, self.uid, self.gid)
-            .map_err(|_| -ENOMEM)?;
+        let at_random = self.at_random_bytes();
+        let rsp = setup_guest_stack_ctx_with_ids_and_random(
+            ctx, meta, args, env, self.uid, self.gid, at_random,
+        )
+        .map_err(|_| -ENOMEM)?;
         ctx.set_rsp(rsp as i64);
         ctx.set_rip(meta.entry_rip as i64);
         ctx.set_yield_flag(0);
@@ -2676,7 +2963,6 @@ impl HostState {
     }
 
     pub fn reset_for_new_run(&mut self) {
-        let mono = self.scheduler.virtual_mono_ns;
         let rt_base = self.scheduler.realtime_base_ns;
         self.active_pid = MAIN_PID;
         self.next_pid = MAIN_PID + 1;
@@ -2696,14 +2982,16 @@ impl HostState {
         self.mmap_start = MMAP_START;
         self.mmap_end = MMAP_END;
         self.mmap_alloc = MmapAllocator::new();
-        self.scheduler = Scheduler::new_with_tid(MAIN_PID, mono, rt_base);
+        self.scheduler = Scheduler::new_with_tid(MAIN_PID, 0, rt_base);
         self.vfs.reset_fds_and_stdio();
+        self.vfs.uptime_ns = 0;
         self.vfs.stdin_eof = !(self.tty.enabled || self.stdin_open);
         self.vfs.current_pid = MAIN_PID;
         self.vfs.current_ppid = 1;
         self.vfs.current_pgid = MAIN_PID;
         self.vfs.uid = self.uid;
         self.vfs.gid = self.gid;
+        self.apply_prng_seeds();
     }
 }
 
@@ -2799,6 +3087,7 @@ pub fn handle_syscall(
 ) -> i64 {
     state.scheduler.advance_syscall_time();
     state.vfs.uptime_ns = state.scheduler.virtual_mono_ns;
+    state.flush_in_flight_pipes(state.scheduler.virtual_mono_ns);
     let ret = handle_syscall_inner(ctx, state, nr, a0, a1, a2, a3, a4, a5);
     if ctx.trace_enabled() {
         ctx.trace_log(&format!(
@@ -2847,9 +3136,9 @@ fn read_into_guest(
             if count == 0 {
                 return 0;
             }
-            let (drained, writers, was_full) = match state.vfs.pipes.get_mut(&pipe_id) {
+            let (drained, is_eof, was_full) = match state.vfs.pipes.get_mut(&pipe_id) {
                 Some(p) => {
-                    let was_full = p.buf.len() >= p.capacity;
+                    let was_full = p.total_buffered() >= p.capacity;
                     let n = count.min(p.buf.len());
                     let mut d = Vec::with_capacity(n);
                     for _ in 0..n {
@@ -2857,9 +3146,9 @@ fn read_into_guest(
                             d.push(b);
                         }
                     }
-                    (d, p.writers, was_full)
+                    (d, p.is_eof(), was_full)
                 }
-                None => (Vec::new(), 0, false),
+                None => (Vec::new(), true, false),
             };
             if !drained.is_empty() {
                 if let Err(e) = write_bytes(ctx, buf_addr, &drained) {
@@ -2868,7 +3157,7 @@ fn read_into_guest(
                 state.wake_pipe_waiters(pipe_id, PipeEvent::Read { was_full });
                 return drained.len() as i64;
             }
-            if writers == 0 {
+            if is_eof {
                 return 0;
             }
             if f.nonblock {
@@ -2975,9 +3264,9 @@ fn readv_into_guest(
                 if tcp_read_pipe.is_none() && f.writable && f.sock_write_pipe_id.is_none() {
                     return -EBADF;
                 }
-                let (drained, writers, was_full) = match state.vfs.pipes.get_mut(&pipe_id) {
+                let (drained, is_eof, was_full) = match state.vfs.pipes.get_mut(&pipe_id) {
                     Some(p) => {
-                        let was_full = p.buf.len() >= p.capacity;
+                        let was_full = p.total_buffered() >= p.capacity;
                         let n = len.min(p.buf.len());
                         let mut d = Vec::with_capacity(n);
                         for _ in 0..n {
@@ -2985,9 +3274,9 @@ fn readv_into_guest(
                                 d.push(b);
                             }
                         }
-                        (d, p.writers, was_full)
+                        (d, p.is_eof(), was_full)
                     }
-                    None => (Vec::new(), 0, false),
+                    None => (Vec::new(), true, false),
                 };
                 if !drained.is_empty() {
                     if let Err(e) = write_bytes(ctx, base, &drained) {
@@ -3000,7 +3289,7 @@ fn readv_into_guest(
                     }
                     continue;
                 }
-                if total_read > 0 || writers == 0 {
+                if total_read > 0 || is_eof {
                     break;
                 }
                 if f.nonblock {
@@ -4578,8 +4867,8 @@ fn handle_syscall_inner(
             state.vfs.next_pipe_id += 1;
             let s2c_pipe = state.vfs.next_pipe_id;
             state.vfs.next_pipe_id += 1;
-            state.vfs.pipes.insert(c2s_pipe, PipeBuffer::new());
-            state.vfs.pipes.insert(s2c_pipe, PipeBuffer::new());
+            state.vfs.pipes.insert(c2s_pipe, PipeBuffer::new_tcp());
+            state.vfs.pipes.insert(s2c_pipe, PipeBuffer::new_tcp());
 
             let server_sid = state.vfs.next_tcp_socket_id;
             state.vfs.next_tcp_socket_id += 1;
@@ -4895,6 +5184,10 @@ fn handle_syscall_inner(
                             let mut remove = false;
                             if let Some(p) = state.vfs.pipes.get_mut(&rpid) {
                                 p.readers = p.readers.saturating_sub(1);
+                                if p.readers == 0 {
+                                    p.in_flight.clear();
+                                    p.in_flight_bytes = 0;
+                                }
                                 if p.readers == 0 && p.writers == 0 {
                                     remove = true;
                                 }
@@ -5636,6 +5929,19 @@ fn handle_syscall_inner(
                 FIONREAD => {
                     let avail: i32 = if f.is_std == Some(0) || f.dev == Some(VirtualDevice::Tty) {
                         state.vfs.stdin_available().min(i32::MAX as usize) as i32
+                    } else if let Some(sid) = f.tcp_socket_id {
+                        match state.vfs.tcp_sockets.get(&sid).map(|s| &s.state) {
+                            Some(TcpSocketState::Connected {
+                                read_pipe_id,
+                                shut_rd: false,
+                                ..
+                            }) => state
+                                .vfs
+                                .pipes
+                                .get(read_pipe_id)
+                                .map_or(0, |p| p.buf.len().min(i32::MAX as usize) as i32),
+                            _ => 0,
+                        }
                     } else if let Some(pid) = f.pipe_id {
                         state
                             .vfs
@@ -5987,24 +6293,43 @@ fn write_fd_data(
             if bytes.is_empty() {
                 return 0;
             }
-            let res = match state.vfs.pipes.get_mut(&pipe_id) {
+            let is_tcp_delayed = f.tcp_socket_id.is_some() && state.delay_stddev_ns > 0;
+            let space_res = match state.vfs.pipes.get(&pipe_id) {
                 None => Err(-EPIPE),
                 Some(p) if p.readers == 0 => Err(-EPIPE),
                 Some(p) => {
-                    let space = p.capacity.saturating_sub(p.buf.len());
+                    let space = p.capacity.saturating_sub(p.total_buffered());
                     if space > 0 {
-                        let n = bytes.len().min(space);
-                        p.buf.extend(&bytes[..n]);
-                        Ok(Some(n))
+                        Ok(Some(bytes.len().min(space)))
                     } else {
                         Ok(None)
                     }
                 }
             };
-            return match res {
+            return match space_res {
                 Err(e) => e,
                 Ok(Some(n)) => {
-                    state.wake_pipe_waiters(pipe_id, PipeEvent::Write);
+                    if is_tcp_delayed {
+                        let d = state.sample_delay_ns();
+                        let mono_now = state.scheduler.virtual_mono_ns;
+                        let mut delivered_immediately = false;
+                        if let Some(p) = state.vfs.pipes.get_mut(&pipe_id) {
+                            if d == 0 && p.in_flight.is_empty() {
+                                p.buf.extend(&bytes[..n]);
+                                delivered_immediately = true;
+                            } else {
+                                p.push_in_flight(mono_now, d, bytes[..n].to_vec());
+                            }
+                        }
+                        if delivered_immediately {
+                            state.wake_pipe_waiters(pipe_id, PipeEvent::Write);
+                        }
+                    } else {
+                        if let Some(p) = state.vfs.pipes.get_mut(&pipe_id) {
+                            p.buf.extend(&bytes[..n]);
+                        }
+                        state.wake_pipe_waiters(pipe_id, PipeEvent::Write);
+                    }
                     n as i64
                 }
                 Ok(None) => {
@@ -7612,6 +7937,36 @@ mod tests {
             handle_syscall(&mut ctx, &mut state, SYS_TIME, oob, 0, 0, 0, 0, 0),
             -EFAULT
         );
+    }
+
+    #[test]
+    fn test_main_exit_code_sigkill_from_child_and_normal_exit() {
+        let mut ctx = MockGuestContext::new(64 * 1024, 64 * 1024);
+        let mut state = make_state();
+        assert_eq!(state.main_exit_code(), None);
+
+        // Simulate a forked child process becoming active and sending SIGKILL to MAIN_PID.
+        let child_pid = state.alloc_pid();
+        let mut child_proc = ProcessState::empty_slot(child_pid, MAIN_PID, MAIN_PID, MAIN_PID);
+        child_proc.scheduler = Scheduler::new();
+        state.processes.insert(child_pid, child_proc);
+        state.switch_active_process(child_pid);
+        assert_eq!(state.active_pid, child_pid);
+
+        let ret = handle_syscall(&mut ctx, &mut state, SYS_KILL, MAIN_PID as i64, 9, 0, 0, 0, 0);
+        assert_eq!(ret, 0);
+        assert!(state.is_main_exited());
+        assert_eq!(state.main_exit_code(), Some(137));
+
+        // Normal exit (42 << 8) returns Some(42).
+        let mut normal_state = make_state();
+        assert_eq!(normal_state.main_exit_code(), None);
+        if let Some(main_proc) = normal_state.processes.get_mut(&MAIN_PID) {
+            main_proc.exited = true;
+            main_proc.exit_status = 42 << 8;
+        }
+        assert!(normal_state.is_main_exited());
+        assert_eq!(normal_state.main_exit_code(), Some(42));
     }
 }
 

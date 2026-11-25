@@ -144,6 +144,9 @@ pub enum OverlayNode {
 #[derive(Debug, Clone)]
 pub struct PipeBuffer {
     pub buf: VecDeque<u8>,
+    pub in_flight: VecDeque<(u64, Vec<u8>)>,
+    pub in_flight_bytes: usize,
+    pub is_tcp: bool,
     pub readers: usize,
     pub writers: usize,
     pub capacity: usize,
@@ -153,10 +156,63 @@ impl PipeBuffer {
     pub fn new() -> Self {
         Self {
             buf: VecDeque::new(),
+            in_flight: VecDeque::new(),
+            in_flight_bytes: 0,
+            is_tcp: false,
             readers: 1,
             writers: 1,
             capacity: PIPE_CAPACITY,
         }
+    }
+
+    pub fn new_tcp() -> Self {
+        let mut p = Self::new();
+        p.is_tcp = true;
+        p
+    }
+
+    /// Total bytes buffered (already delivered + currently in-flight).
+    #[inline]
+    pub fn total_buffered(&self) -> usize {
+        self.buf.len().saturating_add(self.in_flight_bytes)
+    }
+
+    /// True only when all writers are closed AND all in-flight bytes have been delivered.
+    #[inline]
+    pub fn is_eof(&self) -> bool {
+        self.writers == 0 && self.in_flight.is_empty()
+    }
+
+    /// Enqueue bytes for simulated-time delivery while strictly preserving per-pipe FIFO.
+    pub fn push_in_flight(&mut self, now_ns: u64, delay_ns: u64, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        let target = now_ns.saturating_add(delay_ns);
+        let deliver_ns = self
+            .in_flight
+            .back()
+            .map_or(target, |&(prev_ns, _)| prev_ns.max(target));
+        self.in_flight_bytes = self.in_flight_bytes.saturating_add(bytes.len());
+        self.in_flight.push_back((deliver_ns, bytes));
+    }
+
+    /// Move all in-flight chunks with `deliver_ns <= now_ns` into `self.buf`.
+    /// Returns `(delivered_any, became_eof)`.
+    pub fn flush_in_flight(&mut self, now_ns: u64) -> (bool, bool) {
+        let mut delivered = false;
+        while let Some(&(deliver_ns, _)) = self.in_flight.front() {
+            if deliver_ns > now_ns {
+                break;
+            }
+            if let Some((_, chunk)) = self.in_flight.pop_front() {
+                self.in_flight_bytes = self.in_flight_bytes.saturating_sub(chunk.len());
+                self.buf.extend(chunk);
+                delivered = true;
+            }
+        }
+        let became_eof = delivered && self.writers == 0 && self.in_flight.is_empty();
+        (delivered, became_eof)
     }
 }
 
@@ -368,6 +424,8 @@ pub struct VirtualFs {
     pub cmdline: Vec<String>,
     pub uptime_ns: u64,
     pub umask: u32,
+    snapshots: BTreeMap<u32, BTreeMap<String, OverlayNode>>,
+    next_snapshot_id: u32,
 }
 
 impl VirtualFs {
@@ -463,6 +521,8 @@ impl VirtualFs {
             cmdline: Vec::new(),
             uptime_ns: 0,
             umask: 0o022,
+            snapshots: BTreeMap::new(),
+            next_snapshot_id: 1,
         }
     }
 
@@ -512,6 +572,76 @@ impl VirtualFs {
         out
     }
 
+    pub fn snapshot_vfs(&mut self) -> u32 {
+        let mut id = self.next_snapshot_id;
+        if id == 0 {
+            id = 1;
+        }
+        while self.snapshots.contains_key(&id) {
+            id = id.wrapping_add(1);
+            if id == 0 {
+                id = 1;
+            }
+        }
+        self.next_snapshot_id = id.wrapping_add(1);
+        if self.next_snapshot_id == 0 {
+            self.next_snapshot_id = 1;
+        }
+        self.snapshots.insert(id, self.overlay.clone());
+        id
+    }
+
+    pub fn restore_vfs(&mut self, snapshot_id: u32) -> i32 {
+        if snapshot_id == 0 {
+            return -1;
+        }
+        let Some(snap) = self.snapshots.get(&snapshot_id) else {
+            return -1;
+        };
+        self.overlay = snap.clone();
+        0
+    }
+
+    pub fn drop_vfs_snapshot(&mut self, snapshot_id: u32) -> i32 {
+        if snapshot_id == 0 {
+            return -1;
+        }
+        if self.snapshots.remove(&snapshot_id).is_some() {
+            0
+        } else {
+            -1
+        }
+    }
+
+    /// Earliest scheduled delivery timestamp among all pipes with an open reader.
+    pub fn min_in_flight_ns(&self) -> Option<u64> {
+        self.pipes
+            .values()
+            .filter(|p| p.readers > 0)
+            .filter_map(|p| p.in_flight.front().map(|&(deliver_ns, _)| deliver_ns))
+            .min()
+    }
+
+    /// Deliver all in-flight pipe chunks with `deliver_ns <= now_ns` into `p.buf`.
+    /// Returns `(pipe_id, became_eof)` for each pipe that delivered bytes.
+    pub fn flush_in_flight_pipes(&mut self, now_ns: u64) -> Vec<(u64, bool)> {
+        let mut flushed = Vec::new();
+        for (&pipe_id, p) in self.pipes.iter_mut() {
+            if p.readers == 0 {
+                if !p.in_flight.is_empty() {
+                    p.in_flight.clear();
+                    p.in_flight_bytes = 0;
+                }
+                continue;
+            }
+            let (delivered, became_eof) = p.flush_in_flight(now_ns);
+            if delivered {
+                flushed.push((pipe_id, became_eof));
+            }
+        }
+        flushed
+    }
+
     pub fn reset_fds_and_stdio(&mut self) {
         self.pipes.clear();
         self.next_pipe_id = 1;
@@ -519,6 +649,11 @@ impl VirtualFs {
         self.next_epoll_id = 1;
         self.eventfds.clear();
         self.next_eventfd_id = 1;
+        self.tcp_sockets.clear();
+        self.next_tcp_socket_id = 1;
+        self.tcp_bound_ports.clear();
+        self.tcp_listeners.clear();
+        self.next_ephemeral_port = 32768;
         self.fds.clear();
         let empty = Arc::new(Vec::new());
         for (fd, path, writable) in [
@@ -537,6 +672,7 @@ impl VirtualFs {
         self.stderr.clear();
         self.stdout_drain_cursor = 0;
         self.stderr_drain_cursor = 0;
+        self.stdin_data.clear();
         self.stdin_cursor = 0;
         self.umask = 0o022;
     }
@@ -1583,6 +1719,10 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
                     let mut remove = false;
                     if let Some(p) = self.pipes.get_mut(&read_pipe_id) {
                         p.readers = p.readers.saturating_sub(1);
+                        if p.readers == 0 {
+                            p.in_flight.clear();
+                            p.in_flight_bytes = 0;
+                        }
                         if p.readers == 0 && p.writers == 0 {
                             remove = true;
                         }
@@ -1624,6 +1764,10 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
                 let mut remove = false;
                 if let Some(p) = self.pipes.get_mut(&rpid) {
                     p.readers = p.readers.saturating_sub(1);
+                    if p.readers == 0 {
+                        p.in_flight.clear();
+                        p.in_flight_bytes = 0;
+                    }
                     if p.readers == 0 && p.writers == 0 {
                         remove = true;
                     }
@@ -1653,6 +1797,10 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse
                     p.writers = p.writers.saturating_sub(1);
                 } else {
                     p.readers = p.readers.saturating_sub(1);
+                    if p.readers == 0 {
+                        p.in_flight.clear();
+                        p.in_flight_bytes = 0;
+                    }
                 }
                 if p.readers == 0 && p.writers == 0 {
                     remove_pipe = true;

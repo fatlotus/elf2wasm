@@ -10,6 +10,8 @@ pub struct RunConfig {
     pub vfs_ro: Vec<(std::path::PathBuf, String)>,
     pub stdin: Vec<u8>,
     pub inherit_stdin: bool,
+    pub delay_stddev_ns: u64,
+    pub delay_seed: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +117,10 @@ pub fn setup_guest_stack_ctx(
     setup_guest_stack_ctx_with_ids(ctx, meta, args, env, 1000, 1000)
 }
 
+pub const LEGACY_AT_RANDOM: [u8; 16] = [
+    0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09,
+];
+
 pub fn setup_guest_stack_ctx_with_ids(
     ctx: &mut dyn GuestContext,
     meta: &WasmMeta,
@@ -123,16 +129,24 @@ pub fn setup_guest_stack_ctx_with_ids(
     uid: u32,
     gid: u32,
 ) -> Result<u32> {
+    setup_guest_stack_ctx_with_ids_and_random(ctx, meta, args, env, uid, gid, LEGACY_AT_RANDOM)
+}
+
+pub fn setup_guest_stack_ctx_with_ids_and_random(
+    ctx: &mut dyn GuestContext,
+    meta: &WasmMeta,
+    args: &[String],
+    env: &[String],
+    uid: u32,
+    gid: u32,
+    at_random: [u8; 16],
+) -> Result<u32> {
     let stack_min = meta.mmap_end;
     let mut sp = meta.stack_top;
 
-    let rand_bytes: [u8; 16] = [
-        0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8,
-        0x09,
-    ];
-    let _random_addr = push_bytes_ctx(ctx, &mut sp, stack_min, &rand_bytes)?;
+    let _random_addr = push_bytes_ctx(ctx, &mut sp, stack_min, &at_random)?;
     sp &= !0xF;
-    ctx.mem_write(sp as u64, &rand_bytes)
+    ctx.mem_write(sp as u64, &at_random)
         .map_err(|e| anyhow::anyhow!("mem_write failed for AT_RANDOM: {}", e))?;
     let random_addr = sp;
 
@@ -230,6 +244,15 @@ pub fn setup_guest_stack_ctx_with_ids(
 }
 
 pub fn setup_guest_stack(mem: &mut [u8], meta: &WasmMeta, config: &RunConfig) -> Result<u32> {
+    setup_guest_stack_with_random(mem, meta, config, LEGACY_AT_RANDOM)
+}
+
+pub fn setup_guest_stack_with_random(
+    mem: &mut [u8],
+    meta: &WasmMeta,
+    config: &RunConfig,
+    at_random: [u8; 16],
+) -> Result<u32> {
     struct SliceCtx<'a>(&'a mut [u8]);
     impl<'a> GuestContext for SliceCtx<'a> {
         fn mem_len(&self) -> usize {
@@ -299,5 +322,13 @@ pub fn setup_guest_stack(mem: &mut [u8], meta: &WasmMeta, config: &RunConfig) ->
         }
     }
     let mut sctx = SliceCtx(mem);
-    setup_guest_stack_ctx(&mut sctx, meta, &config.args, &config.env)
+    setup_guest_stack_ctx_with_ids_and_random(
+        &mut sctx,
+        meta,
+        &config.args,
+        &config.env,
+        1000,
+        1000,
+        at_random,
+    )
 }
