@@ -1096,6 +1096,10 @@ impl<'a> Lifter<'a> {
             Mnemonic::Nop
             | Mnemonic::Endbr64
             | Mnemonic::Endbr32
+            | Mnemonic::Rdsspq
+            | Mnemonic::Rdsspd
+            | Mnemonic::Incsspq
+            | Mnemonic::Incsspd
             | Mnemonic::Pause
             | Mnemonic::Sfence
             | Mnemonic::Lfence
