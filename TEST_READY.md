@@ -90,3 +90,50 @@ For strictly offline verification (skipping live Docker Hub & GitHub scenarios `
 ```bash
 node e2e_docker_web/run_all.mjs --tier all --skip-live --verbose
 ```
+
+---
+
+## Delay Injection, Build/Run Split & Sweep Mode E2E Ready (F41 — M19 Gate)
+
+The requirement-driven, **opaque-box** 4-tier E2E test suite for **Deterministic Simulated-Time Delay Injection, Build/Run Command Split, Sweep Mode, and Linkable Sweep / Per-Run URLs** (Feature F41, Contracts §11–§13) is complete and verified (**60 E2E tests across Tiers 1–4 + 6 harness self-tests**), preserving 100% of all prior `e2e_docker_web/` suites and helpers untouched.
+
+### Deliverables
+- **Specification**: `TEST_INFRA.md` (Section 7)
+- **Dedicated Runner**: `e2e_docker_web/run_delay_sweep_e2e.mjs` (`--tier <1|2|3|4|all>`, `--self-test`, `--skip-live`, `--verbose`, `--json <file>`, `--help`; exit codes `0` pass, `1` test failure, `2` prereq/CLI error)
+- **Shared Fixtures & Helpers**: `e2e_docker_web/delay_sweep_helpers.mjs` (cached static x86-64 C TCP/epoll/clock/nanosleep probe compiled via `gcc -O2 -static`, mock OCI image `delay-sweep/probe-alpine:v1`, mock Git repo `acme/sweep-proj`, Chrome CDP DOM/sweep wait helpers, and 6 harness self-tests `DS-ST-1`..`DS-ST-6`)
+- **Tier 1 (`e2e_docker_web/test_delay_sweep_tier1.mjs`, 26 tests)**:
+  - Delay Injection & Simulated Time (`DS-T1.1.1`–`DS-T1.1.7`): bit-for-bit determinism across SDK/exec/CLI, seed/stddev perturbation, large simulated delay (`stddev=5000ms`) fast wall-clock execution with `virtualTimeNs` advance, `stddev=0` baseline, JS + native CLI (`translate` -> `run`) flags.
+  - Build vs Run Split (`DS-T1.2.1`–`DS-T1.2.6`): build runs once at `stddev=0`, post-build VFS snapshot preservation, clean snapshot isolation across runs, failed build aborts before sweep (`runs: []`, `passed: false`), relative `./prog` in `cwd`, manual `snapshotVfs`/`restoreVfs`/`dropVfsSnapshot`.
+  - Sweep Mode (`DS-T1.3.1`–`DS-T1.3.6`): passing sweep with `round3(stddevStart + i * stddevStep)` & `seedStart + i`, immediate stop on first failure, callback ordering (`onBuildOutput`/`onRunStart`/`onRunOutput`/`onRunComplete`), standalone bit-for-bit reproduction of failing sweep run.
+  - URL Linking (`DS-T1.4.1`–`DS-T1.4.7`): `parseStateFromSearch`/`serializeStateToSearch` sweep round-trip, `computeSweepRunParams`, `buildRunSearch` standalone reproducer URL, Chrome CDP sweep & single-run hydration without auto-boot, backward compatibility with exact `ORIGINAL_REQUEST.md` `?cmd=` URL, `go-raft-nodice` preset chip.
+- **Tier 2 (`e2e_docker_web/test_delay_sweep_tier2.mjs`, 26 tests)**:
+  - Delay Injection boundaries (`DS-T2.1.1`–`DS-T2.1.7`): `stddev=0` + non-zero seed, fractional `0.001`/`0.5` ms, large `60000` ms, `seed=0`, `Number.MAX_SAFE_INTEGER`, negative/`NaN`/`Infinity` handling, CLI invalid flag rejection.
+  - Build/Run Split boundaries (`DS-T2.2.1`–`DS-T2.2.6`): omitted/empty `buildCmd` (`skipped: true`), custom `env`/`cwd`, nested dirs + symlinks, self-deleting run artifact, missing build binary, invalid `snapshotId`.
+  - Sweep Mode boundaries (`DS-T2.3.1`–`DS-T2.3.6`): `runs=1`, `stddevStart=0` + `stddevStep=0`, failure on run 1, failure on run `N`, `stopOnFailure: false`, `AbortSignal` cancellation + per-run `timeoutMs`.
+  - URL Linking boundaries (`DS-T2.4.1`–`DS-T2.4.7`): `?run=` read alias & canonical `cmd=` precedence, default omission, unmanaged param + `#hash` preservation, invalid/negative/`NaN` query sanitization, `selectedRun` bounds, XSS payload immunity in Chrome CDP, plain `.preset-chip` reset compatibility.
+- **Tier 3 (`e2e_docker_web/test_delay_sweep_tier3.mjs`, 5 offline pairwise tests)**:
+  - `T3-DS-1`: Build/Run split + Sweep + Clean Snapshot Isolation + Standalone Deterministic Reproduction.
+  - `T3-DS-2`: Git Repo Overlay (mock git server) + Build/Run Split + relative `./app` `cwd` + Sweep + Failed-Build Abort.
+  - `T3-DS-3`: Chrome CDP Sweep URL hydration -> `#sweep-panel` / `#sweep-results-body` row click (`selectedRun` URL sync) -> `<a class="run-link">` standalone reproducer navigation & exact reproduction.
+  - `T3-DS-4`: `button.project-preset-chip[data-preset="go-raft-nodice"]` URL/reload hydration vs plain `.preset-chip` reset.
+  - `T3-DS-5`: Backward-compatible `?cmd=` / `?run=` coexistence, `#copy-sweep-link-btn`, and `popstate` transitions.
+- **Tier 4 (`e2e_docker_web/test_delay_sweep_tier4.mjs`, 3 real-world scenarios)**:
+  - `T4-DS-1` (offline): Realistic multi-connection TCP loopback concurrency race sweep with `SLEEP_MS=15000` (`ELAPSED_NS >= 15_000_000_000n`, strict `sweepWallMs < totalSimMs`) + standalone deterministic reproduction.
+  - `T4-DS-2` (offline): Full Chrome CDP sweep-to-reproducer user journey with Git repo overlay & Dedicated Web Worker verification.
+  - `T4-DS-3` (live, skipped only via `--skip-live`): Real `ghcr.io/fatlotus/golang-with-cache:1.27-alpine` + `fatlotus/nodice` (`/workspace/example`, `buildCmd: ["go", "build"]`, `runCmd: ["./raft"]`) sweep finding `INVARIANT VIOLATION (Committed Log Truncation Race)` with build-once, immediate stop-on-failure, simulated time (`virtualTimeNs > 0`), and standalone deterministic reproduction of the exact failing `(stddevMs, seed)`.
+
+### M19 Execution Commands
+Once M16–M18 are complete, verify harness + all 4 tiers:
+```bash
+node e2e_docker_web/run_delay_sweep_e2e.mjs --self-test --verbose
+node e2e_docker_web/run_delay_sweep_e2e.mjs --tier 1 --verbose
+node e2e_docker_web/run_delay_sweep_e2e.mjs --tier 2 --verbose
+node e2e_docker_web/run_delay_sweep_e2e.mjs --tier 3 --verbose
+node e2e_docker_web/run_delay_sweep_e2e.mjs --tier 4 --verbose
+```
+
+Or run all 4 tiers in one command (add `--skip-live` for strictly offline verification skipping `T4-DS-3`):
+```bash
+node e2e_docker_web/run_delay_sweep_e2e.mjs --tier all --verbose
+```
+

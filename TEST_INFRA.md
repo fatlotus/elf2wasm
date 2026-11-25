@@ -106,3 +106,52 @@ node e2e_docker_web/run_all.mjs --tier all --verbose
    - `node:22-slim`: `180s` cold-compile budget (38.5 MiB `.text` ELF + 232 MB rootfs), `< 30s` warm startup (`T2.21`).
    - Heavy Chrome scenarios launch fresh browser instances sequentially so Alpine, Python, and Node WASM heaps never coexist across scenarios.
 5. **Hardened vs Local-Mock Server Isolation**: SSRF tests (`T2.3`, `T2.23`) and live Docker Hub / GitHub scenarios (`T4.5`, `T4.9`, `T4.12`, `T4.13`) spawn `server/server.mjs` **without** `--allow-local-registries`; offline mock-registry & mock-git-server tests spawn a separate ephemeral-port server **with** `--allow-local-registries`.
+
+---
+
+## 7. F41 — Delay Injection, Build/Run Split, Sweep Mode & Linkable Runs E2E Suite
+
+Derived strictly from `ORIGINAL_REQUEST.md` and `PROJECT.md` Interface Contracts §11–§13 (Features F36–F41). All tests are **strictly opaque-box**, interacting exclusively through public interfaces (`js/docker_sdk.mjs`, `js/cli.mjs`, native `elf2wasm` CLI, `web/url_state.mjs`, `server/server.mjs`, and headless Google Chrome CDP driving `web/index.html`).
+
+### 7.1 Additional Files
+```text
+e2e_docker_web/
+├── run_delay_sweep_e2e.mjs       # Dedicated F41 CLI runner (--tier 1|2|3|4|all, --self-test, --skip-live, --verbose, --json, --help)
+├── delay_sweep_helpers.mjs       # Cached static x86-64 C TCP/epoll/clock probe (gcc -O2 -static), mock OCI/Git fixtures, CDP DOM helpers & 6 self-tests (DS-ST-1..DS-ST-6)
+├── test_delay_sweep_tier1.mjs    # Tier 1: Feature Coverage — 26 tests (DS-T1.1.1..DS-T1.4.7; 6-7 tests per requirement area)
+├── test_delay_sweep_tier2.mjs    # Tier 2: Boundary & Corner Cases — 26 tests (DS-T2.1.1..DS-T2.4.7; 6-7 tests per requirement area)
+├── test_delay_sweep_tier3.mjs    # Tier 3: Cross-Feature Pairwise Combinations — 5 offline tests (T3-DS-1..T3-DS-5)
+└── test_delay_sweep_tier4.mjs    # Tier 4: Real-World Scenarios — 3 tests (T4-DS-1 offline TCP race, T4-DS-2 offline Chrome CDP sweep-to-repro, T4-DS-3 live fatlotus/nodice Raft bug discovery)
+```
+
+### 7.2 Running the F41 Suite
+```bash
+# Harness, static C probe, mock OCI/Git & Chrome CDP self-test (independent of M16-M18)
+node e2e_docker_web/run_delay_sweep_e2e.mjs --self-test --verbose
+
+# Per-tier execution (after M16-M18 build .wasm + SDK + Web UI)
+node e2e_docker_web/run_delay_sweep_e2e.mjs --tier 1 --verbose
+node e2e_docker_web/run_delay_sweep_e2e.mjs --tier 2 --verbose
+node e2e_docker_web/run_delay_sweep_e2e.mjs --tier 3 --verbose
+node e2e_docker_web/run_delay_sweep_e2e.mjs --tier 4 --verbose
+
+# Offline-only full run (skips live GHCR + GitHub T4-DS-3 only)
+node e2e_docker_web/run_delay_sweep_e2e.mjs --tier all --skip-live --verbose
+```
+Exit codes match `run_all.mjs`: `0` (all passed), `1` (test failures), `2` (missing prerequisites / CLI usage error).
+
+### 7.3 Unified Offline Probe Fixture (`tcp_delay_probe`)
+`delay_sweep_helpers.mjs` compiles and caches a compact static x86-64 C ELF64 binary (`gcc -O2 -static`) in `/tmp/elf2wasm-e2e-cache/delay-sweep/` that exercises real non-blocking IPv4 TCP loopback (`127.0.0.1:0`), `epoll_pwait`, `CLOCK_MONOTONIC`, `nanosleep`, and `/dev/urandom`:
+- `--mode=timing`: Measures monotonic elapsed ns across loopback TCP round-trips + seeded `/dev/urandom` output (`ELAPSED_NS=`, `RAND_HEX=`).
+- `--mode=reorder` / `--mode=race`: Sends tagged messages across `K=6` independent non-blocking loopback TCP sockets and collects arrival order via `epoll_pwait` (`ORDER=1,2,3,4,5,6` at `stddev=0` -> PASS; out-of-order under `stddev > 0` -> `INVARIANT_VIOLATION` exit `1`), with optional `REQUIRE_BUILD_LOG`, `DIRTY_MARKER`, and `SLEEP_MS` guards.
+- `--mode=fail-above --threshold-ms=<T>`: Passes below simulated-time threshold, exits `1` (`THRESHOLD_EXCEEDED`) above threshold.
+- `--mode=sleep` / `--mode=hang`: Simulated-time `nanosleep` and timeout/cancellation probes.
+
+### 7.4 F41 Requirement Traceability (60 Tests Total)
+| Requirement Area | Tier 1 (Feature Coverage) | Tier 2 (Boundaries) | Tier 3 (Combinations) | Tier 4 (Real-World Scenarios) |
+|---|---|---|---|---|
+| **1. Deterministic Delay Injection & Simulated Time** (`F36`, `F37`, Contract §11–§12) | `DS-T1.1.1`–`DS-T1.1.7` (7) | `DS-T2.1.1`–`DS-T2.1.7` (7) | `T3-DS-1`, `T3-DS-3` | `T4-DS-1`, `T4-DS-2`, `T4-DS-3` |
+| **2. Build vs Run Command Split & CoW Snapshots** (`F37`, `F38`, Contract §11–§12) | `DS-T1.2.1`–`DS-T1.2.6` (6) | `DS-T2.2.1`–`DS-T2.2.6` (6) | `T3-DS-1`, `T3-DS-2`, `T3-DS-4` | `T4-DS-1`, `T4-DS-2`, `T4-DS-3` |
+| **3. Sweep Mode & Stop-on-First-Failure** (`F38`, `F40`, Contract §12–§13) | `DS-T1.3.1`–`DS-T1.3.6` (6) | `DS-T2.3.1`–`DS-T2.3.6` (6) | `T3-DS-1`, `T3-DS-2`, `T3-DS-3` | `T4-DS-1`, `T4-DS-2`, `T4-DS-3` |
+| **4. URL Linking for Sweep & Specific Runs** (`F39`, `F40`, Contract §13) | `DS-T1.4.1`–`DS-T1.4.7` (7) | `DS-T2.4.1`–`DS-T2.4.7` (7) | `T3-DS-3`, `T3-DS-4`, `T3-DS-5` | `T4-DS-2` |
+
