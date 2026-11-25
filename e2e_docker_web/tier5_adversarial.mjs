@@ -965,7 +965,7 @@ export async function runTier5(opts = {}) {
         new Request("https://elf2wasm.workers.dev/api/git/archive?repo=octocat/Hello-World#frag")
       );
       assert.equal(rFrag1.status, 200);
-      assert.equal(seenUrls[0], "https://github.com/octocat/Hello-World/archive/HEAD.tar.gz");
+      assert.equal(seenUrls[0], "https://codeload.github.com/octocat/Hello-World/tar.gz/HEAD");
       assert.equal(
         rFrag1.headers.get("vary"),
         "Origin",
@@ -978,7 +978,7 @@ export async function runTier5(opts = {}) {
         )
       );
       assert.equal(rFrag2.status, 200);
-      assert.equal(seenUrls[1], "https://github.com/octocat/Hello-World/archive/main.tar.gz");
+      assert.equal(seenUrls[1], "https://codeload.github.com/octocat/Hello-World/tar.gz/main");
     }
   );
 

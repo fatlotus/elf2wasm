@@ -825,16 +825,18 @@ export async function runTier4(opts = {}) {
         assert.ok(imageNames.includes(expectedImg), `Missing preserved image preset ${expectedImg}`);
       }
 
-      // 2. 3 Project Test Presets covering Python, JavaScript, and Rust
+      // 2. 4 Project Test Presets covering Python, JavaScript, Rust, and Go
       const projectChips = await browser.getProjectPresetChips();
-      assert.equal(projectChips.length, 3, `Expected 3 project preset chips, got ${JSON.stringify(projectChips)}`);
+      assert.equal(projectChips.length, 4, `Expected 4 project preset chips, got ${JSON.stringify(projectChips)}`);
 
       const ecosystemDescriptions = [];
       for (const chip of projectChips) {
         const populated = await browser.clickProjectPresetChip(chip.preset);
         assert.ok(populated.image.trim().length > 0, `Preset ${chip.preset}: image must be non-empty`);
         assert.ok(populated.repo.trim().length > 0, `Preset ${chip.preset}: repo must be non-empty`);
-        assert.ok(populated.ref.trim().length > 0, `Preset ${chip.preset}: ref must be non-empty`);
+        if (chip.preset !== "go-raft-nodice") {
+          assert.ok(populated.ref.trim().length > 0, `Preset ${chip.preset}: ref must be non-empty`);
+        }
         assert.ok(
           populated.mountPath.startsWith("/"),
           `Preset ${chip.preset}: mountPath must start with "/" (got ${JSON.stringify(populated.mountPath)})`
@@ -848,6 +850,7 @@ export async function runTier4(opts = {}) {
       assert.ok(ecosystemDescriptions.some((d) => /python/i.test(d)), "Expected Python project preset");
       assert.ok(ecosystemDescriptions.some((d) => /javascript|node|\bjs\b/i.test(d)), "Expected JavaScript project preset");
       assert.ok(ecosystemDescriptions.some((d) => /rust|cargo|nushell|\bnu\b/i.test(d)), "Expected Rust project preset");
+      assert.ok(ecosystemDescriptions.some((d) => /\bgo\b|golang|raft/i.test(d)), "Expected Go project preset");
 
       // 3. Dirty fields and click plain alpine:latest .preset-chip -> Contract §10 full reset
       await browser.setInputValue("#cwd-input", "/dirty/cwd");
@@ -932,7 +935,7 @@ export async function runTier4(opts = {}) {
     }
   });
 
-  suite.add("T4.13", "Live execution of all 3 dynamically discovered .project-preset-chip Project Test Presets (Python, JavaScript, Rust) on hardened server", async () => {
+  suite.add("T4.13", "Live execution of all 4 dynamically discovered .project-preset-chip Project Test Presets (Python, JavaScript, Rust, Go) on hardened server", async () => {
     if (skipLive) {
       skip("skipped via --skip-live");
     }
@@ -941,7 +944,7 @@ export async function runTier4(opts = {}) {
     try {
       const hardenedOrigin = new URL(hardenedServer.url).origin;
 
-      // Discovery Phase: inspect the 3 .project-preset-chip buttons dynamically from the DOM
+      // Discovery Phase: inspect the 4 .project-preset-chip buttons dynamically from the DOM
       let presets = [];
       const discoveryBrowser = await launchCdpBrowser();
       try {
@@ -954,8 +957,8 @@ export async function runTier4(opts = {}) {
 
       assert.equal(
         presets.length,
-        3,
-        `Expected 3 dynamically discovered .project-preset-chip buttons, got ${JSON.stringify(presets)}`
+        4,
+        `Expected 4 dynamically discovered .project-preset-chip buttons, got ${JSON.stringify(presets)}`
       );
 
       // Sequential Isolated Execution Phase: fresh browser per preset so WASM heaps never coexist
@@ -969,7 +972,9 @@ export async function runTier4(opts = {}) {
           const fields = await browser.clickProjectPresetChip(preset.preset);
           assert.ok(fields.image.trim().length > 0, `Live preset ${preset.preset}: empty #image-input`);
           assert.ok(fields.repo.trim().length > 0, `Live preset ${preset.preset}: empty #repo-input`);
-          assert.ok(fields.ref.trim().length > 0, `Live preset ${preset.preset}: empty #repo-ref-input`);
+          if (preset.preset !== "go-raft-nodice") {
+            assert.ok(fields.ref.trim().length > 0, `Live preset ${preset.preset}: empty #repo-ref-input`);
+          }
           assert.ok(fields.mountPath.startsWith("/"), `Live preset ${preset.preset}: invalid #repo-mount-input`);
           assert.ok(fields.cmd.trim().length > 0, `Live preset ${preset.preset}: empty #cmd-input`);
 
@@ -982,7 +987,7 @@ export async function runTier4(opts = {}) {
           assert.equal(
             exitRes.exitCode,
             0,
-            `Live preset ${preset.preset} (${fields.repo}@${fields.ref}) exited with code ${exitRes.exitCode} (#status-text=${exitRes.statusText})\n${exitRes.term.slice(-800)}`
+            `Live preset ${preset.preset} (${fields.repo}@${fields.ref || "HEAD"}) exited with code ${exitRes.exitCode} (#status-text=${exitRes.statusText})\n${exitRes.term.slice(-800)}`
           );
           assert.ok(
             exitRes.term.trim().length > 0,

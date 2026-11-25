@@ -919,7 +919,7 @@ export async function runTier1(opts = {}) {
     );
   });
 
-  suite.add("T1.9.4", "GET / exposes Git repo overlay controls & 3 project test presets while preserving all 5 image presets", async () => {
+  suite.add("T1.9.4", "GET / exposes Git repo overlay controls & 4 project test presets while preserving all 5 image presets", async () => {
     const resp = await fetch(`${server.url}/`);
     assert.equal(resp.status, 200);
     assertCoopCoep(resp.headers, "GET /");
@@ -937,7 +937,7 @@ export async function runTier1(opts = {}) {
 
     const projectPresetMatches = [...html.matchAll(/class="[^"]*\bproject-preset-chip\b[^"]*"[^>]*data-preset="([^"]+)"|data-preset="([^"]+)"[^>]*class="[^"]*\bproject-preset-chip\b[^"]*"/g)];
     const presetIds = new Set(projectPresetMatches.map((m) => m[1] || m[2]).filter(Boolean));
-    assert.ok(presetIds.size >= 3, `Expected at least 3 distinct .project-preset-chip[data-preset] buttons, found ${presetIds.size}`);
+    assert.equal(presetIds.size, 4, `Expected 4 distinct .project-preset-chip[data-preset] buttons, found ${presetIds.size}`);
 
     for (const img of ["alpine:latest", "busybox:latest", "debian:bookworm-slim", "python:3.12-slim", "node:22-slim"]) {
       assertIncludes(html, `data-image="${img}"`, `Existing image preset ${img} must be preserved`);
@@ -961,9 +961,9 @@ export async function runTier1(opts = {}) {
       assert.equal(await browser.getInputValue("#repo-ref-input"), "");
 
       const projectChips = await browser.getProjectPresetChips();
-      assert.equal(projectChips.length, 3, `Expected 3 .project-preset-chip buttons, got ${JSON.stringify(projectChips)}`);
+      assert.equal(projectChips.length, 4, `Expected 4 .project-preset-chip buttons, got ${JSON.stringify(projectChips)}`);
       const uniqueIds = new Set(projectChips.map((c) => c.preset).filter(Boolean));
-      assert.equal(uniqueIds.size, 3, "All 3 project presets must have distinct data-preset values");
+      assert.equal(uniqueIds.size, 4, "All 4 project presets must have distinct data-preset values");
 
       const combinedDescriptions = [];
       for (const chip of projectChips) {
@@ -980,6 +980,7 @@ export async function runTier1(opts = {}) {
       assert.ok(combinedDescriptions.some((d) => /python/i.test(d)), "Project presets must include a Python project");
       assert.ok(combinedDescriptions.some((d) => /javascript|node|\bjs\b/i.test(d)), "Project presets must include a JavaScript project");
       assert.ok(combinedDescriptions.some((d) => /rust|cargo|nushell|\bnu\b/i.test(d)), "Project presets must include a Rust project");
+      assert.ok(combinedDescriptions.some((d) => /\bgo\b|golang|raft/i.test(d)), "Project presets must include a Go project");
 
       // Clicking a plain image .preset-chip must clear repo/cmd/cwd/env and restore /workspace
       await browser.clickPresetChip("alpine:latest");
