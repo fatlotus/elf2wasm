@@ -14,10 +14,44 @@ const DEFAULT_RUNTIME = path.resolve(
   "../target/wasm32-unknown-unknown/release/elf2wasm_runtime_wasm.wasm"
 );
 
+function parseDelayStddevMs(raw) {
+  if (raw === undefined || typeof raw !== "string" || raw.trim() === "") {
+    throw new Error(`Invalid --delay-stddev-ms '${raw ?? ""}': must be a finite non-negative number`);
+  }
+  const val = Number(raw);
+  if (!Number.isFinite(val) || val < 0) {
+    throw new Error(`Invalid --delay-stddev-ms '${raw}': must be a finite non-negative number`);
+  }
+  const MAX_STDDEV_NS = 1844674407370955161n; // u64::MAX / 10
+  if (val > 1_844_674_407_370 || BigInt(Math.round(val * 1e6)) > MAX_STDDEV_NS) {
+    throw new Error(
+      `Invalid --delay-stddev-ms '${raw}': exceeds maximum supported delay`
+    );
+  }
+  return val;
+}
+
+function parseDelaySeed(raw) {
+  if (raw === undefined || typeof raw !== "string" || raw.trim() === "") {
+    throw new Error(`Invalid --delay-seed '${raw ?? ""}': must be a non-negative integer`);
+  }
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(`Invalid --delay-seed '${raw}': must be a non-negative integer`);
+  }
+  const seedBig = BigInt(trimmed);
+  if (seedBig > 0xffff_ffff_ffff_ffffn) {
+    throw new Error(
+      `Invalid --delay-seed '${raw}': exceeds 64-bit unsigned integer range`
+    );
+  }
+  return seedBig;
+}
+
 function parseArgs(argv) {
   if (argv.length === 0) {
     throw new Error(
-      "Usage: cli.mjs <compile|run> --elf <path> [--so <path>...] [--vfs-ro <host:guest>...] [--out <out.wasm>] [-- <args...>]"
+      "Usage: cli.mjs <compile|run> --elf <path> [--so <path>...] [--vfs-ro <host:guest>...] [--out <out.wasm>] [--delay-stddev-ms <ms>] [--delay-seed <int>] [-- <args...>]"
     );
   }
   const subcmd = argv[0];
@@ -28,6 +62,8 @@ function parseArgs(argv) {
     vfsRo: [],
     vfsRw: [],
     args: [],
+    delayStddevMs: undefined,
+    delaySeed: undefined,
   };
   let i = 1;
   while (i < argv.length) {
@@ -36,38 +72,64 @@ function parseArgs(argv) {
       opts.args = argv.slice(i + 1);
       break;
     }
-    switch (tok) {
+    let flag = tok;
+    let inlineVal;
+    const eqIdx = tok.indexOf("=");
+    if (tok.startsWith("--") && eqIdx > 2) {
+      flag = tok.slice(0, eqIdx);
+      inlineVal = tok.slice(eqIdx + 1);
+    }
+    const nextVal = () => {
+      if (inlineVal !== undefined) return inlineVal;
+      if (i + 1 >= argv.length) {
+        throw new Error(`Missing value for option: ${flag}`);
+      }
+      return argv[++i];
+    };
+    switch (flag) {
       case "--compiler":
-        opts.compiler = argv[++i];
+        opts.compiler = nextVal();
         break;
       case "--runtime":
-        opts.runtime = argv[++i];
+        opts.runtime = nextVal();
         break;
       case "--elf":
-        opts.elf = argv[++i];
+        opts.elf = nextVal();
         break;
       case "--out":
-        opts.out = argv[++i];
+        opts.out = nextVal();
         break;
       case "--so":
-        opts.so.push(argv[++i]);
+        opts.so.push(nextVal());
         break;
       case "--vfs-ro": {
-        const spec = argv[++i];
+        const spec = nextVal();
         const idx = spec.indexOf(":");
         opts.vfsRo.push({ hostPath: spec.slice(0, idx), guestPath: spec.slice(idx + 1) });
         break;
       }
       case "--vfs-rw": {
-        const spec = argv[++i];
+        const spec = nextVal();
         const idx = spec.indexOf(":");
         opts.vfsRw.push({ hostPath: spec.slice(0, idx), guestPath: spec.slice(idx + 1) });
         break;
       }
+      case "--delay-stddev-ms":
+        opts.delayStddevMs = parseDelayStddevMs(nextVal());
+        break;
+      case "--delay-seed":
+        opts.delaySeed = parseDelaySeed(nextVal());
+        break;
       default:
         throw new Error(`Unknown option: ${tok}`);
     }
     i++;
+  }
+  if (
+    subcmd === "compile" &&
+    (opts.delayStddevMs !== undefined || opts.delaySeed !== undefined)
+  ) {
+    throw new Error("--delay-stddev-ms and --delay-seed are only supported for 'run'");
   }
   return { subcmd, opts };
 }
@@ -100,6 +162,8 @@ async function main() {
       args: [opts.elf, ...opts.args],
       vfsRo: opts.vfsRo,
       vfsRw: opts.vfsRw,
+      delayStddevMs: opts.delayStddevMs,
+      delaySeed: opts.delaySeed,
     });
     if (res.stdout.length > 0) process.stdout.write(Buffer.from(res.stdout));
     if (res.stderr.length > 0) process.stderr.write(Buffer.from(res.stderr));

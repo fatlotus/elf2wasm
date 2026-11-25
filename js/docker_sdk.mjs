@@ -7,7 +7,7 @@
  * execution in Node.js (or when `useWorker: false`).
  */
 
-import { Elf2WasmSystem, extractTarToVfs } from "./elf2wasm_shim.mjs";
+import { Elf2WasmSystem, extractTarToVfs, validateDelayConfig } from "./elf2wasm_shim.mjs";
 import {
   parseImageRef,
   pullImage as ociPullImage,
@@ -33,9 +33,31 @@ function toUint8Array(input) {
 
 function normalizeCmdArray(val) {
   if (val === null || val === undefined) return [];
-  if (typeof val === "string") return [val];
+  if (typeof val === "string") return val.trim() === "" ? [] : [val];
   if (Array.isArray(val)) return val.map((x) => String(x));
   return [];
+}
+
+function decodeChunks(chunks) {
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const merged = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    merged.set(c, off);
+    off += c.length;
+  }
+  return textDecoder.decode(merged);
+}
+
+function round3(n) {
+  return Math.round(n * 1000) / 1000;
+}
+
+function makeAbortError() {
+  const err = new Error("Operation aborted");
+  err.name = "AbortError";
+  return err;
 }
 
 function normalizeMountPath(rawPath, fallback = "/workspace") {
@@ -366,6 +388,10 @@ export class ContainerEngine {
     };
     assertActive();
 
+    if (options.delayStddevMs !== undefined || options.delaySeed !== undefined) {
+      validateDelayConfig(options.delayStddevMs ?? 0, options.delaySeed ?? 0);
+    }
+
     const image = this.images.get(imageId);
     if (!image) {
       throw new Error(`Unknown imageId: ${imageId}`);
@@ -557,6 +583,8 @@ export class ContainerEngine {
       sys,
       argv: fullArgv,
       env,
+      imageConfigEnv: Array.isArray(image.config.env) ? image.config.env.slice() : [],
+      imageRef: image.ref,
       cwd,
       tty,
       cols,
@@ -564,13 +592,19 @@ export class ContainerEngine {
       uid,
       gid,
       stdin: options.stdin,
+      delayStddevMs: options.delayStddevMs,
+      delaySeed: options.delaySeed,
+      _hasDelayConfigured:
+        options.delayStddevMs !== undefined || options.delaySeed !== undefined,
       onProgress,
       callbacks,
       started: false,
+      busy: false,
       stopped: false,
       exited: false,
       exitCode: 0,
       runPromise: null,
+      execPromise: null,
     };
     this.containers.set(containerId, rec);
     return { containerId };
@@ -589,10 +623,21 @@ export class ContainerEngine {
     if (rec.started) {
       throw new Error(`Container ${containerId} has already been started`);
     }
+    if (rec.busy) {
+      throw new Error(`Container ${containerId} already has an active execution`);
+    }
     if (rec.stopped || rec.exited || !this.containers.has(containerId)) {
       return;
     }
     rec.started = true;
+    rec.busy = true;
+    let busyReleased = false;
+    const releaseBusy = () => {
+      if (!busyReleased) {
+        busyReleased = true;
+        rec.busy = false;
+      }
+    };
 
     if (rec.onProgress) {
       rec.onProgress({
@@ -606,7 +651,7 @@ export class ContainerEngine {
     }
 
     if (rec.argv.length > 0 && typeof rec.sys.precompileFromVfs === "function") {
-      const entryPath = rec.sys.resolveCommandPath(rec.argv[0], rec.env);
+      const entryPath = rec.sys.resolveCommandPath(rec.argv[0], rec.env, rec.cwd);
       const entryBytes = entryPath ? rec.sys.readVfsFile(entryPath) : null;
       if (entryBytes && entryBytes.length >= 2 && entryBytes[0] === 0x23 && entryBytes[1] === 0x21) {
         let targetCmd = null;
@@ -627,7 +672,7 @@ export class ContainerEngine {
             });
           }
           try {
-            await rec.sys.precompileFromVfs(targetCmd, { env: rec.env });
+            await rec.sys.precompileFromVfs(targetCmd, { env: rec.env, cwd: rec.cwd });
           } catch {
             // best-effort precompile
           }
@@ -636,6 +681,7 @@ export class ContainerEngine {
     }
 
     if (rec.stopped || rec.exited || !this.containers.has(containerId)) {
+      releaseBusy();
       return;
     }
 
@@ -651,10 +697,18 @@ export class ContainerEngine {
       if (rec.exited) return;
       rec.exited = true;
       rec.exitCode = exitCode;
+      releaseBusy();
       if (rec.callbacks && typeof rec.callbacks.onExit === "function") {
         rec.callbacks.onExit(exitCode);
       }
     };
+
+    const delayOpts =
+      rec.delayStddevMs !== undefined ||
+      rec.delaySeed !== undefined ||
+      rec._hasDelayConfigured
+        ? { delayStddevMs: rec.delayStddevMs ?? 0, delaySeed: rec.delaySeed ?? 0 }
+        : {};
 
     rec.runPromise = rec.sys
       .runFromVfs(rec.argv[0], rec.argv, {
@@ -668,6 +722,7 @@ export class ContainerEngine {
         stdin: rec.stdin,
         keepStdinOpen: rec.stdin === undefined,
         preserveArgv0: true,
+        ...delayOpts,
         onReady: () => {
           if (!readySettled) {
             readySettled = true;
@@ -712,6 +767,9 @@ export class ContainerEngine {
           rec.callbacks.onStderr(textEncoder.encode(`Container error: ${err.message}\n`));
         }
         finishExit(err && err.code === "ENOEXEC" ? 126 : 127);
+      })
+      .finally(() => {
+        releaseBusy();
       });
 
     await readyPromise;
@@ -755,6 +813,178 @@ export class ContainerEngine {
     rec.sys.writeVfsFile(path, toUint8Array(data), mode);
   }
 
+  snapshotVfs(containerId) {
+    const rec = this._getContainer(containerId);
+    if (rec.stopped) throw new Error(`Container ${containerId} has been stopped`);
+    if (rec.busy) {
+      throw new Error(`Cannot snapshot container ${containerId} while an execution is active`);
+    }
+    return rec.sys.snapshotVfs();
+  }
+
+  restoreVfs(containerId, snapshotId) {
+    const rec = this._getContainer(containerId);
+    if (rec.stopped) throw new Error(`Container ${containerId} has been stopped`);
+    if (rec.busy) {
+      throw new Error(`Cannot restore snapshot on container ${containerId} while an execution is active`);
+    }
+    rec.sys.restoreVfs(snapshotId);
+  }
+
+  dropVfsSnapshot(containerId, snapshotId) {
+    const rec = this.containers.get(containerId);
+    if (!rec || rec.stopped) return;
+    rec.sys.dropVfsSnapshot(snapshotId);
+  }
+
+  async execContainer(containerId, options = {}) {
+    const rec = this._getContainer(containerId);
+    if (rec.stopped || this.disposed) {
+      throw new Error(`Container ${containerId} has been stopped`);
+    }
+    if (rec.busy) {
+      throw new Error(`Container ${containerId} already has an active execution`);
+    }
+    if (options.signal?.aborted) {
+      throw makeAbortError();
+    }
+
+    const execArgv = options.cmd !== undefined ? normalizeCmdArray(options.cmd) : rec.argv;
+    if (execArgv.length === 0 || String(execArgv[0]).trim() === "") {
+      throw new TypeError("exec requires a non-empty cmd");
+    }
+
+    const hasExplicitCwd = typeof options.cwd === "string" && options.cwd.length > 0;
+    const cwd = hasExplicitCwd ? options.cwd : rec.cwd;
+    const tty = options.tty !== undefined ? Boolean(options.tty) : false;
+    const stdin = options.stdin !== undefined ? options.stdin : tty ? undefined : "";
+
+    const extraDefaults = [];
+    if (tty) extraDefaults.push("TERM=xterm-256color");
+    if (isNodeContainer(rec.imageConfigEnv, [], execArgv, execArgv)) {
+      extraDefaults.push(...getNodeDefaultEnv(rec.imageConfigEnv));
+    }
+    if (isGoContainer(rec.imageConfigEnv, [], execArgv, execArgv, rec.imageRef)) {
+      extraDefaults.push(...getGoDefaultEnv());
+    }
+    const cwdOverride = hasExplicitCwd ? [`PWD=${cwd}`] : [];
+    const env = mergeEnv(
+      extraDefaults,
+      rec.env,
+      cwdOverride.length ? [...cwdOverride, ...(options.env || [])] : options.env
+    );
+
+    const hasDelayArg =
+      options.delayStddevMs !== undefined || options.delaySeed !== undefined;
+    const effectiveStddevMs =
+      options.delayStddevMs !== undefined ? options.delayStddevMs : rec.delayStddevMs;
+    const effectiveSeed =
+      options.delaySeed !== undefined ? options.delaySeed : rec.delaySeed;
+    const shouldApplyDelay = hasDelayArg || rec._hasDelayConfigured;
+    if (shouldApplyDelay) {
+      validateDelayConfig(effectiveStddevMs ?? 0, effectiveSeed ?? 0);
+    }
+    if (hasDelayArg) rec._hasDelayConfigured = true;
+    const delayOpts = shouldApplyDelay
+      ? { delayStddevMs: effectiveStddevMs ?? 0, delaySeed: effectiveSeed ?? 0 }
+      : {};
+
+    const execCtrl = new AbortController();
+    let abortedByCaller = false;
+    let onCallerAbort = null;
+    if (options.signal) {
+      onCallerAbort = () => {
+        abortedByCaller = true;
+        execCtrl.abort();
+        rec.sys.stop();
+      };
+      options.signal.addEventListener("abort", onCallerAbort, { once: true });
+    }
+
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    const onStdout = (chunk) => {
+      const u8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+      stdoutChunks.push(u8);
+      if (typeof options.onStdout === "function") {
+        options.onStdout(u8);
+      }
+    };
+    const onStderr = (chunk) => {
+      const u8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+      stderrChunks.push(u8);
+      if (typeof options.onStderr === "function") {
+        options.onStderr(u8);
+      }
+    };
+
+    rec.busy = true;
+    const runPromise = (async () => {
+      try {
+        const res = await rec.sys.runFromVfs(execArgv[0], execArgv, {
+          env,
+          cwd,
+          tty,
+          uid: rec.uid,
+          gid: rec.gid,
+          rows: rec.rows,
+          cols: rec.cols,
+          stdin,
+          keepStdinOpen: tty && stdin === undefined,
+          preserveArgv0: true,
+          timeoutMs: options.timeoutMs,
+          signal: execCtrl.signal,
+          ...delayOpts,
+          onStdout,
+          onStderr,
+        });
+        if (abortedByCaller || rec.stopped) {
+          throw makeAbortError();
+        }
+        if (res.timedOut) {
+          return {
+            exitCode: 124,
+            stdout: decodeChunks(stdoutChunks),
+            stderr: decodeChunks(stderrChunks),
+            virtualTimeNs: res.virtualTimeNs ?? rec.sys.getVirtualTimeNs(),
+            timedOut: true,
+            error: `Execution timed out after ${options.timeoutMs}ms`,
+          };
+        }
+        return {
+          exitCode: res.exitCode,
+          stdout: decodeChunks(stdoutChunks),
+          stderr: decodeChunks(stderrChunks),
+          virtualTimeNs: res.virtualTimeNs ?? 0,
+        };
+      } catch (err) {
+        if (abortedByCaller || rec.stopped) {
+          throw makeAbortError();
+        }
+        if (err instanceof RangeError) {
+          throw err;
+        }
+        return {
+          exitCode: err?.code === "ENOEXEC" ? 126 : err?.code === "ENOENT" ? 127 : 1,
+          stdout: decodeChunks(stdoutChunks),
+          stderr: decodeChunks(stderrChunks),
+          virtualTimeNs:
+            typeof rec.sys.getVirtualTimeNs === "function" ? rec.sys.getVirtualTimeNs() : 0,
+          error: err?.message ? String(err.message) : String(err),
+        };
+      } finally {
+        if (options.signal && onCallerAbort) {
+          options.signal.removeEventListener("abort", onCallerAbort);
+        }
+        rec.busy = false;
+        rec.execPromise = null;
+      }
+    })();
+
+    rec.execPromise = runPromise;
+    return await runPromise;
+  }
+
   async stopContainer(containerId) {
     const rec = this.containers.get(containerId);
     if (!rec) return;
@@ -767,9 +997,17 @@ export class ContainerEngine {
         // ignore
       }
     }
+    if (rec.execPromise) {
+      try {
+        await rec.execPromise;
+      } catch {
+        // ignore
+      }
+    }
     if (!rec.exited) {
       rec.exited = true;
       rec.exitCode = 137;
+      rec.busy = false;
       if (rec.callbacks && typeof rec.callbacks.onExit === "function") {
         rec.callbacks.onExit(137);
       }
@@ -862,6 +1100,22 @@ class DirectBackend {
     this.engine.writeFile(containerId, path, data, mode);
   }
 
+  async snapshotVfs(containerId) {
+    return this.engine.snapshotVfs(containerId);
+  }
+
+  async restoreVfs(containerId, snapshotId) {
+    this.engine.restoreVfs(containerId, snapshotId);
+  }
+
+  async dropVfsSnapshot(containerId, snapshotId) {
+    this.engine.dropVfsSnapshot(containerId, snapshotId);
+  }
+
+  async execContainer(containerId, options = {}) {
+    return await this.engine.execContainer(containerId, options);
+  }
+
   async stopContainer(containerId) {
     await this.engine.stopContainer(containerId);
     this.containerHandlers.delete(containerId);
@@ -886,6 +1140,7 @@ class WorkerBackend {
     this.nextReqId = 1;
     this.pending = new Map();
     this.progressListeners = new Map();
+    this.execHandlers = new Map();
     this.containerHandlers = new Map();
     this._dead = false;
     this._deadError = null;
@@ -911,6 +1166,15 @@ class WorkerBackend {
         return;
       }
 
+      if (msg.event === "execStdout" || msg.event === "execStderr") {
+        const h = this.execHandlers.get(msg.reqId);
+        if (!h) return;
+        const chunk = new Uint8Array(msg.chunk);
+        if (msg.event === "execStdout" && h.onStdout) h.onStdout(chunk);
+        else if (msg.event === "execStderr" && h.onStderr) h.onStderr(chunk);
+        return;
+      }
+
       if (msg.event === "stdout" || msg.event === "stderr" || msg.event === "exit") {
         const handlers = this.containerHandlers.get(msg.containerId);
         if (!handlers) return;
@@ -929,10 +1193,23 @@ class WorkerBackend {
         if (!p) return;
         this.pending.delete(msg.id);
         this.progressListeners.delete(msg.id);
+        this.execHandlers.delete(msg.id);
         if (msg.ok) {
           p.resolve(msg.result);
         } else {
-          const err = new Error(msg.error?.message || "Worker RPC error");
+          const errName = typeof msg.error?.name === "string" ? msg.error.name : "Error";
+          const ERROR_CONSTRUCTORS = {
+            Error,
+            RangeError,
+            TypeError,
+            SyntaxError,
+            URIError,
+            ReferenceError,
+          };
+          const ErrCtor = Object.prototype.hasOwnProperty.call(ERROR_CONSTRUCTORS, errName)
+            ? ERROR_CONSTRUCTORS[errName]
+            : Error;
+          const err = new ErrCtor(msg.error?.message || "Worker RPC error");
           if (msg.error?.name) err.name = msg.error.name;
           if (msg.error?.code) err.code = msg.error.code;
           p.reject(err);
@@ -949,6 +1226,7 @@ class WorkerBackend {
       }
       this.pending.clear();
       this.progressListeners.clear();
+      this.execHandlers.clear();
       for (const [, handlers] of this.containerHandlers) {
         if (handlers && typeof handlers.onExit === "function") {
           try {
@@ -982,20 +1260,21 @@ class WorkerBackend {
     return () => this._crashListeners.delete(cb);
   }
 
-  _call(type, payload = {}, { onProgress, signal, transfer = [] } = {}) {
+  _call(type, payload = {}, { onProgress, onStdout, onStderr, signal, transfer = [] } = {}) {
     if (this._dead) {
       return Promise.reject(this._deadError || new Error("Container worker is no longer alive"));
     }
     const id = this.nextReqId++;
     return new Promise((resolve, reject) => {
       if (signal && signal.aborted) {
-        const err = new Error("Operation aborted");
-        err.name = "AbortError";
-        reject(err);
+        reject(makeAbortError());
         return;
       }
       if (typeof onProgress === "function") {
         this.progressListeners.set(id, onProgress);
+      }
+      if (typeof onStdout === "function" || typeof onStderr === "function") {
+        this.execHandlers.set(id, { onStdout, onStderr });
       }
       let onAbort = null;
       if (signal) {
@@ -1016,7 +1295,15 @@ class WorkerBackend {
           reject(err);
         },
       });
-      this.worker.postMessage({ id, type, payload }, transfer);
+      try {
+        this.worker.postMessage({ id, type, payload }, transfer);
+      } catch (err) {
+        this.pending.delete(id);
+        this.progressListeners.delete(id);
+        this.execHandlers.delete(id);
+        if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+        reject(err);
+      }
     });
   }
 
@@ -1074,6 +1361,8 @@ class WorkerBackend {
       uid: options.uid,
       gid: options.gid,
       stdin: options.stdin != null ? toUint8Array(options.stdin).slice() : undefined,
+      delayStddevMs: options.delayStddevMs,
+      delaySeed: options.delaySeed,
       gitRepo:
         options.gitRepo && typeof options.gitRepo === "object"
           ? {
@@ -1147,6 +1436,50 @@ class WorkerBackend {
     );
   }
 
+  async snapshotVfs(containerId) {
+    return await this._call("snapshotVfs", { containerId });
+  }
+
+  async restoreVfs(containerId, snapshotId) {
+    await this._call("restoreVfs", { containerId, snapshotId });
+  }
+
+  async dropVfsSnapshot(containerId, snapshotId) {
+    if (this._dead) return;
+    await this._call("dropVfsSnapshot", { containerId, snapshotId });
+  }
+
+  async execContainer(containerId, options = {}) {
+    const transfer = [];
+    let stdinCopy;
+    if (options.stdin != null) {
+      stdinCopy = toUint8Array(options.stdin).slice();
+      transfer.push(stdinCopy.buffer);
+    }
+    const cleanOptions = {
+      cmd: options.cmd,
+      env: options.env,
+      cwd: options.cwd,
+      tty: options.tty,
+      stdin: stdinCopy,
+      delayStddevMs: options.delayStddevMs,
+      delaySeed: options.delaySeed,
+      timeoutMs: options.timeoutMs,
+      _streamStdout: typeof options.onStdout === "function",
+      _streamStderr: typeof options.onStderr === "function",
+    };
+    return await this._call(
+      "exec",
+      { containerId, options: cleanOptions },
+      {
+        onStdout: options.onStdout,
+        onStderr: options.onStderr,
+        signal: options.signal,
+        transfer,
+      }
+    );
+  }
+
   async stopContainer(containerId) {
     if (!this._dead) {
       await this._call("stop", { containerId });
@@ -1174,6 +1507,7 @@ class WorkerBackend {
     }
     this.pending.clear();
     this.progressListeners.clear();
+    this.execHandlers.clear();
     this.containerHandlers.clear();
     this._crashListeners.clear();
   }
@@ -1221,21 +1555,13 @@ export class DockerContainer {
     }
     this._resolveWait({
       exitCode,
-      stdout: this._decodeChunks(this._stdoutChunks),
-      stderr: this._decodeChunks(this._stderrChunks),
+      stdout: decodeChunks(this._stdoutChunks),
+      stderr: decodeChunks(this._stderrChunks),
     });
   }
 
   _decodeChunks(chunks) {
-    let total = 0;
-    for (const c of chunks) total += c.length;
-    const merged = new Uint8Array(total);
-    let off = 0;
-    for (const c of chunks) {
-      merged.set(c, off);
-      off += c.length;
-    }
-    return textDecoder.decode(merged);
+    return decodeChunks(chunks);
   }
 
   onStdout(cb) {
@@ -1286,6 +1612,22 @@ export class DockerContainer {
 
   async writeFile(path, data, mode = 0o644) {
     await this._backend.writeFile(this._containerId, path, data, mode);
+  }
+
+  async snapshotVfs() {
+    return await this._backend.snapshotVfs(this._containerId);
+  }
+
+  async restoreVfs(snapshotId) {
+    await this._backend.restoreVfs(this._containerId, snapshotId);
+  }
+
+  async dropVfsSnapshot(snapshotId) {
+    await this._backend.dropVfsSnapshot(this._containerId, snapshotId);
+  }
+
+  async exec(options = {}) {
+    return await this._backend.execContainer(this._containerId, options);
   }
 
   async stop() {
@@ -1445,6 +1787,8 @@ export async function runDockerImage(imageRef, options = {}) {
       uid: options.uid,
       gid: options.gid,
       stdin,
+      delayStddevMs: options.delayStddevMs,
+      delaySeed: options.delaySeed,
       gitRepo: options.gitRepo,
       gitProxyBase: options.gitProxyBase,
       overlayTarBytes: options.overlayTarBytes,
@@ -1468,6 +1812,326 @@ export async function runDockerImage(imageRef, options = {}) {
     await container.start();
     return await container.wait();
   } finally {
+    if (ownDocker) {
+      await docker.dispose();
+    } else {
+      if (container) {
+        try {
+          await container.stop();
+        } catch {
+          // ignore cleanup error
+        }
+      }
+      if (image) {
+        try {
+          await image.dispose();
+        } catch {
+          // ignore cleanup error
+        }
+      }
+    }
+  }
+}
+
+/**
+ * High-level sweep runner: builds once with deterministic zero-delay, captures a
+ * Copy-on-Write VFS snapshot, then executes `runCmd` up to `runs` times with
+ * increasing delay stddev and seed (restoring the snapshot before each run).
+ */
+export async function runSweep(imageRef, options = {}) {
+  const runCmdArr = normalizeCmdArray(options.runCmd);
+  if (runCmdArr.length === 0 || String(runCmdArr[0]).trim() === "") {
+    throw new TypeError("runSweep requires a non-empty runCmd");
+  }
+  const rawBuildCmdArr = normalizeCmdArray(options.buildCmd);
+  const buildCmdArr =
+    rawBuildCmdArr.length === 0 ||
+    (rawBuildCmdArr.length === 1 && String(rawBuildCmdArr[0]).trim() === "")
+      ? []
+      : rawBuildCmdArr;
+  if (buildCmdArr.length > 0 && String(buildCmdArr[0]).trim() === "") {
+    throw new TypeError("runSweep buildCmd executable must be non-empty");
+  }
+
+  const rawRuns = options.runs !== undefined ? Number(options.runs) : 20;
+  if (!Number.isFinite(rawRuns) || Math.floor(rawRuns) < 1) {
+    throw new RangeError(`runSweep requires runs >= 1 (got ${options.runs})`);
+  }
+  const totalRuns = Math.floor(rawRuns);
+
+  const stddevStart = options.stddevStart !== undefined ? Number(options.stddevStart) : 1;
+  if (!Number.isFinite(stddevStart) || stddevStart < 0) {
+    throw new RangeError(`runSweep requires finite stddevStart >= 0 (got ${options.stddevStart})`);
+  }
+
+  const stddevStep = options.stddevStep !== undefined ? Number(options.stddevStep) : 1;
+  if (!Number.isFinite(stddevStep) || stddevStep < 0) {
+    throw new RangeError(`runSweep requires finite stddevStep >= 0 (got ${options.stddevStep})`);
+  }
+
+  let seedStart;
+  let seedIsBigInt = false;
+  if (typeof options.seedStart === "bigint") {
+    seedIsBigInt = true;
+    seedStart = options.seedStart;
+    if (seedStart < 0n || seedStart > 0xffff_ffff_ffff_ffffn) {
+      throw new RangeError(
+        `runSweep requires seedStart in 0..2^64-1 (got ${options.seedStart})`
+      );
+    }
+    if (seedStart + BigInt(totalRuns - 1) > 0xffff_ffff_ffff_ffffn) {
+      throw new RangeError(
+        `runSweep seed range overflows u64 (seedStart=${seedStart}, runs=${totalRuns})`
+      );
+    }
+  } else {
+    const rawSeedStart = options.seedStart !== undefined ? Number(options.seedStart) : 1;
+    if (!Number.isSafeInteger(rawSeedStart) || rawSeedStart < 0) {
+      throw new RangeError(
+        `runSweep requires safe non-negative integer seedStart (got ${options.seedStart})`
+      );
+    }
+    if (rawSeedStart + (totalRuns - 1) > Number.MAX_SAFE_INTEGER) {
+      throw new RangeError(
+        `runSweep seed range exceeds Number.MAX_SAFE_INTEGER (seedStart=${rawSeedStart}, runs=${totalRuns}); use BigInt for larger seeds`
+      );
+    }
+    seedStart = rawSeedStart;
+  }
+
+  const maxSeed = seedIsBigInt ? seedStart + BigInt(totalRuns - 1) : seedStart + (totalRuns - 1);
+  const maxStddevMs = round3(stddevStart + (totalRuns - 1) * stddevStep);
+  validateDelayConfig(stddevStart, seedStart);
+  validateDelayConfig(stddevStep, 0);
+  validateDelayConfig(maxStddevMs, maxSeed);
+
+  const stopOnFailure = options.stopOnFailure !== undefined ? Boolean(options.stopOnFailure) : true;
+
+  let gitRepo = options.gitRepo;
+  if (!gitRepo && typeof options.repo === "string" && options.repo.trim()) {
+    gitRepo = {
+      repo: options.repo.trim(),
+      ref: options.ref,
+      mountPath: options.mountPath,
+    };
+  }
+
+  if (options.signal?.aborted) {
+    throw makeAbortError();
+  }
+
+  const ownDocker = !options.docker;
+  const docker =
+    options.docker ||
+    (await Elf2WasmDocker.create({
+      compilerWasmUrl: options.compilerWasmUrl,
+      runtimeWasmUrl: options.runtimeWasmUrl,
+      registryProxyBase: options.registryProxyBase,
+      gitProxyBase: options.gitProxyBase,
+      useWorker: options.useWorker,
+      compilerWasm: options.compilerWasm,
+      runtimeWasm: options.runtimeWasm,
+      workerUrl: options.workerUrl,
+      maxCachedImages: options.maxCachedImages,
+    }));
+
+  let image = null;
+  let container = null;
+  let snapshotId = null;
+
+  try {
+    image = await docker.pullImage(imageRef, {
+      platform: options.platform,
+      onProgress: options.onProgress,
+      signal: options.signal,
+    });
+
+    container = await image.createContainer({
+      cmd: ["/bin/sh"],
+      cwd: options.cwd,
+      env: options.env,
+      tty: false,
+      stdin: "",
+      user: options.user,
+      uid: options.uid,
+      gid: options.gid,
+      gitRepo,
+      gitProxyBase: options.gitProxyBase,
+      overlayTarBytes: options.overlayTarBytes,
+      overlayMountPath: options.overlayMountPath,
+      overlayStripComponents: options.overlayStripComponents,
+      signal: options.signal,
+      onProgress: options.onProgress,
+    });
+
+    if (image) {
+      try {
+        await image.dispose();
+      } catch {
+        // ignore cleanup error
+      }
+      image = null;
+    }
+
+    let build;
+    if (buildCmdArr.length > 0) {
+      if (typeof options.onProgress === "function") {
+        options.onProgress({
+          stage: "build",
+          message: `Building: ${buildCmdArr.join(" ")}`,
+          layerIndex: 0,
+          layerCount: 1,
+          loaded: 0,
+          total: 1,
+        });
+      }
+      const buildRes = await container.exec({
+        cmd: buildCmdArr,
+        cwd: options.cwd,
+        env: options.env,
+        tty: false,
+        stdin: "",
+        delayStddevMs: 0,
+        delaySeed: 0,
+        timeoutMs: options.buildTimeoutMs,
+        signal: options.signal,
+        onStdout:
+          typeof options.onBuildOutput === "function"
+            ? (chunk) => options.onBuildOutput({ stream: "stdout", chunk })
+            : undefined,
+        onStderr:
+          typeof options.onBuildOutput === "function"
+            ? (chunk) => options.onBuildOutput({ stream: "stderr", chunk })
+            : undefined,
+      });
+      build = {
+        exitCode: buildRes.exitCode,
+        stdout: buildRes.stdout,
+        stderr: buildRes.stderr,
+        skipped: false,
+        ...(buildRes.error ? { error: buildRes.error } : {}),
+        ...(buildRes.timedOut ? { timedOut: true } : {}),
+      };
+      if (buildRes.exitCode !== 0 || buildRes.error || buildRes.timedOut) {
+        return {
+          build,
+          runs: [],
+          failedRun: null,
+          passed: false,
+        };
+      }
+    } else {
+      build = {
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        skipped: true,
+      };
+    }
+
+    if (options.signal?.aborted) {
+      throw makeAbortError();
+    }
+
+    snapshotId = await container.snapshotVfs();
+
+    const runs = [];
+    let failedRun = null;
+
+    for (let i = 0; i < totalRuns; i++) {
+      if (options.signal?.aborted) {
+        throw makeAbortError();
+      }
+      const index = i + 1;
+      const stddevMs = round3(stddevStart + i * stddevStep);
+      const seed = seedIsBigInt ? seedStart + BigInt(i) : seedStart + i;
+
+      await container.restoreVfs(snapshotId);
+
+      if (typeof options.onRunStart === "function") {
+        options.onRunStart({ index, totalRuns, stddevMs, seed });
+      }
+      if (typeof options.onProgress === "function") {
+        options.onProgress({
+          stage: "sweep",
+          message: `Sweep run ${index}/${totalRuns} (stddev=${stddevMs}ms, seed=${seed})`,
+          layerIndex: i,
+          layerCount: totalRuns,
+          loaded: i,
+          total: totalRuns,
+        });
+      }
+
+      const res = await container.exec({
+        cmd: runCmdArr,
+        cwd: options.cwd,
+        env: options.env,
+        tty: false,
+        stdin: "",
+        delayStddevMs: stddevMs,
+        delaySeed: seed,
+        timeoutMs: options.timeoutMs,
+        signal: options.signal,
+        onStdout:
+          typeof options.onRunOutput === "function"
+            ? (chunk) => options.onRunOutput({ index, stream: "stdout", chunk })
+            : undefined,
+        onStderr:
+          typeof options.onRunOutput === "function"
+            ? (chunk) => options.onRunOutput({ index, stream: "stderr", chunk })
+            : undefined,
+      });
+
+      const timedOut = Boolean(res.timedOut);
+      const hasError = Boolean(res.error);
+      const failed = res.exitCode !== 0 || timedOut || hasError;
+      const status = timedOut
+        ? "timeout"
+        : hasError
+          ? "error"
+          : res.exitCode !== 0
+            ? "fail"
+            : "pass";
+
+      const runResult = {
+        index,
+        stddevMs,
+        seed,
+        exitCode: res.exitCode,
+        status,
+        stdout: res.stdout,
+        stderr: res.stderr,
+        virtualTimeNs: res.virtualTimeNs ?? 0,
+        error: res.error ?? null,
+        ...(timedOut ? { timedOut: true } : {}),
+      };
+
+      runs.push(runResult);
+      if (failed && !failedRun) {
+        failedRun = runResult;
+      }
+      if (typeof options.onRunComplete === "function") {
+        options.onRunComplete(runResult);
+      }
+      if (failed && stopOnFailure) {
+        break;
+      }
+    }
+
+    return {
+      build,
+      runs,
+      failedRun,
+      passed: failedRun === null,
+    };
+  } finally {
+    if (container && snapshotId !== null) {
+      try {
+        await container.dropVfsSnapshot(snapshotId);
+      } catch {
+        // ignore cleanup error
+      }
+    }
     if (ownDocker) {
       await docker.dispose();
     } else {

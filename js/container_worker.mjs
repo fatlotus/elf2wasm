@@ -181,6 +181,60 @@ async function handleMessage(ev) {
         break;
       }
 
+      case "snapshotVfs": {
+        const snapshotId = engine.snapshotVfs(payload.containerId);
+        postReply(id, true, snapshotId);
+        break;
+      }
+
+      case "restoreVfs": {
+        engine.restoreVfs(payload.containerId, payload.snapshotId);
+        postReply(id, true, { ok: true });
+        break;
+      }
+
+      case "dropVfsSnapshot": {
+        engine.dropVfsSnapshot(payload.containerId, payload.snapshotId);
+        postReply(id, true, { ok: true });
+        break;
+      }
+
+      case "exec": {
+        const ctrl = new AbortController();
+        if (id) activeAborts.set(id, ctrl);
+        try {
+          const opts = payload.options || {};
+          const res = await engine.execContainer(payload.containerId, {
+            ...opts,
+            signal: ctrl.signal,
+            onStdout: opts._streamStdout
+              ? (chunk) => {
+                  const copy =
+                    chunk instanceof Uint8Array ? chunk.slice() : new Uint8Array(chunk);
+                  self.postMessage(
+                    { event: "execStdout", reqId: id, containerId: payload.containerId, chunk: copy },
+                    [copy.buffer]
+                  );
+                }
+              : undefined,
+            onStderr: opts._streamStderr
+              ? (chunk) => {
+                  const copy =
+                    chunk instanceof Uint8Array ? chunk.slice() : new Uint8Array(chunk);
+                  self.postMessage(
+                    { event: "execStderr", reqId: id, containerId: payload.containerId, chunk: copy },
+                    [copy.buffer]
+                  );
+                }
+              : undefined,
+          });
+          postReply(id, true, res);
+        } finally {
+          if (id) activeAborts.delete(id);
+        }
+        break;
+      }
+
       case "stop": {
         await engine.stopContainer(payload.containerId);
         postReply(id, true, { ok: true });

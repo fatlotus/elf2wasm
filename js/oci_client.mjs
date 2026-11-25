@@ -363,9 +363,73 @@ async function readErrorBody(res) {
   }
 }
 
+const RETRYABLE_SOCKET_CODES = new Set([
+  "UND_ERR_SOCKET",
+  "ECONNRESET",
+  "EPIPE",
+  "ECONNABORTED",
+  "ETIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+function extractErrorCodes(err) {
+  const codes = new Set();
+  if (err && typeof err.code === "string" && err.code) {
+    codes.add(err.code);
+  }
+  const cause = err && err.cause;
+  if (cause && typeof cause.code === "string" && cause.code) {
+    codes.add(cause.code);
+  }
+  if (cause && Array.isArray(cause.errors)) {
+    for (const sub of cause.errors) {
+      if (sub && typeof sub.code === "string" && sub.code) {
+        codes.add(sub.code);
+      }
+    }
+  }
+  return [...codes];
+}
+
+function isRetryableFetchError(err, signal) {
+  if (!err) return false;
+  if (signal && signal.aborted) return false;
+  if (err.name === "AbortError") return false;
+  if (!(err instanceof TypeError)) return false;
+  const codes = extractErrorCodes(err);
+  if (codes.length > 0) {
+    return codes.some((code) => RETRYABLE_SOCKET_CODES.has(code));
+  }
+  return true;
+}
+
+async function fetchWithSocketRetry(fetchImpl, url, init, signal) {
+  const maxAttempts = 2;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    checkAborted(signal);
+    try {
+      return await fetchImpl(url, init);
+    } catch (err) {
+      if (signal && signal.aborted) {
+        checkAborted(signal);
+      }
+      if (err && err.name === "AbortError") {
+        throw err;
+      }
+      if (attempt + 1 < maxAttempts && isRetryableFetchError(err, signal)) {
+        // Yield one macrotask so pending socket close/FIN events drain before retrying.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        checkAborted(signal);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 async function fetchJson(url, { headers, signal, fetchImpl }) {
   checkAborted(signal);
-  const res = await fetchImpl(url, { headers, signal });
+  const res = await fetchWithSocketRetry(fetchImpl, url, { headers, signal }, signal);
   if (!res.ok) {
     const detail = await readErrorBody(res);
     throw new Error(
@@ -380,7 +444,7 @@ async function fetchJson(url, { headers, signal, fetchImpl }) {
 
 async function fetchStreamedBlob(url, { expectedSize = 0, signal, fetchImpl, onChunk }) {
   checkAborted(signal);
-  const res = await fetchImpl(url, { signal });
+  const res = await fetchWithSocketRetry(fetchImpl, url, { signal }, signal);
   if (!res.ok) {
     const detail = await readErrorBody(res);
     throw new Error(
