@@ -41,8 +41,28 @@
           >
         </div>
 
+        <div class="actions">
+          <button id="start-btn" type="button" class="btn btn-primary">Start Shell</button>
+          <button id="stop-btn" type="button" class="btn btn-danger" disabled>Stop</button>
+          <button id="clear-btn" type="button" class="btn btn-secondary">Clear</button>
+        </div>
+      </div>
+
+      <div class="cmd-grid" role="group" aria-label="Build and run commands">
         <div class="field">
-          <label for="cmd-input">Command Override (optional)</label>
+          <label for="build-cmd-input">Build Command (optional)</label>
+          <input
+            id="build-cmd-input"
+            name="build"
+            type="text"
+            placeholder="e.g. go build (runs once before run/sweep)"
+            autocomplete="off"
+            spellcheck="false"
+          >
+        </div>
+
+        <div class="field">
+          <label for="cmd-input">Run Command (optional)</label>
           <input
             id="cmd-input"
             name="cmd"
@@ -51,12 +71,6 @@
             autocomplete="off"
             spellcheck="false"
           >
-        </div>
-
-        <div class="actions">
-          <button id="start-btn" type="button" class="btn btn-primary">Start Shell</button>
-          <button id="stop-btn" type="button" class="btn btn-danger" disabled>Stop</button>
-          <button id="clear-btn" type="button" class="btn btn-secondary">Clear</button>
         </div>
       </div>
 
@@ -129,6 +143,91 @@
           data-preset="rust-nushell"
           data-language="rust"
         ><span class="lang-badge lang-rust" aria-hidden="true">Rs</span> Rust: Nushell stdlib (35 tests)</button>
+        <button
+          type="button"
+          class="project-preset-chip"
+          data-preset="go-raft-nodice"
+          data-language="go"
+        ><span class="lang-badge lang-go" aria-hidden="true">Go</span> Go: Raft (nodice)</button>
+      </div>
+
+      <div class="delay-sweep-section" role="group" aria-label="Deterministic delay injection and sweep mode">
+        <div class="delay-sweep-grid">
+          <div class="field" id="delay-stddev-field">
+            <label for="delay-stddev-input">Delay Stddev (ms)</label>
+            <input
+              id="delay-stddev-input"
+              name="stddev"
+              type="number"
+              min="0"
+              step="any"
+              value="0"
+              placeholder="0"
+            >
+          </div>
+
+          <div class="field">
+            <label for="delay-seed-input">PRNG Seed</label>
+            <input
+              id="delay-seed-input"
+              name="seed"
+              type="number"
+              min="0"
+              step="1"
+              value="0"
+              placeholder="0"
+            >
+          </div>
+
+          <div class="field sweep-toggle-field">
+            <label class="sweep-toggle-label" for="sweep-mode-toggle">
+              <input id="sweep-mode-toggle" name="sweep" type="checkbox">
+              <span>Sweep Mode</span>
+            </label>
+          </div>
+        </div>
+
+        <div id="sweep-params-grid" class="sweep-params-grid" hidden>
+          <div class="field">
+            <label for="sweep-runs-input">Runs (N)</label>
+            <input
+              id="sweep-runs-input"
+              name="runs"
+              type="number"
+              min="1"
+              max="1000"
+              step="1"
+              value="20"
+              placeholder="20"
+            >
+          </div>
+
+          <div class="field">
+            <label for="sweep-stddev-start-input">Stddev Start (ms)</label>
+            <input
+              id="sweep-stddev-start-input"
+              name="stddevStart"
+              type="number"
+              min="0"
+              step="any"
+              value="1"
+              placeholder="1"
+            >
+          </div>
+
+          <div class="field">
+            <label for="sweep-stddev-step-input">Stddev Step (ms)</label>
+            <input
+              id="sweep-stddev-step-input"
+              name="stddevStep"
+              type="number"
+              min="0"
+              step="any"
+              value="1"
+              placeholder="1"
+            >
+          </div>
+        </div>
       </div>
 
       <details class="panel-drawer" id="advanced-options">
@@ -178,6 +277,33 @@
           <span class="stage-step" data-step="compile">3. Compile ELF &rarr; WASM</span>
           <span class="stage-step" data-step="run">4. Run in Browser</span>
         </div>
+      </div>
+    </section>
+
+    <section id="sweep-panel" class="sweep-panel" aria-label="Sweep results" hidden>
+      <div class="sweep-summary">
+        <div class="sweep-summary-meta">
+          <span id="sweep-outcome-badge" class="sweep-badge" data-outcome="idle">Idle</span>
+          <span id="sweep-build-status" class="sweep-meta-item">Build: —</span>
+          <span id="sweep-progress-text" class="sweep-meta-item">0 / 20 runs</span>
+        </div>
+        <button id="copy-sweep-link-btn" type="button" class="btn btn-secondary btn-sm">Copy Sweep Link</button>
+      </div>
+      <div class="sweep-table-wrap">
+        <table class="sweep-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Stddev (ms)</th>
+              <th>Seed</th>
+              <th>Status</th>
+              <th>Exit</th>
+              <th>Virtual Time</th>
+              <th>Link</th>
+            </tr>
+          </thead>
+          <tbody id="sweep-results-body"></tbody>
+        </table>
       </div>
     </section>
 

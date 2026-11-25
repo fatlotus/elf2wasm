@@ -2,19 +2,25 @@
  * UI controller for the elf2wasm client-side Docker-on-WASM interactive web shell.
  */
 
-import { Elf2WasmDocker, runDockerImage, parseImageRef } from "/js/docker_sdk.mjs";
+import { Elf2WasmDocker, runDockerImage, runSweep, parseImageRef } from "/js/docker_sdk.mjs";
 import { VT100Terminal } from "/web/terminal.mjs";
 import {
   DEFAULT_UI_STATE,
+  MAX_STDDEV_MS,
+  MAX_SEED,
+  MAX_SWEEP_RUNS,
   parseEnvLines,
   parseStateFromSearch,
   serializeStateToSearch,
   matchProjectPreset,
+  computeSweepRunParams,
+  buildRunSearch,
 } from "./url_state.mjs";
 
 // Immediately expose JS SDK globals on window (before any async work)
 window.Elf2WasmDocker = Elf2WasmDocker;
 window.runDockerImage = runDockerImage;
+window.runSweep = runSweep;
 
 const COMPILER_WASM_URL = "/wasm/elf2wasm_compiler_wasm.wasm";
 const RUNTIME_WASM_URL = "/wasm/elf2wasm_runtime_wasm.wasm";
@@ -64,6 +70,7 @@ const PROJECT_PRESETS = Object.freeze({
     repo: "bottlepy/bottle",
     ref: "0.13.4",
     mountPath: "/workspace",
+    build: "",
     cmd: "python3 -m unittest discover -s test -t .",
     cwd: "/workspace",
     env: Object.freeze(["PYTHONUNBUFFERED=1"]),
@@ -76,6 +83,7 @@ const PROJECT_PRESETS = Object.freeze({
     repo: "ai/nanoid",
     ref: "6.0.2",
     mountPath: "/workspace",
+    build: "",
     cmd: "node test/non-secure.test.js",
     cwd: "/workspace",
     env: Object.freeze([]),
@@ -88,18 +96,47 @@ const PROJECT_PRESETS = Object.freeze({
     repo: "nushell/nushell",
     ref: "0.117.0",
     mountPath: "/workspace",
+    build: "",
     cmd: "--no-config-file -c \"source crates/nu-std/tests/test_asserts.nu; source crates/nu-std/tests/test_iter.nu; source crates/nu-std/tests/test_formats.nu; assert_basic; assert_not; assert_equal; assert_not_equal; assert_error; assert_length; assert_less; assert_less_or_equal; assert_greater; assert_greater_or_equal; iter_find; iter_intersperse; iter_scan; iter_filter_map; iter_find_index; iter_zip_with; iter_flat_map; iter_zip_into_record; from_ndjson_multiple_objects; from_ndjson_single_object; from_ndjson_invalid_object; from_jsonl_multiple_objects; from_jsonl_single_object; from_jsonl_invalid_object; to_ndjson_multiple_objects; to_ndjson_single_object; to_jsonl_multiple_objects; to_jsonl_single_object; from_ndnuon_multiple_objects; from_ndnuon_single_object; from_ndnuon_invalid_object; to_ndnuon_multiple_objects; to_ndnuon_single_object; to_ndnuon_multiline_strings; from_ndnuon_multiline_strings; print 'OK: 35 nu-std tests passed'\"",
     cwd: "/workspace",
     env: Object.freeze(["HOME=/tmp"]),
+  }),
+  "go-raft-nodice": Object.freeze({
+    id: "go-raft-nodice",
+    label: "Go: Raft (nodice)",
+    language: "Go",
+    image: "ghcr.io/fatlotus/golang-with-cache:1.27-alpine",
+    repo: "fatlotus/nodice",
+    ref: "",
+    mountPath: "/workspace",
+    build: "go build",
+    cmd: "./raft",
+    cwd: "/workspace/example",
+    env: Object.freeze([]),
   }),
 });
 
 // Primary DOM elements
 const imageInput = document.getElementById("image-input");
+const buildCmdInput = document.getElementById("build-cmd-input");
 const cmdInput = document.getElementById("cmd-input");
 const repoInput = document.getElementById("repo-input");
 const repoRefInput = document.getElementById("repo-ref-input");
 const repoMountInput = document.getElementById("repo-mount-input");
+const delayStddevField = document.getElementById("delay-stddev-field");
+const delayStddevInput = document.getElementById("delay-stddev-input");
+const delaySeedInput = document.getElementById("delay-seed-input");
+const sweepModeToggle = document.getElementById("sweep-mode-toggle");
+const sweepParamsGrid = document.getElementById("sweep-params-grid");
+const sweepRunsInput = document.getElementById("sweep-runs-input");
+const sweepStddevStartInput = document.getElementById("sweep-stddev-start-input");
+const sweepStddevStepInput = document.getElementById("sweep-stddev-step-input");
+const sweepPanel = document.getElementById("sweep-panel");
+const sweepOutcomeBadge = document.getElementById("sweep-outcome-badge");
+const sweepBuildStatus = document.getElementById("sweep-build-status");
+const sweepProgressText = document.getElementById("sweep-progress-text");
+const copySweepLinkBtn = document.getElementById("copy-sweep-link-btn");
+const sweepResultsBody = document.getElementById("sweep-results-body");
 const envInput = document.getElementById("env-input");
 const cwdInput = document.getElementById("cwd-input");
 const advancedOptionsEl = document.getElementById("advanced-options");
@@ -137,6 +174,15 @@ let activeContainer = null;
 let activeAbortController = null;
 let containerExited = true;
 let sessionSeq = 0;
+
+// Sweep UI state
+const MAX_CAPTURED_STREAM_CHARS = 256 * 1024;
+let selectedRunIndex = null;
+let sweepRunRecords = new Map();
+let sweepRowEls = new Map();
+let sweepBaseState = null;
+let userPinnedRun = false;
+let activeSweepRunIndex = null;
 
 // Manual upload state
 let stagedTarball = null; // { name: string, bytes: Uint8Array } | null
@@ -257,9 +303,9 @@ function updateStageSteps(stage) {
     stage === "git-overlay"
   ) {
     activeIdx = 1;
-  } else if (stage === "compile") {
+  } else if (stage === "compile" || stage === "build") {
     activeIdx = 2;
-  } else if (stage === "run") {
+  } else if (stage === "run" || stage === "sweep") {
     activeIdx = 3;
   }
 
@@ -356,6 +402,17 @@ function handleProgressEvent(ev) {
       setProgress(90, "compile");
       setStatus("Compiling ELF → WASM in browser...", "busy");
       break;
+    case "build":
+      setProgress(91, "build");
+      setStatus(ev.message || "Building...", "busy");
+      break;
+    case "sweep": {
+      const frac = total > 0 ? Math.min(1, loaded / total) : 0;
+      const pct = 92 + frac * 7;
+      setProgress(pct, "sweep");
+      setStatus(ev.message || "Running sweep...", "busy");
+      break;
+    }
     case "run":
       setProgress(100, "run");
       setStatus("Running — Interactive shell ready", "running");
@@ -429,6 +486,56 @@ function splitShellArgs(str) {
   return args;
 }
 
+function parseShellCommand(str) {
+  const raw = String(str ?? "").trim();
+  if (!raw) return [];
+
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (inSingle) {
+      if (ch === "'") inSingle = false;
+      continue;
+    }
+    if (inDouble) {
+      if (ch === "\\" && i + 1 < raw.length) {
+        i++;
+      } else if (ch === '"') {
+        inDouble = false;
+      }
+      continue;
+    }
+    if (ch === "\\" && i + 1 < raw.length) {
+      i++;
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = true;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+      continue;
+    }
+    const next = i + 1 < raw.length ? raw[i + 1] : "";
+    if (
+      ch === ";" ||
+      ch === "|" ||
+      ch === ">" ||
+      ch === "<" ||
+      ch === "\n" ||
+      ch === "\r" ||
+      ch === "`" ||
+      (ch === "&" && next === "&") ||
+      (ch === "$" && next === "(")
+    ) {
+      return ["/bin/sh", "-c", raw];
+    }
+  }
+  return splitShellArgs(raw);
+}
+
 async function stopActiveSession({ updateUi = true } = {}) {
   if (activeAbortController) {
     try {
@@ -456,47 +563,141 @@ async function stopActiveSession({ updateUi = true } = {}) {
     startBtn.disabled = false;
     setProgress(0, "idle");
     setStatus("Stopped", "idle");
+    if (sweepOutcomeBadge && sweepOutcomeBadge.dataset.outcome === "running") {
+      sweepOutcomeBadge.dataset.outcome = "idle";
+      sweepOutcomeBadge.textContent = "Stopped";
+    }
+    if (
+      sweepBuildStatus &&
+      (sweepBuildStatus.textContent === "Build: running..." ||
+        sweepBuildStatus.textContent === "Build: pending")
+    ) {
+      sweepBuildStatus.textContent = "Build: stopped";
+    }
+    for (const rowEl of sweepRowEls.values()) {
+      const pill = rowEl.querySelector('.run-status-pill[data-status="running"]');
+      if (pill) {
+        pill.dataset.status = "stopped";
+        pill.textContent = "stopped";
+        const cells = rowEl.querySelectorAll("td");
+        if (cells[4] && cells[4].textContent === "…") {
+          cells[4].textContent = "—";
+        }
+        if (cells[5] && cells[5].textContent === "…") {
+          cells[5].textContent = "—";
+        }
+      }
+    }
   }
 }
 
-async function bootImage({ imageRef, tarball = null, cmdStr = null, envList = null, cwd = null, gitRepo = undefined }) {
-  const seq = ++sessionSeq;
+function formatVirtualTime(ns) {
+  if (!Number.isFinite(ns) || ns <= 0) return "0 ms";
+  if (ns < 1_000_000) return `${Math.round(ns / 1000)} µs`;
+  if (ns < 1_000_000_000) return `${(ns / 1e6).toFixed(1)} ms`;
+  return `${(ns / 1e9).toFixed(2)} s`;
+}
 
-  // Snapshot all form controls synchronously before any await so clicking a preset
-  // or editing fields mid-pull cannot corrupt this in-flight boot.
-  const rawCmd = cmdStr !== null ? cmdStr : cmdInput.value.trim();
-  const cmdTokens = rawCmd ? splitShellArgs(rawCmd) : [];
-  const envEntries = envList !== null ? envList : parseEnvLines(envInput.value);
-  const workdir = cwd !== null ? cwd : cwdInput.value.trim();
+function capCapturedText(text) {
+  const s = typeof text === "string" ? text : "";
+  if (s.length <= MAX_CAPTURED_STREAM_CHARS) return s;
+  return `${s.slice(0, MAX_CAPTURED_STREAM_CHARS)}\n... [truncated]`;
+}
 
-  let resolvedGitRepo;
+function resolveGitRepoFromOption(gitRepo) {
   if (gitRepo === null) {
-    resolvedGitRepo = undefined;
-  } else if (gitRepo && typeof gitRepo === "object") {
+    return undefined;
+  }
+  if (gitRepo && typeof gitRepo === "object") {
     const repoVal = String(gitRepo.repo || "").trim();
     if (repoVal) {
-      resolvedGitRepo = {
+      return {
         repo: repoVal,
         ref: String(gitRepo.ref || "").trim() || "HEAD",
         mountPath: String(gitRepo.mountPath || "").trim() || "/workspace",
       };
     }
-  } else {
-    const rawRepo = repoInput ? repoInput.value.trim() : "";
-    const rawRef = repoRefInput ? repoRefInput.value.trim() : "";
-    const rawMount = repoMountInput ? repoMountInput.value.trim() : "";
-    if (rawRepo) {
-      resolvedGitRepo = {
-        repo: rawRepo,
-        ref: rawRef || "HEAD",
-        mountPath: rawMount || "/workspace",
-      };
-    }
+    return undefined;
   }
+  const rawRepo = repoInput ? repoInput.value.trim() : "";
+  const rawRef = repoRefInput ? repoRefInput.value.trim() : "";
+  const rawMount = repoMountInput ? repoMountInput.value.trim() : "";
+  if (rawRepo) {
+    return {
+      repo: rawRepo,
+      ref: rawRef || "HEAD",
+      mountPath: rawMount || "/workspace",
+    };
+  }
+  return undefined;
+}
+
+function resolveDefaultImageCmd(imageConfig) {
+  const ep = Array.isArray(imageConfig?.entrypoint) ? imageConfig.entrypoint : [];
+  const cmd = Array.isArray(imageConfig?.cmd) ? imageConfig.cmd : [];
+  const combined = [...ep, ...cmd].filter((s) => typeof s === "string" && s.length > 0);
+  return combined.length > 0 ? combined : ["/bin/sh"];
+}
+
+function parseNonNegFloatOr(raw, fallback, max = MAX_STDDEV_MS) {
+  const s = String(raw ?? "").trim();
+  if (!s) return fallback;
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  const clamped = Math.round(Math.min(n, max) * 1000) / 1000;
+  return clamped === 0 ? 0 : clamped;
+}
+
+function parseNonNegIntOr(raw, fallback, min = 0, max = MAX_SEED) {
+  const s = String(raw ?? "").trim();
+  if (!s) return fallback;
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < min) return fallback;
+  const f = Math.floor(Math.min(n, max));
+  return f >= min ? (f === 0 ? 0 : f) : fallback;
+}
+
+async function bootImage({
+  imageRef,
+  tarball = null,
+  buildCmdStr = null,
+  cmdStr = null,
+  envList = null,
+  cwd = null,
+  gitRepo = undefined,
+  delayStddevMs = null,
+  delaySeed = null,
+}) {
+  const seq = ++sessionSeq;
+
+  // Snapshot all form controls synchronously before any await so clicking a preset
+  // or editing fields mid-pull cannot corrupt this in-flight boot.
+  const rawBuild = buildCmdStr !== null ? buildCmdStr : (buildCmdInput ? buildCmdInput.value.trim() : "");
+  const buildCmdTokens = rawBuild ? parseShellCommand(rawBuild) : [];
+  const rawCmd = cmdStr !== null ? cmdStr : cmdInput.value.trim();
+  const cmdTokens = rawCmd ? parseShellCommand(rawCmd) : [];
+  const envEntries = envList !== null ? envList : parseEnvLines(envInput.value);
+  const workdir = cwd !== null ? cwd : cwdInput.value.trim();
+  const resolvedGitRepo = resolveGitRepoFromOption(gitRepo);
+
+  const effStddev =
+    delayStddevMs !== null
+      ? parseNonNegFloatOr(delayStddevMs, 0)
+      : parseNonNegFloatOr(delayStddevInput?.value, 0);
+  const effSeed =
+    delaySeed !== null
+      ? parseNonNegIntOr(delaySeed, 0)
+      : parseNonNegIntOr(delaySeedInput?.value, 0);
+  const hasDelay = effStddev > 0 || effSeed > 0;
 
   // Cancel any in-flight pull and cleanly stop any previous container
   await stopActiveSession({ updateUi: false });
   if (seq !== sessionSeq) return;
+
+  clearSweepResults();
+  if (sweepPanel) {
+    sweepPanel.hidden = true;
+  }
 
   const abortController = new AbortController();
   activeAbortController = abortController;
@@ -546,10 +747,12 @@ async function bootImage({ imageRef, tarball = null, cmdStr = null, envList = nu
     }
 
     let container;
+    let imageDefaultCmd = ["/bin/sh"];
     try {
       if (seq !== sessionSeq) return;
 
       const { cols, rows } = terminal.getSize();
+      imageDefaultCmd = resolveDefaultImageCmd(image.config);
 
       const displayCmd =
         cmdTokens.length > 0
@@ -561,22 +764,38 @@ async function bootImage({ imageRef, tarball = null, cmdStr = null, envList = nu
         const repoSuffix = resolvedGitRepo
           ? ` + ${resolvedGitRepo.repo}@${resolvedGitRepo.ref}`
           : "";
-        terminalTitleEl.textContent = `${resolvedDisplayName}${repoSuffix} — ${displayCmd}`;
+        const cmdSummary = buildCmdTokens.length > 0 ? `${rawBuild} && ${displayCmd}` : displayCmd;
+        terminalTitleEl.textContent = `${resolvedDisplayName}${repoSuffix} — ${cmdSummary}`;
       }
 
-      container = await image.createContainer({
-        cmd: cmdTokens.length > 0 ? cmdTokens : undefined,
-        env: envEntries.length > 0 ? envEntries : undefined,
-        cwd: workdir || undefined,
-        gitRepo: resolvedGitRepo,
-        tty: true,
-        cols,
-        rows,
-        signal: abortController.signal,
-        onProgress: (ev) => {
-          if (seq === sessionSeq) handleProgressEvent(ev);
-        },
-      });
+      if (buildCmdTokens.length > 0) {
+        container = await image.createContainer({
+          env: envEntries.length > 0 ? envEntries : undefined,
+          cwd: workdir || undefined,
+          gitRepo: resolvedGitRepo,
+          tty: false,
+          stdin: "",
+          signal: abortController.signal,
+          onProgress: (ev) => {
+            if (seq === sessionSeq) handleProgressEvent(ev);
+          },
+        });
+      } else {
+        container = await image.createContainer({
+          cmd: cmdTokens.length > 0 ? cmdTokens : undefined,
+          env: envEntries.length > 0 ? envEntries : undefined,
+          cwd: workdir || undefined,
+          gitRepo: resolvedGitRepo,
+          tty: true,
+          cols,
+          rows,
+          ...(hasDelay ? { delayStddevMs: effStddev, delaySeed: effSeed } : {}),
+          signal: abortController.signal,
+          onProgress: (ev) => {
+            if (seq === sessionSeq) handleProgressEvent(ev);
+          },
+        });
+      }
     } finally {
       try {
         await image.dispose();
@@ -597,6 +816,96 @@ async function bootImage({ imageRef, tarball = null, cmdStr = null, envList = nu
     activeContainer = container;
     containerExited = false;
 
+    if (buildCmdTokens.length > 0) {
+      setProgress(91, "build");
+      setStatus(`Building: ${rawBuild}...`, "busy");
+      terminal.write(`[build] ${rawBuild}\r\n`);
+
+      const buildRes = await container.exec({
+        cmd: buildCmdTokens,
+        cwd: workdir || undefined,
+        env: envEntries.length > 0 ? envEntries : undefined,
+        tty: false,
+        stdin: "",
+        delayStddevMs: 0,
+        delaySeed: 0,
+        signal: abortController.signal,
+        onStdout: (chunk) => {
+          if (seq === sessionSeq) terminal.write(chunk);
+        },
+        onStderr: (chunk) => {
+          if (seq === sessionSeq) {
+            sawStderr = true;
+            terminal.write(chunk);
+          }
+        },
+      });
+      if (seq !== sessionSeq) return;
+
+      if (buildRes.exitCode !== 0 || buildRes.error || buildRes.timedOut) {
+        if (buildRes.error && !sawStderr) {
+          terminal.write(`\r\n[build] Error: ${buildRes.error}\r\n`);
+        }
+        if (typeof terminal._renderNow === "function") {
+          terminal._renderNow();
+        }
+        containerExited = true;
+        activeContainer = null;
+        activeAbortController = null;
+        stopBtn.disabled = true;
+        startBtn.disabled = false;
+        setProgress(100, "build");
+        setStatus(`Build failed (exit ${buildRes.exitCode})`, "error");
+        void container.stop().catch(() => {});
+        return;
+      }
+
+      sawStderr = false;
+      const effectiveRunCmd = cmdTokens.length > 0 ? cmdTokens : imageDefaultCmd;
+      const delayNote = hasDelay ? ` (stddev=${effStddev}ms, seed=${effSeed})` : "";
+      setProgress(95, "run");
+      setStatus(`Running${delayNote}...`, "busy");
+      terminal.write(`\r\n[run] ${effectiveRunCmd.join(" ")}${delayNote}\r\n`);
+
+      const runRes = await container.exec({
+        cmd: effectiveRunCmd,
+        cwd: workdir || undefined,
+        env: envEntries.length > 0 ? envEntries : undefined,
+        tty: false,
+        stdin: "",
+        delayStddevMs: hasDelay ? effStddev : 0,
+        delaySeed: hasDelay ? effSeed : 0,
+        signal: abortController.signal,
+        onStdout: (chunk) => {
+          if (seq === sessionSeq) terminal.write(chunk);
+        },
+        onStderr: (chunk) => {
+          if (seq === sessionSeq) {
+            sawStderr = true;
+            terminal.write(chunk);
+          }
+        },
+      });
+      if (seq !== sessionSeq) return;
+
+      if (runRes.error && !sawStderr) {
+        terminal.write(`\r\n[run] Error: ${runRes.error}\r\n`);
+      }
+
+      if (typeof terminal._renderNow === "function") {
+        terminal._renderNow();
+      }
+      containerExited = true;
+      activeContainer = null;
+      activeAbortController = null;
+      stopBtn.disabled = true;
+      startBtn.disabled = false;
+      setProgress(100, "run");
+      setStatus(`Exited (code ${runRes.exitCode})`, runRes.exitCode === 0 ? "idle" : "error");
+      void container.stop().catch(() => {});
+      return;
+    }
+
     // Register stdout, stderr, and exit handlers BEFORE container.start()
     container.onStdout((chunk) => {
       if (seq !== sessionSeq) return;
@@ -611,6 +920,9 @@ async function bootImage({ imageRef, tarball = null, cmdStr = null, envList = nu
 
     container.onExit((exitCode) => {
       if (seq !== sessionSeq) return;
+      if (typeof terminal._renderNow === "function") {
+        terminal._renderNow();
+      }
       containerExited = true;
       activeContainer = null;
       activeAbortController = null;
@@ -635,9 +947,13 @@ async function bootImage({ imageRef, tarball = null, cmdStr = null, envList = nu
     if (seq !== sessionSeq || err?.name === "AbortError") {
       return;
     }
+    const leakedContainer = activeContainer;
     activeAbortController = null;
     activeContainer = null;
     containerExited = true;
+    if (leakedContainer) {
+      void leakedContainer.stop().catch(() => {});
+    }
     stopBtn.disabled = true;
     startBtn.disabled = false;
     const msg = err?.message || String(err);
@@ -648,17 +964,408 @@ async function bootImage({ imageRef, tarball = null, cmdStr = null, envList = nu
   }
 }
 
+function selectSweepRun(index, { syncUrl = true } = {}) {
+  const record = sweepRunRecords.get(index);
+  selectedRunIndex = index;
+
+  for (const [idx, rowEl] of sweepRowEls.entries()) {
+    rowEl.dataset.selected = idx === index ? "true" : "false";
+  }
+
+  if (record) {
+    terminal.reset();
+    terminal.write(
+      `[sweep run #${record.index}] stddev=${record.stddevMs}ms, seed=${record.seed}, status=${record.status}, exit=${record.exitCode}, virtual=${formatVirtualTime(record.virtualTimeNs)}\r\n`
+    );
+    if (record.stdout) {
+      terminal.write(record.stdout);
+    }
+    if (record.stderr) {
+      if (record.stdout && !record.stdout.endsWith("\n")) {
+        terminal.write("\r\n");
+      }
+      terminal.write(record.stderr);
+    }
+    if (record.error) {
+      terminal.write(`\r\n[error] ${record.error}\r\n`);
+    }
+    if (typeof terminal._renderNow === "function") {
+      terminal._renderNow();
+    }
+    if (terminalTitleEl && sweepBaseState) {
+      terminalTitleEl.textContent = `${sweepBaseState.image} — Run #${record.index} (stddev=${record.stddevMs}ms, seed=${record.seed})`;
+    }
+  }
+
+  if (syncUrl) {
+    syncUrlFromControls({ push: false });
+  }
+}
+
+function createSweepRowElement(index, stddevMs, seed, runHref) {
+  const tr = document.createElement("tr");
+  tr.dataset.runIndex = String(index);
+  tr.dataset.selected = "false";
+
+  const tdIndex = document.createElement("td");
+  tdIndex.textContent = String(index);
+
+  const tdStddev = document.createElement("td");
+  tdStddev.textContent = String(stddevMs);
+
+  const tdSeed = document.createElement("td");
+  tdSeed.textContent = String(seed);
+
+  const tdStatus = document.createElement("td");
+  const statusBadge = document.createElement("span");
+  statusBadge.className = "run-status-pill";
+  statusBadge.dataset.status = "running";
+  statusBadge.textContent = "running";
+  tdStatus.appendChild(statusBadge);
+
+  const tdExit = document.createElement("td");
+  tdExit.textContent = "…";
+
+  const tdTime = document.createElement("td");
+  tdTime.textContent = "…";
+
+  const tdLink = document.createElement("td");
+  const link = document.createElement("a");
+  link.className = "run-link";
+  link.setAttribute("href", runHref);
+  link.textContent = "Open run";
+  link.addEventListener("click", (e) => {
+    e.stopPropagation();
+  });
+  tdLink.appendChild(link);
+
+  tr.append(tdIndex, tdStddev, tdSeed, tdStatus, tdExit, tdTime, tdLink);
+  tr.addEventListener("click", () => {
+    userPinnedRun = true;
+    selectSweepRun(index, { syncUrl: true });
+  });
+
+  return { tr, statusBadge, tdExit, tdTime };
+}
+
+async function runSweepFromControls(state) {
+  const buildCmdTokens = state.build ? parseShellCommand(state.build) : [];
+  const runCmdTokens = state.cmd ? parseShellCommand(state.cmd) : [];
+  if (runCmdTokens.length === 0) {
+    setStatus("Error: Sweep mode requires a Run Command", "error");
+    cmdInput.focus();
+    return;
+  }
+
+  const seq = ++sessionSeq;
+  await stopActiveSession({ updateUi: false });
+  if (seq !== sessionSeq) return;
+
+  const abortController = new AbortController();
+  activeAbortController = abortController;
+  containerExited = false;
+
+  stopBtn.disabled = false;
+  startBtn.disabled = true;
+  terminal.reset();
+  setProgress(3, "manifest");
+
+  const maxSweepSeedStart = Math.max(0, MAX_SEED - Math.max(0, state.runs - 1));
+  const effectiveSeedStart = Math.min(state.seed, maxSweepSeedStart);
+
+  sweepRunRecords.clear();
+  sweepRowEls.clear();
+  const rowRefs = new Map();
+  userPinnedRun = false;
+  activeSweepRunIndex = null;
+  const runBaseState = { ...state, seed: effectiveSeedStart };
+  sweepBaseState = runBaseState;
+
+  if (sweepResultsBody) {
+    sweepResultsBody.textContent = "";
+  }
+  if (sweepPanel) {
+    sweepPanel.hidden = false;
+  }
+  if (sweepOutcomeBadge) {
+    sweepOutcomeBadge.dataset.outcome = "running";
+    sweepOutcomeBadge.textContent = "Running";
+  }
+  if (sweepBuildStatus) {
+    sweepBuildStatus.textContent =
+      buildCmdTokens.length > 0 ? "Build: pending" : "Build: skipped";
+  }
+  if (sweepProgressText) {
+    sweepProgressText.textContent = `0 / ${state.runs} runs`;
+  }
+
+  const resolvedGitRepo = state.repo
+    ? {
+        repo: state.repo,
+        ref: state.ref || "HEAD",
+        mountPath: state.mount || "/workspace",
+      }
+    : undefined;
+
+  if (terminalTitleEl) {
+    const repoSuffix = resolvedGitRepo
+      ? ` + ${resolvedGitRepo.repo}@${resolvedGitRepo.ref}`
+      : "";
+    terminalTitleEl.textContent = `${state.image}${repoSuffix} — Sweep (${state.runs} runs)`;
+  }
+
+  try {
+    const docker = await getDocker();
+    if (seq !== sessionSeq) return;
+
+    const result = await runSweep(state.image, {
+      docker,
+      platform: "linux/amd64",
+      buildCmd: buildCmdTokens.length > 0 ? buildCmdTokens : undefined,
+      runCmd: runCmdTokens,
+      runs: state.runs,
+      stddevStart: state.stddevStart,
+      stddevStep: state.stddevStep,
+      seedStart: effectiveSeedStart,
+      stopOnFailure: true,
+      cwd: state.cwd || undefined,
+      env: state.env.length > 0 ? state.env : undefined,
+      gitRepo: resolvedGitRepo,
+      signal: abortController.signal,
+      onProgress: (ev) => {
+        if (seq === sessionSeq) handleProgressEvent(ev);
+      },
+      onBuildOutput: ({ chunk }) => {
+        if (seq !== sessionSeq) return;
+        if (sweepBuildStatus) {
+          sweepBuildStatus.textContent = "Build: running...";
+        }
+        terminal.write(chunk);
+      },
+      onRunStart: ({ index, totalRuns, stddevMs, seed }) => {
+        if (seq !== sessionSeq) return;
+        if (
+          sweepBuildStatus &&
+          buildCmdTokens.length > 0 &&
+          sweepBuildStatus.textContent !== "Build: passed (exit 0)"
+        ) {
+          sweepBuildStatus.textContent = "Build: passed (exit 0)";
+        }
+        const computed = computeSweepRunParams(runBaseState, index);
+        const effStddev = Number.isFinite(stddevMs) ? stddevMs : computed.stddev;
+        const effSeed =
+          typeof seed === "bigint" ? seed : Number.isFinite(seed) ? seed : computed.seed;
+        const runSearch = buildRunSearch(
+          runBaseState,
+          { stddev: effStddev, seed: effSeed },
+          { existingSearch: window.location.search }
+        );
+        const runHref = `${window.location.pathname}${runSearch}`;
+        const rowRef = createSweepRowElement(index, effStddev, effSeed, runHref);
+        rowRefs.set(index, rowRef);
+        sweepRowEls.set(index, rowRef.tr);
+        sweepResultsBody?.appendChild(rowRef.tr);
+
+        activeSweepRunIndex = index;
+        if (!userPinnedRun) {
+          terminal.reset();
+          terminal.write(
+            `[sweep run #${index}/${totalRuns}] stddev=${effStddev}ms, seed=${effSeed}\r\n`
+          );
+        }
+      },
+      onRunOutput: ({ index, chunk }) => {
+        if (seq !== sessionSeq) return;
+        if (
+          (!userPinnedRun && activeSweepRunIndex === index) ||
+          (userPinnedRun && selectedRunIndex === index && activeSweepRunIndex === index)
+        ) {
+          terminal.write(chunk);
+        }
+      },
+      onRunComplete: (runResult) => {
+        if (seq !== sessionSeq) return;
+        const capped = {
+          ...runResult,
+          stdout: capCapturedText(runResult.stdout),
+          stderr: capCapturedText(runResult.stderr),
+        };
+        sweepRunRecords.set(runResult.index, capped);
+
+        const rowRef = rowRefs.get(runResult.index);
+        if (rowRef) {
+          const statusStr = String(runResult.status || (runResult.exitCode === 0 ? "pass" : "fail"));
+          rowRef.statusBadge.dataset.status = statusStr;
+          rowRef.statusBadge.textContent = statusStr;
+          rowRef.tdExit.textContent = String(runResult.exitCode);
+          rowRef.tdTime.textContent = formatVirtualTime(runResult.virtualTimeNs);
+        }
+        if (sweepProgressText) {
+          sweepProgressText.textContent = `${sweepRunRecords.size} / ${state.runs} runs`;
+        }
+        if (userPinnedRun && selectedRunIndex === runResult.index) {
+          selectSweepRun(runResult.index, { syncUrl: false });
+        }
+      },
+    });
+
+    if (seq !== sessionSeq) return;
+
+    activeAbortController = null;
+    containerExited = true;
+    stopBtn.disabled = true;
+    startBtn.disabled = false;
+
+    const buildFailed =
+      !result.build.skipped &&
+      (result.build.exitCode !== 0 || Boolean(result.build.error) || Boolean(result.build.timedOut));
+
+    if (sweepBuildStatus) {
+      if (result.build.skipped) {
+        sweepBuildStatus.textContent = "Build: skipped";
+      } else if (buildFailed) {
+        sweepBuildStatus.textContent = `Build: failed (exit ${result.build.exitCode})`;
+      } else {
+        sweepBuildStatus.textContent = "Build: passed (exit 0)";
+      }
+    }
+
+    if (sweepProgressText) {
+      sweepProgressText.textContent = `${result.runs.length} / ${state.runs} runs`;
+    }
+
+    if (buildFailed) {
+      if (sweepOutcomeBadge) {
+        sweepOutcomeBadge.dataset.outcome = "fail";
+        sweepOutcomeBadge.textContent = "Build Failed";
+      }
+      setProgress(100, "build");
+      setStatus(`Build failed (exit ${result.build.exitCode})`, "error");
+    } else if (result.failedRun) {
+      if (sweepOutcomeBadge) {
+        sweepOutcomeBadge.dataset.outcome = "fail";
+        sweepOutcomeBadge.textContent = `Failed (#${result.failedRun.index})`;
+      }
+      setProgress(100, "run");
+      setStatus(
+        `Sweep failed on run #${result.failedRun.index} (stddev=${result.failedRun.stddevMs}ms, seed=${result.failedRun.seed}, exit=${result.failedRun.exitCode})`,
+        "error"
+      );
+    } else {
+      if (sweepOutcomeBadge) {
+        sweepOutcomeBadge.dataset.outcome = "pass";
+        sweepOutcomeBadge.textContent = "Passed";
+      }
+      setProgress(100, "run");
+      setStatus(`Sweep passed (${result.runs.length}/${state.runs} runs)`, "idle");
+    }
+
+    const hadStaleSelectedRun =
+      selectedRunIndex !== null && !sweepRunRecords.has(selectedRunIndex);
+    if (selectedRunIndex !== null && sweepRunRecords.has(selectedRunIndex)) {
+      selectSweepRun(selectedRunIndex, { syncUrl: false });
+    } else if (result.runs.length === 0) {
+      if (hadStaleSelectedRun) {
+        selectedRunIndex = null;
+        syncUrlFromControls({ push: false });
+      }
+    } else if ((!userPinnedRun || hadStaleSelectedRun) && result.failedRun) {
+      selectSweepRun(result.failedRun.index, { syncUrl: hadStaleSelectedRun });
+    } else if ((!userPinnedRun || hadStaleSelectedRun) && result.runs.length > 0) {
+      selectSweepRun(result.runs[result.runs.length - 1].index, {
+        syncUrl: hadStaleSelectedRun,
+      });
+    }
+  } catch (err) {
+    if (seq !== sessionSeq) return;
+    activeAbortController = null;
+    containerExited = true;
+    stopBtn.disabled = true;
+    startBtn.disabled = false;
+
+    if (err?.name === "AbortError") {
+      if (sweepOutcomeBadge) {
+        sweepOutcomeBadge.dataset.outcome = "idle";
+        sweepOutcomeBadge.textContent = "Stopped";
+      }
+      if (
+        sweepBuildStatus &&
+        (sweepBuildStatus.textContent === "Build: running..." ||
+          sweepBuildStatus.textContent === "Build: pending")
+      ) {
+        sweepBuildStatus.textContent = "Build: stopped";
+      }
+      return;
+    }
+
+    const msg = err?.message || String(err);
+    if (sweepOutcomeBadge) {
+      sweepOutcomeBadge.dataset.outcome = "fail";
+      sweepOutcomeBadge.textContent = "Error";
+    }
+    if (
+      sweepBuildStatus &&
+      (sweepBuildStatus.textContent === "Build: running..." ||
+        sweepBuildStatus.textContent === "Build: pending")
+    ) {
+      sweepBuildStatus.textContent = "Build: error";
+    }
+    for (const rowEl of sweepRowEls.values()) {
+      const pill = rowEl.querySelector('.run-status-pill[data-status="running"]');
+      if (pill) {
+        pill.dataset.status = "error";
+        pill.textContent = "error";
+        const cells = rowEl.querySelectorAll("td");
+        if (cells[4] && cells[4].textContent === "…") {
+          cells[4].textContent = "—";
+        }
+        if (cells[5] && cells[5].textContent === "…") {
+          cells[5].textContent = "—";
+        }
+      }
+    }
+    setStatus(`Error: ${msg}`, "error");
+    terminal.write(`\r\n[elf2wasm] Sweep error: ${msg}\r\n`);
+  }
+}
+
 let isHydrating = false;
 
 function readStateFromControls() {
+  const sweep = Boolean(sweepModeToggle?.checked);
+  const runs = parseNonNegIntOr(
+    sweepRunsInput?.value,
+    DEFAULT_UI_STATE.runs,
+    1,
+    MAX_SWEEP_RUNS
+  );
   return {
     image: imageInput.value.trim() || DEFAULT_UI_STATE.image,
+    build: buildCmdInput ? buildCmdInput.value.trim() : "",
     cmd: cmdInput.value.trim(),
     repo: repoInput ? repoInput.value.trim() : "",
     ref: repoRefInput ? repoRefInput.value.trim() : "",
     mount: (repoMountInput ? repoMountInput.value.trim() : "") || DEFAULT_UI_STATE.mount,
     cwd: cwdInput.value.trim(),
     env: parseEnvLines(envInput.value),
+    stddev: parseNonNegFloatOr(delayStddevInput?.value, DEFAULT_UI_STATE.stddev, MAX_STDDEV_MS),
+    seed: parseNonNegIntOr(delaySeedInput?.value, DEFAULT_UI_STATE.seed, 0, MAX_SEED),
+    sweep,
+    runs,
+    stddevStart: parseNonNegFloatOr(
+      sweepStddevStartInput?.value,
+      DEFAULT_UI_STATE.stddevStart,
+      MAX_STDDEV_MS
+    ),
+    stddevStep: parseNonNegFloatOr(
+      sweepStddevStepInput?.value,
+      DEFAULT_UI_STATE.stddevStep,
+      MAX_STDDEV_MS
+    ),
+    selectedRun:
+      sweep && selectedRunIndex !== null && selectedRunIndex >= 1 && selectedRunIndex <= runs
+        ? selectedRunIndex
+        : null,
   };
 }
 
@@ -668,17 +1375,39 @@ function setActiveProjectPreset(activePresetId) {
   }
 }
 
+function updateSweepModeUi(state) {
+  const isSweep = Boolean(state.sweep);
+  if (startBtn) {
+    startBtn.textContent = isSweep ? "Run Sweep" : "Start Shell";
+  }
+  if (sweepParamsGrid) {
+    sweepParamsGrid.hidden = !isSweep;
+  }
+  if (delayStddevField) {
+    delayStddevField.dataset.dimmed = isSweep ? "true" : "false";
+  }
+  if (sweepPanel) {
+    sweepPanel.hidden = !isSweep && sweepRunRecords.size === 0;
+  }
+  if (sweepProgressText && sweepRunRecords.size === 0) {
+    sweepProgressText.textContent = `0 / ${state.runs} runs`;
+  }
+}
+
 function updateIdleDisplayFromState(state) {
   if (activeContainer || activeAbortController || !containerExited) {
     return;
   }
   if (statusText && statusPill?.dataset.state === "idle") {
-    statusText.textContent = `Idle — click Start Shell to boot ${state.image}`;
+    statusText.textContent = state.sweep
+      ? `Idle — click Run Sweep to sweep ${state.image} (${state.runs} runs)`
+      : `Idle — click Start Shell to boot ${state.image}`;
   }
   if (terminalTitleEl) {
     const repoSuffix = state.repo ? ` + ${state.repo}@${state.ref || "HEAD"}` : "";
     const displayCmd = state.cmd || "/bin/sh";
-    terminalTitleEl.textContent = `${state.image}${repoSuffix} — ${displayCmd}`;
+    const cmdSummary = state.build ? `${state.build} && ${displayCmd}` : displayCmd;
+    terminalTitleEl.textContent = `${state.image}${repoSuffix} — ${cmdSummary}`;
   }
 }
 
@@ -704,16 +1433,29 @@ function applyStateToControls(state, activePresetId) {
   isHydrating = true;
   try {
     imageInput.value = state.image;
+    if (buildCmdInput) buildCmdInput.value = state.build || "";
     cmdInput.value = state.cmd;
     if (repoInput) repoInput.value = state.repo;
     if (repoRefInput) repoRefInput.value = state.ref;
     if (repoMountInput) repoMountInput.value = state.mount;
     cwdInput.value = state.cwd;
     envInput.value = state.env.join("\n");
+    if (delayStddevInput) delayStddevInput.value = String(state.stddev ?? DEFAULT_UI_STATE.stddev);
+    if (delaySeedInput) delaySeedInput.value = String(state.seed ?? DEFAULT_UI_STATE.seed);
+    if (sweepModeToggle) sweepModeToggle.checked = Boolean(state.sweep);
+    if (sweepRunsInput) sweepRunsInput.value = String(state.runs ?? DEFAULT_UI_STATE.runs);
+    if (sweepStddevStartInput) {
+      sweepStddevStartInput.value = String(state.stddevStart ?? DEFAULT_UI_STATE.stddevStart);
+    }
+    if (sweepStddevStepInput) {
+      sweepStddevStepInput.value = String(state.stddevStep ?? DEFAULT_UI_STATE.stddevStep);
+    }
+    selectedRunIndex = state.sweep ? (state.selectedRun ?? null) : null;
     setActiveProjectPreset(activePresetId);
     if (advancedOptionsEl) {
       advancedOptionsEl.open = state.cwd.length > 0 || state.env.length > 0;
     }
+    updateSweepModeUi(state);
     updateIdleDisplayFromState(state);
   } finally {
     isHydrating = false;
@@ -726,10 +1468,20 @@ function applyStateFromUrl() {
 }
 
 async function startFromControls() {
-  const imageRef = imageInput.value.trim() || "alpine:latest";
+  const imageRef = imageInput.value.trim() || DEFAULT_UI_STATE.image;
   imageInput.value = imageRef;
+  const state = readStateFromControls();
   syncUrlFromControls({ push: false });
-  await bootImage({ imageRef });
+  if (state.sweep) {
+    await runSweepFromControls(state);
+  } else {
+    await bootImage({
+      imageRef,
+      buildCmdStr: state.build,
+      delayStddevMs: state.stddev,
+      delaySeed: state.seed,
+    });
+  }
 }
 
 // Wire primary controls
@@ -747,21 +1499,37 @@ clearBtn.addEventListener("click", () => {
   terminal.focus();
 });
 
-imageInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") {
-    e.preventDefault();
-    void startFromControls();
+let copySweepLinkResetTimer = null;
+copySweepLinkBtn?.addEventListener("click", async () => {
+  const search = serializeStateToSearch(readStateFromControls(), {
+    existingSearch: window.location.search,
+  });
+  const url = `${window.location.origin}${window.location.pathname}${search}${window.location.hash}`;
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(url);
+    }
+  } catch {
+    // Clipboard access may be denied in non-secure contexts
   }
+  copySweepLinkBtn.textContent = "Copied!";
+  if (copySweepLinkResetTimer !== null) {
+    clearTimeout(copySweepLinkResetTimer);
+  }
+  copySweepLinkResetTimer = setTimeout(() => {
+    copySweepLinkResetTimer = null;
+    copySweepLinkBtn.textContent = "Copy Sweep Link";
+  }, 1500);
 });
 
-cmdInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") {
-    e.preventDefault();
-    void startFromControls();
-  }
-});
-
-for (const inputEl of [repoInput, repoRefInput, repoMountInput]) {
+for (const inputEl of [
+  imageInput,
+  buildCmdInput,
+  cmdInput,
+  repoInput,
+  repoRefInput,
+  repoMountInput,
+]) {
   inputEl?.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       e.preventDefault();
@@ -773,17 +1541,28 @@ for (const inputEl of [repoInput, repoRefInput, repoMountInput]) {
 function handleControlChange() {
   if (isHydrating) return;
   const state = readStateFromControls();
+  if (!state.sweep) {
+    selectedRunIndex = null;
+  }
   setActiveProjectPreset(matchProjectPreset(state, PROJECT_PRESETS));
+  updateSweepModeUi(state);
   updateIdleDisplayFromState(state);
   syncUrlFromControls({ push: false });
 }
 
 for (const controlEl of [
   imageInput,
+  buildCmdInput,
   cmdInput,
   repoInput,
   repoRefInput,
   repoMountInput,
+  delayStddevInput,
+  delaySeedInput,
+  sweepModeToggle,
+  sweepRunsInput,
+  sweepStddevStartInput,
+  sweepStddevStepInput,
   envInput,
   cwdInput,
 ]) {
@@ -796,20 +1575,71 @@ function clearActiveProjectPreset() {
   setActiveProjectPreset(null);
 }
 
+function clearSweepResults() {
+  selectedRunIndex = null;
+  sweepRunRecords.clear();
+  sweepRowEls.clear();
+  if (sweepResultsBody) sweepResultsBody.textContent = "";
+  sweepBaseState = null;
+  userPinnedRun = false;
+  activeSweepRunIndex = null;
+  if (sweepOutcomeBadge) {
+    sweepOutcomeBadge.dataset.outcome = "idle";
+    sweepOutcomeBadge.textContent = "Idle";
+  }
+  if (sweepBuildStatus) {
+    sweepBuildStatus.textContent = "Build: —";
+  }
+}
+
+function cancelActiveSessionForNavigation() {
+  if (
+    activeAbortController !== null ||
+    activeContainer !== null ||
+    sweepOutcomeBadge?.dataset?.outcome === "running"
+  ) {
+    sessionSeq++;
+    void stopActiveSession({ updateUi: false });
+    stopBtn.disabled = true;
+    startBtn.disabled = false;
+    setProgress(0, "idle");
+    setStatus("Ready", "idle");
+  }
+}
+
+function resetDelayAndSweepControls() {
+  if (delayStddevInput) delayStddevInput.value = String(DEFAULT_UI_STATE.stddev);
+  if (delaySeedInput) delaySeedInput.value = String(DEFAULT_UI_STATE.seed);
+  if (sweepModeToggle) sweepModeToggle.checked = false;
+  if (sweepRunsInput) sweepRunsInput.value = String(DEFAULT_UI_STATE.runs);
+  if (sweepStddevStartInput) {
+    sweepStddevStartInput.value = String(DEFAULT_UI_STATE.stddevStart);
+  }
+  if (sweepStddevStepInput) {
+    sweepStddevStepInput.value = String(DEFAULT_UI_STATE.stddevStep);
+  }
+  clearSweepResults();
+}
+
 for (const chip of presetChips) {
   chip.addEventListener("click", () => {
     const img = chip.dataset.image;
     if (img) {
+      cancelActiveSessionForNavigation();
       clearActiveProjectPreset();
       imageInput.value = img;
+      if (buildCmdInput) buildCmdInput.value = "";
       if (repoInput) repoInput.value = "";
       if (repoRefInput) repoRefInput.value = "";
       if (repoMountInput) repoMountInput.value = "/workspace";
       cmdInput.value = "";
       cwdInput.value = "";
       envInput.value = "";
+      resetDelayAndSweepControls();
       imageInput.focus();
-      updateIdleDisplayFromState(readStateFromControls());
+      const nextState = readStateFromControls();
+      updateSweepModeUi(nextState);
+      updateIdleDisplayFromState(nextState);
       syncUrlFromControls({ push: true });
     }
   });
@@ -819,23 +1649,31 @@ for (const chip of projectPresetChips) {
   chip.addEventListener("click", () => {
     const preset = PROJECT_PRESETS[chip.dataset.preset];
     if (!preset) return;
+    cancelActiveSessionForNavigation();
     clearActiveProjectPreset();
     chip.dataset.active = "true";
     imageInput.value = preset.image;
+    if (buildCmdInput) buildCmdInput.value = preset.build || "";
     if (repoInput) repoInput.value = preset.repo;
     if (repoRefInput) repoRefInput.value = preset.ref;
     if (repoMountInput) repoMountInput.value = preset.mountPath || "/workspace";
     cmdInput.value = preset.cmd;
     cwdInput.value = preset.cwd || preset.mountPath || "/workspace";
     envInput.value = Array.isArray(preset.env) ? preset.env.join("\n") : "";
+    resetDelayAndSweepControls();
     startBtn.focus();
-    updateIdleDisplayFromState(readStateFromControls());
+    const nextState = readStateFromControls();
+    updateSweepModeUi(nextState);
+    updateIdleDisplayFromState(nextState);
     syncUrlFromControls({ push: true });
   });
 }
 
 window.addEventListener("popstate", () => {
-  applyStateFromUrl();
+  const { state, activePresetId } = parseStateFromSearch(window.location.search, PROJECT_PRESETS);
+  cancelActiveSessionForNavigation();
+  clearSweepResults();
+  applyStateToControls(state, activePresetId);
 });
 
 // Synchronously hydrate UI controls from URL query parameters on initial load (never auto-boot)
