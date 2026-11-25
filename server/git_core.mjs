@@ -362,7 +362,7 @@ export function resolveGitArchiveSpec(rawRepo, rawRef, { allowLocalRegistries = 
   let archiveUrl;
   if (parsed.provider === "github") {
     archiveUrl = new URL(
-      `https://github.com/${parsed.owner}/${parsed.repo}/archive/${encodedRefPath}.tar.gz`
+      `https://codeload.github.com/${parsed.owner}/${parsed.repo}/tar.gz/${encodedRefPath}`
     );
   } else if (parsed.provider === "gitlab") {
     const safeFilenameRef = encodeURIComponent(ref.replaceAll("/", "-"));

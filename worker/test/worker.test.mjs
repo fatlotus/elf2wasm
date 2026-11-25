@@ -1112,20 +1112,20 @@ describe("Cloudflare Worker: /api/git/archive Proxy", () => {
     };
   }
 
-  it("streams GitHub archive across 302 codeload redirect, normalizes headers, and cancels redirect body", async () => {
+  it("streams GitHub archive across 302 cross-origin redirect, normalizes headers, and cancels redirect body", async () => {
     const seen = [];
     const redirectTracked = makeTrackedResponse("redirect body", {
       status: 302,
-      headers: { Location: "https://codeload.github.com/octocat/Hello-World/tar.gz/HEAD" },
+      headers: { Location: "https://objects.githubusercontent.com/octocat/Hello-World/HEAD.tar.gz" },
     });
 
     const worker = createWorkerHandler({
       fetchImpl: async (url, init) => {
         seen.push({ url, method: init.method, headers: new Headers(init.headers) });
-        if (url === "https://github.com/octocat/Hello-World/archive/HEAD.tar.gz") {
+        if (url === "https://codeload.github.com/octocat/Hello-World/tar.gz/HEAD") {
           return redirectTracked.response;
         }
-        if (url === "https://codeload.github.com/octocat/Hello-World/tar.gz/HEAD") {
+        if (url === "https://objects.githubusercontent.com/octocat/Hello-World/HEAD.tar.gz") {
           return new Response(FAKE_GZIP, {
             status: 200,
             headers: {
@@ -1247,7 +1247,7 @@ describe("Cloudflare Worker: /api/git/archive Proxy", () => {
     const worker = createWorkerHandler({
       fetchImpl: async (url) => {
         fetchCalls++;
-        if (url === "https://github.com/evil/repo/archive/HEAD.tar.gz") {
+        if (url === "https://codeload.github.com/evil/repo/tar.gz/HEAD") {
           return ssrfRedirect.response;
         }
         return new Response(FAKE_GZIP, { status: 200 });
@@ -1321,11 +1321,11 @@ describe("Cloudflare Worker: /api/git/archive Proxy", () => {
     const worker = createWorkerHandler({
       maxRedirects: 2,
       fetchImpl: async (url) => {
-        if (url.includes("/archive/missing.tar.gz")) return tracked404.response;
-        if (url.includes("/archive/ratelimit.tar.gz")) return tracked429.response;
-        if (url.includes("/archive/fail500.tar.gz")) return tracked500.response;
-        if (url.includes("/archive/neterr.tar.gz")) throw new Error("ECONNRESET");
-        if (url.includes("/archive/loop.tar.gz")) {
+        if (url.includes("/tar.gz/missing")) return tracked404.response;
+        if (url.includes("/tar.gz/ratelimit")) return tracked429.response;
+        if (url.includes("/tar.gz/fail500")) return tracked500.response;
+        if (url.includes("/tar.gz/neterr")) throw new Error("ECONNRESET");
+        if (url.includes("/tar.gz/loop")) {
           return new Response(null, { status: 302, headers: { Location: url } });
         }
         return new Response(FAKE_GZIP, { status: 200 });
@@ -1518,13 +1518,13 @@ describe("Cloudflare Worker: M13 Phase 2 Adversarial Regressions (BUG-A1, A2, A3
       new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World#frag`)
     );
     assert.equal(r1.status, 200);
-    assert.equal(requestedUrls[0], "https://github.com/octocat/Hello-World/archive/HEAD.tar.gz");
+    assert.equal(requestedUrls[0], "https://codeload.github.com/octocat/Hello-World/tar.gz/HEAD");
 
     const r2 = await worker.fetch(
       new Request(`${WORKER_ORIGIN}/api/git/archive?repo=octocat/Hello-World&ref=main#frag`)
     );
     assert.equal(r2.status, 200);
-    assert.equal(requestedUrls[1], "https://github.com/octocat/Hello-World/archive/main.tar.gz");
+    assert.equal(requestedUrls[1], "https://codeload.github.com/octocat/Hello-World/tar.gz/main");
   });
 
   it("BUG-A2: emits Vary: Origin even when Origin header is absent if ALLOWED_ORIGINS is configured", async () => {
@@ -1743,7 +1743,7 @@ describe("Cloudflare Worker: M13 Phase 2 Adversarial Regressions (BUG-A1, A2, A3
     const worker = createWorkerHandler({
       cache,
       fetchImpl: async (url) => {
-        if (url.startsWith("https://github.com/")) {
+        if (url.startsWith("https://codeload.github.com/")) {
           gitUpstreamCalls++;
           return new Response(FAKE_GZIP, {
             status: 200,

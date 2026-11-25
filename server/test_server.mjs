@@ -970,7 +970,7 @@ describe("F25: Git Core Pure Helpers (parseGitRepo, validateGitRef, resolveGitAr
       assert.equal(spec.defaultStripComponents, 1);
       assert.equal(
         spec.archiveUrl.toString(),
-        "https://github.com/octocat/Hello-World/archive/HEAD.tar.gz"
+        "https://codeload.github.com/octocat/Hello-World/tar.gz/HEAD"
       );
     }
 
@@ -980,7 +980,7 @@ describe("F25: Git Core Pure Helpers (parseGitRepo, validateGitRef, resolveGitAr
     assert.equal(shaSpec.cacheControl, GIT_ARCHIVE_IMMUTABLE_CACHE_CONTROL);
     assert.equal(
       shaSpec.archiveUrl.toString(),
-      `https://github.com/octocat/Hello-World/archive/${FULL_SHA}.tar.gz`
+      `https://codeload.github.com/octocat/Hello-World/tar.gz/${FULL_SHA}`
     );
 
     // Short SHA, slash branch, tag, explicit refs/heads and refs/tags
@@ -997,7 +997,7 @@ describe("F25: Git Core Pure Helpers (parseGitRepo, validateGitRef, resolveGitAr
       assert.equal(s.cacheControl, GIT_ARCHIVE_MUTABLE_CACHE_CONTROL);
       assert.equal(
         s.archiveUrl.toString(),
-        `https://github.com/octocat/Hello-World/archive/${ref}.tar.gz`
+        `https://codeload.github.com/octocat/Hello-World/tar.gz/${ref}`
       );
     }
   });
@@ -1543,7 +1543,7 @@ describe("M13 Phase 2: Backend Git Proxy Adversarial Regressions (BUG-A1, A3, A4
     assert.equal(s1.ref, "HEAD");
     assert.equal(
       s1.archiveUrl.toString(),
-      "https://github.com/octocat/Hello-World/archive/HEAD.tar.gz"
+      "https://codeload.github.com/octocat/Hello-World/tar.gz/HEAD"
     );
 
     const s2 = parseGitArchiveQuery(
@@ -1553,7 +1553,7 @@ describe("M13 Phase 2: Backend Git Proxy Adversarial Regressions (BUG-A1, A3, A4
     assert.equal(s2.ref, "main");
     assert.equal(
       s2.archiveUrl.toString(),
-      "https://github.com/octocat/Hello-World/archive/main.tar.gz"
+      "https://codeload.github.com/octocat/Hello-World/tar.gz/main"
     );
 
     // Still rejects control characters / null bytes even after fragment
