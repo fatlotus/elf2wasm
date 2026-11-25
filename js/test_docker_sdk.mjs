@@ -38,6 +38,7 @@ import {
   DockerImage,
   DockerContainer,
   runDockerImage,
+  runSweep,
   fetchGitArchive,
   getGoDefaultEnv,
   isGoImageRef,
@@ -2956,6 +2957,1019 @@ test("M14: IPv4 TCP loopback socket bind/listen/connect/accept4/epoll/shutdown r
   assert.equal(res.exitCode, 0);
   assert.equal(out, "TCP_LOOPBACK_OK\n");
 });
+
+// ============================================================================
+// Milestone M17: Relative cwd, CoW VFS snapshots, delay injection, exec, sweep & CLI
+// ============================================================================
+
+const SYSCALL_HELPER_C = `
+static inline long sc6(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
+  long ret;
+  register long r10 __asm__("r10") = a4;
+  register long r8 __asm__("r8") = a5;
+  register long r9 __asm__("r9") = a6;
+  __asm__ volatile("syscall"
+    : "=a"(ret)
+    : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8), "r"(r9)
+    : "rcx", "r11", "memory");
+  return ret;
+}
+static long c_strlen(const char *s) {
+  long n = 0;
+  while (s[n]) n++;
+  return n;
+}
+static void write_str(int fd, const char *s) {
+  sc6(1, fd, (long)s, c_strlen(s), 0, 0, 0);
+}
+static void write_u64(int fd, unsigned long v) {
+  char buf[24];
+  int i = 23;
+  buf[i] = 0;
+  if (v == 0) {
+    buf[--i] = '0';
+  } else {
+    while (v > 0) {
+      buf[--i] = (char)('0' + (v % 10));
+      v /= 10;
+    }
+  }
+  write_str(fd, &buf[i]);
+}
+static void write_hex(int fd, const unsigned char *data, int len) {
+  static const char hex[] = "0123456789abcdef";
+  char buf[64];
+  for (int i = 0; i < len; i++) {
+    buf[i * 2] = hex[(data[i] >> 4) & 0xf];
+    buf[i * 2 + 1] = hex[data[i] & 0xf];
+  }
+  sc6(1, fd, (long)buf, len * 2, 0, 0, 0);
+}
+`;
+
+function buildTcpDelayProbeElf() {
+  return buildStaticTestElf(`
+    ${SYSCALL_HELPER_C}
+    void _start(void) {
+      unsigned char rnd[8] = {0};
+      sc6(318 /* getrandom */, (long)rnd, 8, 0, 0, 0, 0);
+      write_str(1, "RAND=");
+      write_hex(1, rnd, 8);
+      write_str(1, "\\n");
+
+      long ts0[2] = {0, 0};
+      long ts1[2] = {0, 0};
+      sc6(228 /* clock_gettime */, 1 /* CLOCK_MONOTONIC */, (long)ts0, 0, 0, 0, 0);
+
+      long lfd = sc6(41 /* socket */, 2 /* AF_INET */, 1 /* SOCK_STREAM */, 0, 0, 0, 0);
+      if (lfd < 3) sc6(231, 10, 0, 0, 0, 0, 0);
+      unsigned char sa[16] = {2, 0, 0, 0, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0};
+      if (sc6(49 /* bind */, lfd, (long)sa, 16, 0, 0, 0) != 0) sc6(231, 11, 0, 0, 0, 0, 0);
+      unsigned char bound[16] = {0};
+      unsigned int blen = 16;
+      if (sc6(51 /* getsockname */, lfd, (long)bound, (long)&blen, 0, 0, 0) != 0) sc6(231, 12, 0, 0, 0, 0, 0);
+      if (sc6(50 /* listen */, lfd, 16, 0, 0, 0, 0) != 0) sc6(231, 13, 0, 0, 0, 0, 0);
+
+      long cfd = sc6(41 /* socket */, 2, 1, 0, 0, 0, 0);
+      if (cfd < 3) sc6(231, 14, 0, 0, 0, 0, 0);
+      if (sc6(42 /* connect */, cfd, (long)bound, 16, 0, 0, 0) != 0) sc6(231, 15, 0, 0, 0, 0, 0);
+      long sfd = sc6(288 /* accept4 */, lfd, 0, 0, 0, 0, 0);
+      if (sfd < 3) sc6(231, 16, 0, 0, 0, 0, 0);
+
+      char msg[4] = {'p', 'i', 'n', 'g'};
+      char buf[8];
+      for (int i = 0; i < 16; i++) {
+        if (sc6(44 /* sendto */, cfd, (long)msg, 4, 0, 0, 0) != 4) sc6(231, 17, 0, 0, 0, 0, 0);
+        if (sc6(45 /* recvfrom */, sfd, (long)buf, 4, 0, 0, 0) != 4) sc6(231, 18, 0, 0, 0, 0, 0);
+      }
+
+      sc6(3, cfd, 0, 0, 0, 0, 0);
+      sc6(3, sfd, 0, 0, 0, 0, 0);
+      sc6(3, lfd, 0, 0, 0, 0, 0);
+
+      sc6(228 /* clock_gettime */, 1 /* CLOCK_MONOTONIC */, (long)ts1, 0, 0, 0, 0);
+      unsigned long t0 = (unsigned long)ts0[0] * 1000000000UL + (unsigned long)ts0[1];
+      unsigned long t1 = (unsigned long)ts1[0] * 1000000000UL + (unsigned long)ts1[1];
+      unsigned long dt = t1 >= t0 ? (t1 - t0) : 0;
+      write_str(1, "DT_NS=");
+      write_u64(1, dt);
+      write_str(1, "\\n");
+      sc6(231, 0, 0, 0, 0, 0, 0);
+    }
+  `);
+}
+
+test("M17: Elf2WasmSystem resolves relative executable paths against options.cwd and preserves argv[0]", async () => {
+  const cwdProgElf = buildStaticTestElf(`
+    ${SYSCALL_HELPER_C}
+    void run_main(long *sp) {
+      long argc = sp[0];
+      const char **argv = (const char **)&sp[1];
+      char cwd[256];
+      sc6(79 /* getcwd */, (long)cwd, sizeof(cwd), 0, 0, 0, 0);
+      write_str(1, "CWD=");
+      write_str(1, cwd);
+      write_str(1, "\\nARGC=");
+      write_u64(1, (unsigned long)argc);
+      write_str(1, "\\nARGV0=");
+      write_str(1, argc > 0 ? argv[0] : "");
+      write_str(1, "\\nARGV1=");
+      write_str(1, argc > 1 ? argv[1] : "");
+      write_str(1, "\\n");
+      sc6(231, 0, 0, 0, 0, 0, 0);
+    }
+    __attribute__((naked)) void _start(void) {
+      __asm__ volatile(
+        "mov %rsp, %rdi\\n"
+        "and $-16, %rsp\\n"
+        "call run_main\\n"
+      );
+    }
+  `);
+
+  const sys = await Elf2WasmSystem.create({
+    compilerWasm: fs.readFileSync(COMPILER_WASM_PATH),
+    runtimeWasm: fs.readFileSync(RUNTIME_WASM_PATH),
+  });
+  sys.writeVfsFile("/workspace/example/prog", cwdProgElf, 0o755);
+  sys.writeVfsFile("/workspace/example/sub/prog", cwdProgElf, 0o755);
+  sys.writeVfsDir("/workspace/other", 0o755);
+
+  const r1 = await sys.runFromVfs("./prog", ["./prog", "rel1"], { cwd: "/workspace/example" });
+  assert.equal(r1.exitCode, 0);
+  const out1 = textDecoder.decode(r1.stdout);
+  assert.match(out1, /CWD=\/workspace\/example\n/);
+  assert.match(out1, /ARGC=2\n/);
+  assert.match(out1, /ARGV0=\.\/prog\n/);
+  assert.match(out1, /ARGV1=rel1\n/);
+
+  const r2 = await sys.runFromVfs("sub/prog", ["sub/prog", "rel2"], { cwd: "/workspace/example" });
+  assert.equal(r2.exitCode, 0);
+  const out2 = textDecoder.decode(r2.stdout);
+  assert.match(out2, /ARGV0=sub\/prog\n/);
+  assert.match(out2, /ARGV1=rel2\n/);
+
+  const r3 = await sys.runFromVfs("../example/prog", ["../example/prog", "rel3"], {
+    cwd: "/workspace/other",
+  });
+  assert.equal(r3.exitCode, 0);
+  const out3 = textDecoder.decode(r3.stdout);
+  assert.match(out3, /CWD=\/workspace\/other\n/);
+  assert.match(out3, /ARGV1=rel3\n/);
+
+  await assert.rejects(
+    () => sys.runFromVfs("./missing", ["./missing"], { cwd: "/workspace/example" }),
+    (err) => err && err.code === "ENOENT"
+  );
+});
+
+test("M17: CoW VFS snapshot/restore/drop isolation across Elf2WasmSystem, DirectBackend, and WorkerBackend", async () => {
+  const mutatorElf = buildStaticTestElf(`
+    ${SYSCALL_HELPER_C}
+    void _start(void) {
+      long fd = sc6(257 /* openat */, -100 /* AT_FDCWD */, (long)"/work/dirty.txt", 0 /* O_RDONLY */, 0, 0, 0);
+      if (fd >= 0) {
+        sc6(3, fd, 0, 0, 0, 0, 0);
+        write_str(1, "DIRTY=1\\n");
+      } else {
+        write_str(1, "DIRTY=0\\n");
+      }
+      long dfd = sc6(257, -100, (long)"/work/dirty.txt", 0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644, 0, 0);
+      if (dfd >= 0) {
+        sc6(1, dfd, (long)"yes", 3, 0, 0, 0);
+        sc6(3, dfd, 0, 0, 0, 0, 0);
+      }
+      long bfd = sc6(257, -100, (long)"/work/base.txt", 0x241, 0644, 0, 0);
+      if (bfd >= 0) {
+        sc6(1, bfd, (long)"mutated", 7, 0, 0, 0);
+        sc6(3, bfd, 0, 0, 0, 0, 0);
+      }
+      sc6(263 /* unlinkat */, -100, (long)"/work/keep.txt", 0, 0, 0, 0);
+      sc6(266 /* symlinkat */, (long)"dirty.txt", -100, (long)"/work/guestlink", 0, 0, 0);
+      sc6(231, 0, 0, 0, 0, 0, 0);
+    }
+  `);
+
+  // 1. Direct Elf2WasmSystem snapshot/restore/drop + live runtime_read_vfs_link
+  const sys = await Elf2WasmSystem.create({
+    compilerWasm: fs.readFileSync(COMPILER_WASM_PATH),
+    runtimeWasm: fs.readFileSync(RUNTIME_WASM_PATH),
+  });
+  sys.writeVfsFile("/bin/mutator", mutatorElf, 0o755);
+  sys.writeVfsDir("/work", 0o755);
+  sys.writeVfsFile("/work/base.txt", new TextEncoder().encode("original"), 0o644);
+  sys.writeVfsFile("/work/keep.txt", new TextEncoder().encode("keep"), 0o644);
+  sys.writeVfsSymlink("/work/link", "base.txt");
+
+  const snapId = sys.snapshotVfs();
+  assert.ok(snapId > 0);
+
+  const run1 = await sys.runFromVfs("/bin/mutator", ["/bin/mutator"]);
+  assert.equal(run1.exitCode, 0);
+  assert.equal(textDecoder.decode(run1.stdout), "DIRTY=0\n");
+  assert.equal(textDecoder.decode(sys.readVfsFile("/work/dirty.txt")), "yes");
+  assert.equal(textDecoder.decode(sys.readVfsFile("/work/base.txt")), "mutated");
+  assert.equal(sys.readVfsFile("/work/keep.txt"), null);
+  assert.equal(sys.readVfsLink("/work/guestlink"), "dirty.txt");
+  sys.removeVfsPath("/work/link");
+  assert.equal(sys.readVfsLink("/work/link"), null);
+
+  sys.restoreVfs(snapId);
+  assert.equal(sys.readVfsFile("/work/dirty.txt"), null);
+  assert.equal(textDecoder.decode(sys.readVfsFile("/work/base.txt")), "original");
+  assert.equal(textDecoder.decode(sys.readVfsFile("/work/keep.txt")), "keep");
+  assert.equal(sys.readVfsLink("/work/link"), "base.txt");
+  assert.equal(sys.readVfsLink("/work/guestlink"), null);
+
+  const run2 = await sys.runFromVfs("/bin/mutator", ["/bin/mutator"]);
+  assert.equal(run2.exitCode, 0);
+  assert.equal(textDecoder.decode(run2.stdout), "DIRTY=0\n");
+
+  sys.dropVfsSnapshot(snapId);
+  assert.throws(() => sys.restoreVfs(snapId), /runtime_restore_vfs failed/);
+  assert.throws(() => sys.restoreVfs(99999), /runtime_restore_vfs failed/);
+  assert.throws(() => sys.dropVfsSnapshot(99999), /runtime_drop_vfs_snapshot failed/);
+  assert.throws(() => sys.dropVfsSnapshot(0), RangeError);
+
+  // 2. DockerContainer snapshotVfs/restoreVfs/dropVfsSnapshot + reusable exec() on DirectBackend & WorkerBackend
+  const mockReg = createMockRegistry({ port: 0, host: "127.0.0.1" });
+  mockReg.addImage("library/snaptest", "latest", {
+    config: { cmd: ["/bin/mutator"], env: ["PATH=/bin"], workingDir: "/work" },
+    layers: [
+      {
+        files: [
+          { path: "bin/mutator", type: "file", content: mutatorElf, mode: 0o755 },
+          { path: "work", type: "dir", mode: 0o755 },
+          { path: "work/base.txt", type: "file", content: "original", mode: 0o644 },
+          { path: "work/keep.txt", type: "file", content: "keep", mode: 0o644 },
+        ],
+      },
+    ],
+  });
+  await mockReg.start();
+  const srv = createServer({ port: 0, host: "127.0.0.1", allowLocalRegistries: true });
+  await srv.start();
+
+  const origWorker = globalThis.Worker;
+  const origSelf = globalThis.self;
+  try {
+    const verifyBackend = async (useWorker) => {
+      if (useWorker) {
+        class InProcessWorker {
+          constructor(url) {
+            this._listeners = new Map();
+            this._terminated = false;
+            this._workerListeners = [];
+            const selfShim = {
+              addEventListener: (type, fn) => {
+                if (type === "message") this._workerListeners.push(fn);
+              },
+              postMessage: (data) => {
+                if (this._terminated) return;
+                queueMicrotask(() => {
+                  if (this._terminated) return;
+                  for (const fn of this._listeners.get("message") || []) fn({ data });
+                });
+              },
+            };
+            globalThis.self = selfShim;
+            this._ready = import(`${url.href}?m17=${Date.now()}_${Math.random()}`);
+          }
+          addEventListener(type, fn) {
+            if (!this._listeners.has(type)) this._listeners.set(type, new Set());
+            this._listeners.get(type).add(fn);
+          }
+          postMessage(data) {
+            if (this._terminated) return;
+            this._ready.then(() => {
+              if (this._terminated) return;
+              for (const fn of this._workerListeners) fn({ data });
+            });
+          }
+          terminate() {
+            this._terminated = true;
+          }
+        }
+        globalThis.Worker = InProcessWorker;
+      }
+
+      const docker = await Elf2WasmDocker.create({
+        compilerWasmUrl: `${srv.url}/wasm/elf2wasm_compiler_wasm.wasm`,
+        runtimeWasmUrl: `${srv.url}/wasm/elf2wasm_runtime_wasm.wasm`,
+        registryProxyBase: `${srv.url}/api/v2`,
+        useWorker,
+      });
+      try {
+        const img = await docker.pullImage(`${mockReg.host}/library/snaptest:latest`);
+        const container = await img.createContainer({ tty: false });
+        await img.dispose();
+
+        const sid = await container.snapshotVfs();
+        assert.ok(sid > 0);
+
+        let streamed1 = "";
+        const e1 = await container.exec({
+          cmd: ["/bin/mutator"],
+          onStdout: (c) => {
+            streamed1 += textDecoder.decode(c);
+          },
+        });
+        assert.equal(e1.exitCode, 0);
+        assert.equal(e1.stdout, "DIRTY=0\n");
+        assert.equal(streamed1, "DIRTY=0\n");
+
+        // Without restore, second exec sees DIRTY=1 (container not destroyed)
+        const eDirty = await container.exec({ cmd: ["/bin/mutator"] });
+        assert.equal(eDirty.exitCode, 0);
+        assert.equal(eDirty.stdout, "DIRTY=1\n");
+
+        // With restore, third exec sees DIRTY=0 again
+        await container.restoreVfs(sid);
+        const eClean = await container.exec({ cmd: ["/bin/mutator"] });
+        assert.equal(eClean.exitCode, 0);
+        assert.equal(eClean.stdout, "DIRTY=0\n");
+
+        await container.dropVfsSnapshot(sid);
+        await container.stop();
+      } finally {
+        await docker.dispose();
+      }
+    };
+
+    await verifyBackend(false);
+    await verifyBackend(true);
+  } finally {
+    globalThis.Worker = origWorker;
+    globalThis.self = origSelf;
+    await srv.stop();
+    await mockReg.stop();
+  }
+});
+
+test("M17: Deterministic simulated-time delay injection (determinism, seed sensitivity, zero real-time wait)", async () => {
+  const probeElf = buildTcpDelayProbeElf();
+  const parseProbe = (stdoutStr) => {
+    const randMatch = stdoutStr.match(/RAND=([0-9a-f]{16})/);
+    const dtMatch = stdoutStr.match(/DT_NS=(\d+)/);
+    assert.ok(randMatch, `Missing RAND in output: ${stdoutStr}`);
+    assert.ok(dtMatch, `Missing DT_NS in output: ${stdoutStr}`);
+    return { rand: randMatch[1], dtNs: Number(dtMatch[1]) };
+  };
+
+  const sys1 = await Elf2WasmSystem.create({
+    compilerWasm: fs.readFileSync(COMPILER_WASM_PATH),
+    runtimeWasm: fs.readFileSync(RUNTIME_WASM_PATH),
+  });
+  sys1.writeVfsFile("/bin/probe", probeElf, 0o755);
+
+  const a1 = await sys1.runFromVfs("/bin/probe", ["/bin/probe"], {
+    delayStddevMs: 50,
+    delaySeed: 42,
+  });
+  const a2 = await sys1.runFromVfs("/bin/probe", ["/bin/probe"], {
+    delayStddevMs: 50,
+    delaySeed: 42,
+  });
+
+  // Fresh standalone Elf2WasmSystem must produce bit-for-bit identical output & virtual time
+  const sysStandalone = await Elf2WasmSystem.create({
+    compilerWasm: fs.readFileSync(COMPILER_WASM_PATH),
+    runtimeWasm: fs.readFileSync(RUNTIME_WASM_PATH),
+  });
+  sysStandalone.writeVfsFile("/bin/probe", probeElf, 0o755);
+  const a3 = await sysStandalone.runFromVfs("/bin/probe", ["/bin/probe"], {
+    delayStddevMs: 50,
+    delaySeed: 42,
+  });
+
+  const out1 = textDecoder.decode(a1.stdout);
+  const out2 = textDecoder.decode(a2.stdout);
+  const out3 = textDecoder.decode(a3.stdout);
+  assert.equal(a1.exitCode, 0);
+  assert.equal(out2, out1);
+  assert.equal(out3, out1);
+  assert.equal(a2.virtualTimeNs, a1.virtualTimeNs);
+  assert.equal(a3.virtualTimeNs, a1.virtualTimeNs);
+
+  // Different seed produces different RAND and DT_NS
+  const b1 = await sys1.runFromVfs("/bin/probe", ["/bin/probe"], {
+    delayStddevMs: 50,
+    delaySeed: 43,
+  });
+  const pA = parseProbe(out1);
+  const pB = parseProbe(textDecoder.decode(b1.stdout));
+  assert.notEqual(pB.rand, pA.rand);
+  assert.notEqual(pB.dtNs, pA.dtNs);
+
+  // Large simulated delay (5000ms stddev over 16 sends -> tens of seconds simulated) finishes fast in wall time
+  const tWall0 = performance.now();
+  const big = await sys1.runFromVfs("/bin/probe", ["/bin/probe"], {
+    delayStddevMs: 5000,
+    delaySeed: 7,
+  });
+  const wallMs = performance.now() - tWall0;
+  const pBig = parseProbe(textDecoder.decode(big.stdout));
+  assert.equal(big.exitCode, 0);
+  assert.ok(wallMs < 5000, `Expected simulated time (no real wait), but took ${wallMs}ms`);
+  assert.ok(
+    pBig.dtNs > 1_000_000_000,
+    `Expected >1s simulated DT_NS, got ${pBig.dtNs}`
+  );
+  assert.ok(
+    big.virtualTimeNs > 1_000_000_000,
+    `Expected >1s virtualTimeNs, got ${big.virtualTimeNs}`
+  );
+
+  // Zero-delay baseline
+  const zero = await sys1.runFromVfs("/bin/probe", ["/bin/probe"], {
+    delayStddevMs: 0,
+    delaySeed: 0,
+  });
+  const pZero = parseProbe(textDecoder.decode(zero.stdout));
+  assert.equal(zero.exitCode, 0);
+  assert.ok(pZero.dtNs < 10_000_000, `Expected minimal DT_NS at stddev=0, got ${pZero.dtNs}`);
+});
+
+test("M17: runSweep() lifecycle (build-once, stop-on-failure, stopOnFailure=false, pass-all, build-fail, skipped-build) and exec() timeout/abort", async () => {
+  // /bin/builder: exits 42 if FAIL_BUILD=1; exits 99 if /work/built.marker already exists; else creates marker & exits 0
+  const builderElf = buildStaticTestElf(`
+    ${SYSCALL_HELPER_C}
+    static int str_starts_with(const char *s, const char *p) {
+      while (*p) {
+        if (*s++ != *p++) return 0;
+      }
+      return 1;
+    }
+    void run_main(long *sp) {
+      long argc = sp[0];
+      const char **envp = (const char **)&sp[argc + 2];
+      for (int i = 0; envp[i]; i++) {
+        if (str_starts_with(envp[i], "FAIL_BUILD=1")) {
+          write_str(2, "BUILD_FAILED\\n");
+          sc6(231, 42, 0, 0, 0, 0, 0);
+        }
+      }
+      long check = sc6(257, -100, (long)"/work/built.marker", 0, 0, 0, 0);
+      if (check >= 0) {
+        sc6(3, check, 0, 0, 0, 0, 0);
+        write_str(2, "BUILT_TWICE\\n");
+        sc6(231, 99, 0, 0, 0, 0, 0);
+      }
+      long fd = sc6(257, -100, (long)"/work/built.marker", 0x241, 0644, 0, 0);
+      if (fd < 0) sc6(231, 98, 0, 0, 0, 0, 0);
+      sc6(1, fd, (long)"OK", 2, 0, 0, 0);
+      sc6(3, fd, 0, 0, 0, 0, 0);
+      write_str(1, "BUILD_DONE\\n");
+      sc6(231, 0, 0, 0, 0, 0, 0);
+    }
+    __attribute__((naked)) void _start(void) {
+      __asm__ volatile("mov %rsp, %rdi\\nand $-16, %rsp\\ncall run_main\\n");
+    }
+  `);
+
+  // /bin/runner: verifies /work/built.marker exists (else exit 2) and /work/dirty.txt does NOT exist (else exit 3),
+  // creates /work/dirty.txt, runs TCP loopback, fails (exit 1, BUG_FOUND) if simulated DT_NS > 20ms.
+  const runnerElf = buildStaticTestElf(`
+    ${SYSCALL_HELPER_C}
+    void _start(void) {
+      long mfd = sc6(257, -100, (long)"/work/built.marker", 0, 0, 0, 0);
+      if (mfd < 0) sc6(231, 2, 0, 0, 0, 0, 0);
+      sc6(3, mfd, 0, 0, 0, 0, 0);
+
+      long dfd = sc6(257, -100, (long)"/work/dirty.txt", 0, 0, 0, 0);
+      if (dfd >= 0) {
+        sc6(3, dfd, 0, 0, 0, 0, 0);
+        sc6(231, 3, 0, 0, 0, 0, 0);
+      }
+      long wfd = sc6(257, -100, (long)"/work/dirty.txt", 0x241, 0644, 0, 0);
+      if (wfd >= 0) {
+        sc6(1, wfd, (long)"dirty", 5, 0, 0, 0);
+        sc6(3, wfd, 0, 0, 0, 0, 0);
+      }
+
+      long ts0[2] = {0, 0}, ts1[2] = {0, 0};
+      sc6(228, 1, (long)ts0, 0, 0, 0, 0);
+      long lfd = sc6(41, 2, 1, 0, 0, 0, 0);
+      unsigned char sa[16] = {2, 0, 0, 0, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0};
+      sc6(49, lfd, (long)sa, 16, 0, 0, 0);
+      unsigned char bound[16] = {0};
+      unsigned int blen = 16;
+      sc6(51, lfd, (long)bound, (long)&blen, 0, 0, 0);
+      sc6(50, lfd, 8, 0, 0, 0, 0);
+      long cfd = sc6(41, 2, 1, 0, 0, 0, 0);
+      sc6(42, cfd, (long)bound, 16, 0, 0, 0);
+      long sfd = sc6(288, lfd, 0, 0, 0, 0, 0);
+      char msg[4] = {'a', 'b', 'c', 'd'}, buf[4];
+      for (int i = 0; i < 8; i++) {
+        sc6(44, cfd, (long)msg, 4, 0, 0, 0);
+        sc6(45, sfd, (long)buf, 4, 0, 0, 0);
+      }
+      sc6(3, cfd, 0, 0, 0, 0, 0);
+      sc6(3, sfd, 0, 0, 0, 0, 0);
+      sc6(3, lfd, 0, 0, 0, 0, 0);
+      sc6(228, 1, (long)ts1, 0, 0, 0, 0);
+
+      unsigned long t0 = (unsigned long)ts0[0] * 1000000000UL + (unsigned long)ts0[1];
+      unsigned long t1 = (unsigned long)ts1[0] * 1000000000UL + (unsigned long)ts1[1];
+      unsigned long dt = t1 >= t0 ? (t1 - t0) : 0;
+      if (dt > 20000000UL) {
+        write_str(1, "BUG_FOUND\\n");
+        sc6(231, 1, 0, 0, 0, 0, 0);
+      }
+      write_str(1, "PASS\\n");
+      sc6(231, 0, 0, 0, 0, 0, 0);
+    }
+  `);
+
+  // /bin/spinner: busy-loops forever (used to test timeoutMs & AbortSignal)
+  const spinnerElf = buildStaticTestElf(`
+    ${SYSCALL_HELPER_C}
+    void _start(void) {
+      volatile unsigned long x = 0;
+      while (1) {
+        x++;
+        if ((x & 0xffffUL) == 0) {
+          sc6(24 /* sched_yield */, 0, 0, 0, 0, 0, 0);
+        }
+      }
+    }
+  `);
+
+  const mockReg = createMockRegistry({ port: 0, host: "127.0.0.1" });
+  mockReg.addImage("library/sweeptest", "latest", {
+    config: { cmd: ["/bin/runner"], env: ["PATH=/bin"], workingDir: "/work" },
+    layers: [
+      {
+        files: [
+          { path: "bin/builder", type: "file", content: builderElf, mode: 0o755 },
+          { path: "bin/runner", type: "file", content: runnerElf, mode: 0o755 },
+          { path: "bin/spinner", type: "file", content: spinnerElf, mode: 0o755 },
+          { path: "work", type: "dir", mode: 0o755 },
+        ],
+      },
+    ],
+  });
+  mockReg.addImage("library/sweepprebuilt", "latest", {
+    config: { cmd: ["/bin/runner"], env: ["PATH=/bin"], workingDir: "/work" },
+    layers: [
+      {
+        files: [
+          { path: "bin/runner", type: "file", content: runnerElf, mode: 0o755 },
+          { path: "work", type: "dir", mode: 0o755 },
+          { path: "work/built.marker", type: "file", content: "OK", mode: 0o644 },
+        ],
+      },
+    ],
+  });
+  await mockReg.start();
+  const srv = createServer({ port: 0, host: "127.0.0.1", allowLocalRegistries: true });
+  await srv.start();
+
+  const docker = await Elf2WasmDocker.create({
+    compilerWasmUrl: `${srv.url}/wasm/elf2wasm_compiler_wasm.wasm`,
+    runtimeWasmUrl: `${srv.url}/wasm/elf2wasm_runtime_wasm.wasm`,
+    registryProxyBase: `${srv.url}/api/v2`,
+    useWorker: false,
+  });
+
+  try {
+    const imgRef = `${mockReg.host}/library/sweeptest:latest`;
+
+    // 1. Build-once + stop-on-failure
+    let buildChunks = "";
+    const startedRuns = [];
+    const completedRuns = [];
+    const res1 = await runSweep(imgRef, {
+      docker,
+      buildCmd: ["/bin/builder"],
+      runCmd: ["/bin/runner"],
+      runs: 10,
+      stddevStart: 0,
+      stddevStep: 10,
+      seedStart: 1,
+      stopOnFailure: true,
+      onBuildOutput: ({ chunk }) => {
+        buildChunks += textDecoder.decode(chunk);
+      },
+      onRunStart: (ev) => startedRuns.push(ev),
+      onRunComplete: (ev) => completedRuns.push(ev),
+    });
+    assert.equal(res1.build.exitCode, 0);
+    assert.equal(res1.build.skipped, false);
+    assert.match(res1.build.stdout, /BUILD_DONE/);
+    assert.match(buildChunks, /BUILD_DONE/);
+    assert.equal(res1.passed, false);
+    assert.ok(res1.failedRun);
+    assert.equal(res1.failedRun.exitCode, 1);
+    assert.equal(res1.failedRun.status, "fail");
+    assert.match(res1.failedRun.stdout, /BUG_FOUND/);
+    assert.ok(res1.runs.length >= 2 && res1.runs.length < 10);
+    assert.equal(res1.runs[0].exitCode, 0);
+    assert.equal(res1.runs[0].stddevMs, 0);
+    assert.equal(res1.runs[0].seed, 1);
+    assert.equal(startedRuns.length, res1.runs.length);
+    assert.equal(completedRuns.length, res1.runs.length);
+    for (const r of res1.runs) {
+      assert.notEqual(r.exitCode, 2, "built.marker must exist on every run");
+      assert.notEqual(r.exitCode, 3, "dirty.txt must be wiped by snapshot restore");
+    }
+
+    // 2. stopOnFailure: false runs all iterations
+    const res2 = await runSweep(imgRef, {
+      docker,
+      buildCmd: ["/bin/builder"],
+      runCmd: ["/bin/runner"],
+      runs: 4,
+      stddevStart: 0,
+      stddevStep: 15,
+      seedStart: 5,
+      stopOnFailure: false,
+    });
+    assert.equal(res2.runs.length, 4);
+    assert.equal(res2.passed, false);
+    assert.ok(res2.failedRun);
+    assert.equal(res2.failedRun.index, res2.runs.find((r) => r.exitCode !== 0).index);
+
+    // 3. Pass-all
+    const res3 = await runSweep(imgRef, {
+      docker,
+      buildCmd: ["/bin/builder"],
+      runCmd: ["/bin/runner"],
+      runs: 3,
+      stddevStart: 0,
+      stddevStep: 0,
+      seedStart: 1,
+    });
+    assert.equal(res3.passed, true);
+    assert.equal(res3.failedRun, null);
+    assert.equal(res3.runs.length, 3);
+    assert.ok(res3.runs.every((r) => r.exitCode === 0 && r.status === "pass"));
+
+    // 4. Build-failure-abort
+    const res4 = await runSweep(imgRef, {
+      docker,
+      buildCmd: ["/bin/builder"],
+      runCmd: ["/bin/runner"],
+      env: ["FAIL_BUILD=1"],
+      runs: 5,
+    });
+    assert.equal(res4.build.exitCode, 42);
+    assert.equal(res4.build.skipped, false);
+    assert.deepEqual(res4.runs, []);
+    assert.equal(res4.failedRun, null);
+    assert.equal(res4.passed, false);
+
+    // 5. Skipped build (buildCmd omitted)
+    const res5 = await runSweep(`${mockReg.host}/library/sweepprebuilt:latest`, {
+      docker,
+      runCmd: ["/bin/runner"],
+      runs: 2,
+      stddevStart: 0,
+      stddevStep: 0,
+    });
+    assert.equal(res5.build.skipped, true);
+    assert.equal(res5.build.exitCode, 0);
+    assert.equal(res5.passed, true);
+    assert.equal(res5.runs.length, 2);
+
+    // 6. exec() timeoutMs & AbortSignal + delay anti-leak
+    const img = await docker.pullImage(imgRef);
+    const c = await img.createContainer({ tty: false });
+    await img.dispose();
+
+    const t0 = performance.now();
+    const tRes = await c.exec({ cmd: ["/bin/spinner"], timeoutMs: 200 });
+    assert.ok(performance.now() - t0 < 5000, "exec timeoutMs must settle promptly");
+    assert.equal(tRes.timedOut, true);
+    assert.equal(tRes.exitCode, 124);
+
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 120);
+    await assert.rejects(
+      () => c.exec({ cmd: ["/bin/spinner"], signal: ac.signal }),
+      (err) => err && err.name === "AbortError"
+    );
+
+    await c.stop();
+  } finally {
+    await docker.dispose();
+    await srv.stop();
+    await mockReg.stop();
+  }
+});
+
+test("M17: js/cli.mjs --delay-stddev-ms and --delay-seed determinism & strict validation", async () => {
+  const probeElf = buildTcpDelayProbeElf();
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "elf2wasm-cli-delay-"));
+  const elfPath = path.join(tmpDir, "probe");
+  const cliPath = path.join(REPO_ROOT, "js", "cli.mjs");
+  fs.writeFileSync(elfPath, probeElf);
+
+  try {
+    const r1 = spawnSync(
+      process.execPath,
+      [cliPath, "run", "--elf", elfPath, "--delay-stddev-ms", "25", "--delay-seed", "99"],
+      { encoding: "utf8" }
+    );
+    assert.equal(r1.status, 0, `CLI run 1 failed: ${r1.stderr}`);
+
+    const r2 = spawnSync(
+      process.execPath,
+      [cliPath, "run", "--elf", elfPath, "--delay-stddev-ms=25", "--delay-seed=99"],
+      { encoding: "utf8" }
+    );
+    assert.equal(r2.status, 0, `CLI run 2 failed: ${r2.stderr}`);
+    assert.equal(r2.stdout, r1.stdout, "Same --delay-stddev-ms and --delay-seed must be deterministic");
+
+    const r3 = spawnSync(
+      process.execPath,
+      [cliPath, "run", "--elf", elfPath, "--delay-stddev-ms", "25", "--delay-seed", "100"],
+      { encoding: "utf8" }
+    );
+    assert.equal(r3.status, 0, `CLI run 3 failed: ${r3.stderr}`);
+    assert.notEqual(r3.stdout, r1.stdout, "Different --delay-seed must produce different output");
+
+    const badInvocations = [
+      ["run", "--elf", elfPath, "--delay-stddev-ms", "-1"],
+      ["run", "--elf", elfPath, "--delay-stddev-ms", "NaN"],
+      ["run", "--elf", elfPath, "--delay-stddev-ms", "Infinity"],
+      ["run", "--elf", elfPath, "--delay-stddev-ms", "abc"],
+      ["run", "--elf", elfPath, "--delay-stddev-ms"],
+      ["run", "--elf", elfPath, "--delay-seed", "-5"],
+      ["run", "--elf", elfPath, "--delay-seed", "1.5"],
+      ["run", "--elf", elfPath, "--delay-seed", "abc"],
+      ["run", "--elf", elfPath, "--delay-seed"],
+      ["compile", "--elf", elfPath, "--out", path.join(tmpDir, "out.wasm"), "--delay-seed", "1"],
+    ];
+    for (const args of badInvocations) {
+      const res = spawnSync(process.execPath, [cliPath, ...args], { encoding: "utf8" });
+      assert.notEqual(res.status, 0, `Expected non-zero exit for: ${args.join(" ")}`);
+      assert.ok(res.stderr.length > 0, `Expected error message on stderr for: ${args.join(" ")}`);
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("M17 regression: runFromVfs #! shebang relative/non-normalized interp argv[0] & omitted-argv[0] args", async () => {
+  const argvElf = buildStaticTestElf(`
+    ${SYSCALL_HELPER_C}
+    void run_main(long *sp) {
+      long argc = sp[0];
+      const char **argv = (const char **)&sp[1];
+      write_str(1, "ARGC=");
+      write_u64(1, (unsigned long)argc);
+      write_str(1, "\\n");
+      for (long i = 0; i < argc; i++) {
+        write_str(1, "ARGV[");
+        write_u64(1, (unsigned long)i);
+        write_str(1, "]=");
+        write_str(1, argv[i]);
+        write_str(1, "\\n");
+      }
+      sc6(231, 0, 0, 0, 0, 0, 0);
+    }
+    __attribute__((naked)) void _start(void) {
+      __asm__ volatile("mov %rsp, %rdi\\nand $-16, %rsp\\ncall run_main\\n");
+    }
+  `);
+
+  const sys = await Elf2WasmSystem.create({
+    compilerWasm: fs.readFileSync(COMPILER_WASM_PATH),
+    runtimeWasm: fs.readFileSync(RUNTIME_WASM_PATH),
+  });
+  const enc = new TextEncoder();
+  sys.writeVfsFile("/work/prog", argvElf, 0o755);
+  sys.writeVfsFile("/work/sub/.keep", enc.encode(""), 0o644);
+  sys.writeVfsFile("/work/script_rel", enc.encode("#!./prog -flag\n"), 0o755);
+  sys.writeVfsFile("/work/script_dotdot", enc.encode("#!/work/sub/../prog -flag\n"), 0o755);
+  sys.writeVfsFile("/work/script_abs", enc.encode("#!/work/prog -flag\n"), 0o755);
+
+  const r1 = await sys.runFromVfs("./script_rel", ["./script_rel", "u1"], { cwd: "/work" });
+  assert.equal(r1.exitCode, 0);
+  const out1 = textDecoder.decode(r1.stdout);
+  assert.match(out1, /ARGC=4\n/);
+  assert.match(out1, /ARGV\[0\]=\.\/prog\n/);
+  assert.match(out1, /ARGV\[1\]=-flag\n/);
+  assert.match(out1, /ARGV\[2\]=\/work\/script_rel\n/);
+  assert.match(out1, /ARGV\[3\]=u1\n/);
+
+  const r2 = await sys.runFromVfs("./script_dotdot", ["./script_dotdot", "u1"], { cwd: "/work" });
+  assert.equal(r2.exitCode, 0);
+  const out2 = textDecoder.decode(r2.stdout);
+  assert.match(out2, /ARGC=4\n/);
+  assert.match(out2, /ARGV\[0\]=\/work\/sub\/\.\.\/prog\n/);
+  assert.match(out2, /ARGV\[1\]=-flag\n/);
+  assert.match(out2, /ARGV\[2\]=\/work\/script_dotdot\n/);
+  assert.match(out2, /ARGV\[3\]=u1\n/);
+
+  const r3 = await sys.runFromVfs("./script_abs", ["u1", "u2"], { cwd: "/work" });
+  assert.equal(r3.exitCode, 0);
+  const out3 = textDecoder.decode(r3.stdout);
+  assert.match(out3, /ARGC=5\n/);
+  assert.match(out3, /ARGV\[0\]=\/work\/prog\n/);
+  assert.match(out3, /ARGV\[1\]=-flag\n/);
+  assert.match(out3, /ARGV\[2\]=\/work\/script_abs\n/);
+  assert.match(out3, /ARGV\[3\]=u1\n/);
+  assert.match(out3, /ARGV\[4\]=u2\n/);
+});
+
+test("M17 regression: restoreVfs/dropVfsSnapshot strict u32 & setDelayConfig strict seed/stddev validation", async () => {
+  const sys = await Elf2WasmSystem.create({
+    compilerWasm: fs.readFileSync(COMPILER_WASM_PATH),
+    runtimeWasm: fs.readFileSync(RUNTIME_WASM_PATH),
+  });
+  const enc = new TextEncoder();
+  sys.writeVfsFile("/work/a.txt", enc.encode("v1"), 0o644);
+  const s1 = sys.snapshotVfs();
+
+  const badIds = [0, -1, s1 + 0.5, s1 + 2 ** 32, s1 - 2 ** 32, NaN, Infinity, "1", null, undefined];
+  for (const badId of badIds) {
+    assert.throws(() => sys.restoreVfs(badId), RangeError, `restoreVfs must reject ${String(badId)}`);
+    assert.throws(() => sys.dropVfsSnapshot(badId), RangeError, `dropVfsSnapshot must reject ${String(badId)}`);
+  }
+
+  // Verify s1 was NOT corrupted or dropped by the invalid calls above
+  sys.writeVfsFile("/work/a.txt", enc.encode("v2"), 0o644);
+  sys.restoreVfs(s1);
+  assert.equal(textDecoder.decode(sys.readVfsFile("/work/a.txt")), "v1");
+  sys.dropVfsSnapshot(s1);
+
+  // setDelayConfig strict integer & u64 seed validation + huge stddevMs validation
+  const badSeeds = [1.5, -1, 1e25, NaN, Infinity, "42", -1n, 0xffff_ffff_ffff_ffffn + 1n];
+  for (const badSeed of badSeeds) {
+    assert.throws(
+      () => sys.setDelayConfig(1, badSeed),
+      RangeError,
+      `setDelayConfig must reject seed ${String(badSeed)}`
+    );
+  }
+  for (const badStddev of [-1, NaN, Infinity, 1e308, 1_844_674_407_371]) {
+    assert.throws(
+      () => sys.setDelayConfig(badStddev, 0),
+      RangeError,
+      `setDelayConfig must reject stddevMs ${String(badStddev)}`
+    );
+  }
+  // Valid boundary values must succeed
+  sys.setDelayConfig(0, 0);
+  sys.setDelayConfig(1, 0xffff_ffff_ffff_ffffn);
+});
+
+test("M17 regression: exec() delay does not leak into start(), and empty buildCmd/runCmd handled cleanly", async () => {
+  const probeElf = buildTcpDelayProbeElf();
+  const mockReg = createMockRegistry({ port: 0, host: "127.0.0.1" });
+  mockReg.addImage("library/delayprobe", "latest", {
+    config: { cmd: ["/bin/probe"], env: ["PATH=/bin"], workingDir: "/" },
+    layers: [
+      {
+        files: [{ path: "bin/probe", type: "file", content: probeElf, mode: 0o755 }],
+      },
+    ],
+  });
+  await mockReg.start();
+  const srv = createServer({ port: 0, host: "127.0.0.1", allowLocalRegistries: true });
+  await srv.start();
+
+  const docker = await Elf2WasmDocker.create({
+    compilerWasmUrl: `${srv.url}/wasm/elf2wasm_compiler_wasm.wasm`,
+    runtimeWasmUrl: `${srv.url}/wasm/elf2wasm_runtime_wasm.wasm`,
+    registryProxyBase: `${srv.url}/api/v2`,
+    useWorker: false,
+  });
+
+  try {
+    const imgRef = `${mockReg.host}/library/delayprobe:latest`;
+    const img = await docker.pullImage(imgRef);
+    const c = await img.createContainer({ tty: false });
+    await img.dispose();
+
+    // 1. exec with delayStddevMs=5, delaySeed=42 produces elevated simulated delay
+    const delayed = await c.exec({ cmd: ["/bin/probe"], delayStddevMs: 5, delaySeed: 42 });
+    assert.equal(delayed.exitCode, 0);
+    const delayedDelta = Number(/DT_NS=(\d+)/.exec(delayed.stdout)?.[1] ?? -1);
+    assert.ok(delayedDelta > 500_000, `Expected delayed DT_NS > 500us, got ${delayedDelta}`);
+
+    // 2. Subsequent start() on the same container (created without delay options) must reset to zero-delay
+    await c.start();
+    const started = await c.wait();
+    assert.equal(started.exitCode, 0);
+    const startDelta = Number(/DT_NS=(\d+)/.exec(started.stdout)?.[1] ?? -1);
+    assert.ok(startDelta >= 0 && startDelta < 100_000, `Stale delay leaked into start(): DT_NS=${startDelta}`);
+
+    // 3. exec with empty/whitespace cmd rejects with TypeError
+    await assert.rejects(() => c.exec({ cmd: "" }), TypeError);
+    await assert.rejects(() => c.exec({ cmd: [""] }), TypeError);
+    await c.stop();
+
+    // 4. runSweep with buildCmd: "" and buildCmd: [""] skips build cleanly
+    const sweepEmptyStr = await runSweep(imgRef, {
+      docker,
+      buildCmd: "",
+      runCmd: ["/bin/probe"],
+      runs: 1,
+      stddevStart: 0,
+      stddevStep: 0,
+    });
+    assert.equal(sweepEmptyStr.build.skipped, true);
+    assert.equal(sweepEmptyStr.passed, true);
+
+    const sweepEmptyArr = await runSweep(imgRef, {
+      docker,
+      buildCmd: [""],
+      runCmd: ["/bin/probe"],
+      runs: 1,
+      stddevStart: 0,
+      stddevStep: 0,
+    });
+    assert.equal(sweepEmptyArr.build.skipped, true);
+    assert.equal(sweepEmptyArr.passed, true);
+
+    // 5. runSweep with runCmd: "", "   ", [""] rejects with TypeError
+    await assert.rejects(() => runSweep(imgRef, { docker, runCmd: "", runs: 1 }), TypeError);
+    await assert.rejects(() => runSweep(imgRef, { docker, runCmd: "   ", runs: 1 }), TypeError);
+    await assert.rejects(() => runSweep(imgRef, { docker, runCmd: [""], runs: 1 }), TypeError);
+  } finally {
+    await docker.dispose();
+    await srv.stop();
+    await mockReg.stop();
+  }
+});
+
+test("M19 Tier 2 regression: container.exec() rejects invalid delayStddevMs/delaySeed with RangeError without corrupting state", async () => {
+  const probeElf = buildTcpDelayProbeElf();
+  const mockReg = createMockRegistry({ port: 0, host: "127.0.0.1" });
+  mockReg.addImage("library/delayval", "latest", {
+    config: { cmd: ["/bin/probe"], env: ["PATH=/bin"], workingDir: "/" },
+    layers: [
+      {
+        files: [{ path: "bin/probe", type: "file", content: probeElf, mode: 0o755 }],
+      },
+    ],
+  });
+  await mockReg.start();
+  const srv = createServer({ port: 0, host: "127.0.0.1", allowLocalRegistries: true });
+  await srv.start();
+
+  const docker = await Elf2WasmDocker.create({
+    compilerWasmUrl: `${srv.url}/wasm/elf2wasm_compiler_wasm.wasm`,
+    runtimeWasmUrl: `${srv.url}/wasm/elf2wasm_runtime_wasm.wasm`,
+    registryProxyBase: `${srv.url}/api/v2`,
+    useWorker: false,
+  });
+
+  try {
+    const imgRef = `${mockReg.host}/library/delayval:latest`;
+    const img = await docker.pullImage(imgRef);
+    const c = await img.createContainer({ tty: false });
+    await img.dispose();
+
+    const rec = docker._backend.engine.containers.get(c._containerId);
+    assert.ok(rec, "Container record must exist");
+    assert.equal(rec._hasDelayConfigured, false);
+    assert.equal(rec.busy, false);
+
+    const badCases = [
+      { delayStddevMs: -5, delaySeed: 1 },
+      { delayStddevMs: NaN, delaySeed: 1 },
+      { delayStddevMs: Infinity, delaySeed: 1 },
+      { delayStddevMs: "abc", delaySeed: 1 },
+      { delayStddevMs: 5, delaySeed: -1 },
+      { delayStddevMs: 5, delaySeed: NaN },
+      { delayStddevMs: 5, delaySeed: Infinity },
+      { delayStddevMs: 5, delaySeed: 1.5 },
+    ];
+
+    for (const opts of badCases) {
+      await assert.rejects(
+        () => c.exec({ cmd: ["/bin/probe"], ...opts }),
+        RangeError,
+        `container.exec must reject ${JSON.stringify(opts)} with RangeError`
+      );
+      assert.equal(rec.busy, false, "Failed validation must not leave container busy");
+      assert.equal(
+        rec._hasDelayConfigured,
+        false,
+        "Failed validation must not mutate _hasDelayConfigured"
+      );
+    }
+
+    // Subsequent valid exec() must succeed cleanly
+    const ok = await c.exec({ cmd: ["/bin/probe"], delayStddevMs: 0, delaySeed: 0 });
+    assert.equal(ok.exitCode, 0, `stderr: ${ok.stderr}`);
+    assert.equal(rec.busy, false);
+    assert.equal(rec._hasDelayConfigured, true);
+
+    await c.stop();
+  } finally {
+    await docker.dispose();
+    await srv.stop();
+    await mockReg.stop();
+  }
+});
+
+
+
 
 
 
