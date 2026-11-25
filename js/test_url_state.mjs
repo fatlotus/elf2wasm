@@ -3,10 +3,15 @@ import assert from "node:assert/strict";
 
 import {
   DEFAULT_UI_STATE,
+  MAX_STDDEV_MS,
+  MAX_SEED,
+  MAX_SWEEP_RUNS,
   parseEnvLines,
   matchProjectPreset,
   parseStateFromSearch,
   serializeStateToSearch,
+  computeSweepRunParams,
+  buildRunSearch,
 } from "../web/url_state.mjs";
 
 const SAMPLE_PRESETS = Object.freeze({
@@ -37,6 +42,16 @@ const SAMPLE_PRESETS = Object.freeze({
     cwd: "/workspace",
     env: Object.freeze(["HOME=/tmp"]),
   }),
+  "go-raft-nodice": Object.freeze({
+    image: "ghcr.io/fatlotus/golang-with-cache:1.27-alpine",
+    repo: "fatlotus/nodice",
+    ref: "",
+    mountPath: "/workspace",
+    build: "go build",
+    cmd: "./raft",
+    cwd: "/workspace/example",
+    env: Object.freeze([]),
+  }),
 });
 
 describe("web/url_state.mjs: parseEnvLines", () => {
@@ -56,12 +71,7 @@ describe("web/url_state.mjs: parseStateFromSearch", () => {
   it("returns DEFAULT_UI_STATE and null activePresetId for empty search", () => {
     const res = parseStateFromSearch("", SAMPLE_PRESETS);
     assert.deepEqual(res.state, {
-      image: "alpine:latest",
-      cmd: "",
-      repo: "",
-      ref: "",
-      mount: "/workspace",
-      cwd: "",
+      ...DEFAULT_UI_STATE,
       env: [],
     });
     assert.equal(res.activePresetId, null);
@@ -72,6 +82,7 @@ describe("web/url_state.mjs: parseStateFromSearch", () => {
       "?image=python%3A3.12-slim&cmd=python3+-c+%22print('a%2Bb%26c%3Dd')%22&repo=https%3A%2F%2Fgithub.com%2Fowner%2Frepo&ref=v1.2.3&mount=%2Fapp&cwd=%2Fapp%2Fsrc&env=FOO%3D1&env=BAR%3Da%3Db";
     const { state, activePresetId } = parseStateFromSearch(search, SAMPLE_PRESETS);
     assert.deepEqual(state, {
+      ...DEFAULT_UI_STATE,
       image: "python:3.12-slim",
       cmd: `python3 -c "print('a+b&c=d')"`,
       repo: "https://github.com/owner/repo",
@@ -239,13 +250,355 @@ describe("web/url_state.mjs: serializeStateToSearch & round-trip", () => {
     const parsed = parseStateFromSearch(search, SAMPLE_PRESETS);
     assert.equal(parsed.activePresetId, null);
     assert.deepEqual(parsed.state, {
+      ...DEFAULT_UI_STATE,
       image,
-      cmd: "",
-      repo: "",
-      ref: "",
-      mount: "/workspace",
-      cwd: "",
       env: [],
+    });
+  });
+});
+
+describe("web/url_state.mjs: Contract 13 build/run split, delay injection & sweep mode", () => {
+  it("parses build and run read alias, gives canonical cmd precedence over run, and serializes canonical cmd", () => {
+    const aliasOnly = parseStateFromSearch("?build=go+build&run=.%2Fraft");
+    assert.equal(aliasOnly.state.build, "go build");
+    assert.equal(aliasOnly.state.cmd, "./raft");
+
+    const serialized = serializeStateToSearch(aliasOnly.state, {
+      existingSearch: "?run=stale&utm_source=ci",
+    });
+    assert.equal(serialized, "?utm_source=ci&build=go+build&cmd=.%2Fraft");
+
+    const both = parseStateFromSearch("?cmd=.%2Fcanonical&run=.%2Falias");
+    assert.equal(both.state.cmd, "./canonical");
+
+    const cleared = parseStateFromSearch("?preset=go-raft-nodice&build=&run=", SAMPLE_PRESETS);
+    assert.equal(cleared.state.build, "");
+    assert.equal(cleared.state.cmd, "");
+    assert.equal(cleared.activePresetId, null);
+  });
+
+  it("handles stddev and seed defaults, omission rules, and fractional round-trip", () => {
+    // Omitted when stddev=0, seed=0, sweep=false
+    assert.equal(
+      serializeStateToSearch({ ...DEFAULT_UI_STATE, stddev: 0, seed: 0, sweep: false }),
+      ""
+    );
+
+    // Non-zero stddev emits both stddev and seed (even when seed=0)
+    const withStddev = serializeStateToSearch({
+      ...DEFAULT_UI_STATE,
+      stddev: 2.5,
+      seed: 0,
+      sweep: false,
+    });
+    assert.equal(withStddev, "?stddev=2.5&seed=0");
+    const parsedStddev = parseStateFromSearch(withStddev);
+    assert.equal(parsedStddev.state.stddev, 2.5);
+    assert.equal(parsedStddev.state.seed, 0);
+
+    // Zero stddev with non-zero seed emits seed only
+    const withSeedOnly = serializeStateToSearch({
+      ...DEFAULT_UI_STATE,
+      stddev: 0,
+      seed: 42,
+      sweep: false,
+    });
+    assert.equal(withSeedOnly, "?seed=42");
+    const parsedSeedOnly = parseStateFromSearch(withSeedOnly);
+    assert.equal(parsedSeedOnly.state.stddev, 0);
+    assert.equal(parsedSeedOnly.state.seed, 42);
+  });
+
+  it("handles sweep mode serialization, default omission, custom params, and selectedRun", () => {
+    // When sweep=false, sweep-only fields are omitted even if provided
+    assert.equal(
+      serializeStateToSearch({
+        ...DEFAULT_UI_STATE,
+        sweep: false,
+        runs: 50,
+        stddevStart: 5,
+        stddevStep: 2.5,
+        selectedRun: 3,
+      }),
+      ""
+    );
+
+    // When sweep=true with default runs/stddevStart/stddevStep, only seed & sweep=1 are emitted
+    const defaultSweep = serializeStateToSearch({
+      ...DEFAULT_UI_STATE,
+      sweep: true,
+    });
+    assert.equal(defaultSweep, "?seed=0&sweep=1");
+    const parsedDefaultSweep = parseStateFromSearch(defaultSweep);
+    assert.equal(parsedDefaultSweep.state.sweep, true);
+    assert.equal(parsedDefaultSweep.state.runs, 20);
+    assert.equal(parsedDefaultSweep.state.stddevStart, 1);
+    assert.equal(parsedDefaultSweep.state.stddevStep, 1);
+    assert.equal(parsedDefaultSweep.state.seed, 0);
+    assert.equal(parsedDefaultSweep.state.selectedRun, null);
+
+    // Full custom sweep round-trip (omits single-run stddev when sweep=true)
+    const customSweep = serializeStateToSearch({
+      ...DEFAULT_UI_STATE,
+      image: "ghcr.io/fatlotus/golang-with-cache:1.27-alpine",
+      repo: "fatlotus/nodice",
+      cwd: "/workspace/example",
+      build: "go build",
+      cmd: "./raft",
+      stddev: 99,
+      seed: 7,
+      sweep: true,
+      runs: 15,
+      stddevStart: 0.5,
+      stddevStep: 1.25,
+      selectedRun: 4,
+    });
+    const p = new URLSearchParams(customSweep);
+    assert.equal(p.has("stddev"), false);
+    assert.equal(p.get("seed"), "7");
+    assert.equal(p.get("sweep"), "1");
+    assert.equal(p.get("runs"), "15");
+    assert.equal(p.get("stddevStart"), "0.5");
+    assert.equal(p.get("stddevStep"), "1.25");
+    assert.equal(p.get("selectedRun"), "4");
+
+    const parsedCustom = parseStateFromSearch(customSweep, SAMPLE_PRESETS);
+    assert.equal(parsedCustom.activePresetId, "go-raft-nodice");
+    assert.equal(parsedCustom.state.sweep, true);
+    assert.equal(parsedCustom.state.runs, 15);
+    assert.equal(parsedCustom.state.stddevStart, 0.5);
+    assert.equal(parsedCustom.state.stddevStep, 1.25);
+    assert.equal(parsedCustom.state.seed, 7);
+    assert.equal(parsedCustom.state.selectedRun, 4);
+
+    // selectedRun is ignored (null) when sweep is false
+    const nonSweepSelected = parseStateFromSearch("?selectedRun=3");
+    assert.equal(nonSweepSelected.state.sweep, false);
+    assert.equal(nonSweepSelected.state.selectedRun, null);
+  });
+
+  it("sanitizes and clamps adversarial/boundary numeric and boolean parameters", () => {
+    const neg = parseStateFromSearch(
+      "?stddev=-5&seed=-10&runs=0&stddevStart=-1&stddevStep=-2&sweep=true&selectedRun=0"
+    );
+    assert.equal(neg.state.stddev, 0);
+    assert.equal(neg.state.seed, 0);
+    assert.equal(neg.state.runs, 20);
+    assert.equal(neg.state.stddevStart, 1);
+    assert.equal(neg.state.stddevStep, 1);
+    assert.equal(neg.state.sweep, true);
+    assert.equal(neg.state.selectedRun, null);
+
+    const garbage = parseStateFromSearch(
+      "?stddev=NaN&seed=Infinity&runs=abc&stddevStart=oops&stddevStep=1e999&sweep=garbage&selectedRun=999"
+    );
+    assert.equal(garbage.state.stddev, 0);
+    assert.equal(garbage.state.seed, 0);
+    assert.equal(garbage.state.runs, 20);
+    assert.equal(garbage.state.stddevStart, 1);
+    assert.equal(garbage.state.stddevStep, 1);
+    assert.equal(garbage.state.sweep, false);
+    assert.equal(garbage.state.selectedRun, null);
+
+    const clamped = parseStateFromSearch(
+      "?stddev=99999999&seed=99999999999999999999&runs=999999&stddevStart=99999999&stddevStep=99999999&sweep=1&selectedRun=1001"
+    );
+    assert.equal(clamped.state.stddev, 3_600_000);
+    assert.equal(clamped.state.seed, Number.MAX_SAFE_INTEGER);
+    assert.equal(clamped.state.runs, 1000);
+    assert.equal(clamped.state.stddevStart, 3_600_000);
+    assert.equal(clamped.state.stddevStep, 3_600_000);
+    assert.equal(clamped.state.selectedRun, null);
+
+    const validBoundary = parseStateFromSearch("?sweep=yes&runs=5&selectedRun=5.9");
+    assert.equal(validBoundary.state.sweep, true);
+    assert.equal(validBoundary.state.runs, 5);
+    assert.equal(validBoundary.state.selectedRun, 5);
+
+    const negZero = parseStateFromSearch("?seed=-0&stddev=-0&sweep=1&stddevStart=-0&stddevStep=-0");
+    assert.ok(Object.is(negZero.state.seed, 0), "expected ?seed=-0 to normalize to +0");
+    assert.ok(Object.is(negZero.state.stddev, 0), "expected ?stddev=-0 to normalize to +0");
+    assert.ok(Object.is(negZero.state.stddevStart, 0), "expected ?stddevStart=-0 to normalize to +0");
+    assert.ok(Object.is(negZero.state.stddevStep, 0), "expected ?stddevStep=-0 to normalize to +0");
+  });
+
+  it("hydrates go-raft-nodice preset, preserves preset match with sweep/delay params, and clears match on build edit", () => {
+    const base = parseStateFromSearch("?preset=go-raft-nodice", SAMPLE_PRESETS);
+    assert.equal(base.activePresetId, "go-raft-nodice");
+    assert.equal(base.state.image, "ghcr.io/fatlotus/golang-with-cache:1.27-alpine");
+    assert.equal(base.state.repo, "fatlotus/nodice");
+    assert.equal(base.state.cwd, "/workspace/example");
+    assert.equal(base.state.build, "go build");
+    assert.equal(base.state.cmd, "./raft");
+
+    const withSweep = parseStateFromSearch(
+      "?preset=go-raft-nodice&sweep=1&runs=15&seed=3",
+      SAMPLE_PRESETS
+    );
+    assert.equal(withSweep.activePresetId, "go-raft-nodice");
+
+    const editedBuild = parseStateFromSearch("?preset=go-raft-nodice&build=", SAMPLE_PRESETS);
+    assert.equal(editedBuild.activePresetId, null);
+    assert.equal(editedBuild.state.build, "");
+  });
+
+  it("computeSweepRunParams calculates deterministic progression without float drift", () => {
+    assert.deepEqual(computeSweepRunParams(DEFAULT_UI_STATE, 1), {
+      index: 1,
+      stddev: 1,
+      seed: 0,
+    });
+    assert.deepEqual(computeSweepRunParams(DEFAULT_UI_STATE, 7), {
+      index: 7,
+      stddev: 7,
+      seed: 6,
+    });
+
+    // Avoid IEEE-754 0.1 + 2 * 0.1 = 0.30000000000000004 drift
+    assert.deepEqual(
+      computeSweepRunParams({ stddevStart: 0.1, stddevStep: 0.1, seed: 10 }, 3),
+      { index: 3, stddev: 0.3, seed: 12 }
+    );
+
+    // Zero stddevStart and invalid runIndex1Based clamping
+    assert.deepEqual(
+      computeSweepRunParams({ stddevStart: 0, stddevStep: 0.5, seed: 5 }, 0),
+      { index: 1, stddev: 0, seed: 5 }
+    );
+    assert.deepEqual(
+      computeSweepRunParams({ stddevStart: 0, stddevStep: 0.5, seedStart: 5 }, 2),
+      { index: 2, stddev: 0.5, seed: 6 }
+    );
+  });
+
+  it("buildRunSearch generates standalone deterministic reproducer URLs stripping sweep keys", () => {
+    const sweepState = {
+      image: "ghcr.io/fatlotus/golang-with-cache:1.27-alpine",
+      repo: "fatlotus/nodice",
+      ref: "main",
+      mount: "/src",
+      cwd: "/src/example",
+      build: "go build",
+      cmd: "./raft",
+      env: ["FOO=1"],
+      sweep: true,
+      runs: 25,
+      stddevStart: 1,
+      stddevStep: 2,
+      seed: 10,
+      selectedRun: 4,
+    };
+
+    const runSearch = buildRunSearch(
+      sweepState,
+      { stddevMs: 7, seed: 13 },
+      { existingSearch: "?utm_source=sweep&preset=go-raft-nodice&run=old&sweep=1&selectedRun=4" }
+    );
+    const params = new URLSearchParams(runSearch);
+    assert.equal(params.get("utm_source"), "sweep");
+    assert.equal(params.get("image"), "ghcr.io/fatlotus/golang-with-cache:1.27-alpine");
+    assert.equal(params.get("build"), "go build");
+    assert.equal(params.get("cmd"), "./raft");
+    assert.equal(params.get("repo"), "fatlotus/nodice");
+    assert.equal(params.get("ref"), "main");
+    assert.equal(params.get("mount"), "/src");
+    assert.equal(params.get("cwd"), "/src/example");
+    assert.deepEqual(params.getAll("env"), ["FOO=1"]);
+    assert.equal(params.get("stddev"), "7");
+    assert.equal(params.get("seed"), "13");
+    assert.equal(params.has("sweep"), false);
+    assert.equal(params.has("runs"), false);
+    assert.equal(params.has("stddevStart"), false);
+    assert.equal(params.has("stddevStep"), false);
+    assert.equal(params.has("selectedRun"), false);
+    assert.equal(params.has("preset"), false);
+    assert.equal(params.has("run"), false);
+
+    // Even { stddev: 0, seed: 0 } emits explicit stddev=0&seed=0
+    const zeroSearch = buildRunSearch(DEFAULT_UI_STATE, { stddev: 0, seed: 0 });
+    assert.equal(zeroSearch, "?stddev=0&seed=0");
+
+    // Round-trip through parseStateFromSearch
+    const reparsed = parseStateFromSearch(runSearch);
+    assert.equal(reparsed.state.sweep, false);
+    assert.equal(reparsed.state.selectedRun, null);
+    assert.equal(reparsed.state.stddev, 7);
+    assert.equal(reparsed.state.seed, 13);
+    assert.equal(reparsed.state.build, "go build");
+    assert.equal(reparsed.state.cmd, "./raft");
+  });
+
+  it("Tier 5 adversarial: exact ORIGINAL_REQUEST.md query round-trip, duplicate params, unicode/%00/+ vs %20, and 100-step float-drift invariance", () => {
+    // Exported numeric bounds match expected contract
+    assert.equal(MAX_STDDEV_MS, 3_600_000);
+    assert.equal(MAX_SEED, Number.MAX_SAFE_INTEGER);
+    assert.equal(MAX_SWEEP_RUNS, 1000);
+
+    // 1. Exact ORIGINAL_REQUEST.md query string round-trip
+    const origQuery =
+      "?image=ghcr.io%2Ffatlotus%2Fgolang-with-cache%3A1.27-alpine&cmd=%2Fbin%2Fsh+-c+%22go+build+%26%26+.%2Fraft%22&repo=fatlotus%2Fnodice&cwd=%2Fworkspace%2Fexample";
+    const parsedOrig = parseStateFromSearch(origQuery, SAMPLE_PRESETS);
+    assert.equal(parsedOrig.state.image, "ghcr.io/fatlotus/golang-with-cache:1.27-alpine");
+    assert.equal(parsedOrig.state.cmd, '/bin/sh -c "go build && ./raft"');
+    assert.equal(parsedOrig.state.build, "");
+    assert.equal(parsedOrig.state.repo, "fatlotus/nodice");
+    assert.equal(parsedOrig.state.cwd, "/workspace/example");
+    assert.equal(parsedOrig.state.sweep, false);
+    assert.equal(parsedOrig.state.stddev, 0);
+    assert.equal(parsedOrig.state.seed, 0);
+    const reserializedOrig = serializeStateToSearch(parsedOrig.state);
+    assert.deepEqual(parseStateFromSearch(reserializedOrig).state, parsedOrig.state);
+
+    // 2. Duplicate params: URLSearchParams.get() returns first occurrence deterministically
+    const dupCmd = parseStateFromSearch("?cmd=first&cmd=second");
+    assert.equal(dupCmd.state.cmd, "first");
+    const dupSweep = parseStateFromSearch("?sweep=1&sweep=0&runs=7&runs=99");
+    assert.equal(dupSweep.state.sweep, true);
+    assert.equal(dupSweep.state.runs, 7);
+    const dupRoundTrip = serializeStateToSearch(dupSweep.state);
+    assert.deepEqual(parseStateFromSearch(dupRoundTrip).state, dupSweep.state);
+
+    // 3. Unicode, embedded %00 (NUL stripped), and '+' vs '%20' space equivalence
+    const plusQuery = parseStateFromSearch("?cmd=echo+hello+world+%F0%9F%9A%80%00&build=make%20all%00&env=MSG%3D%E4%BD%A0%E5%A5%BD%00");
+    const pct20Query = parseStateFromSearch("?cmd=echo%20hello%20world%20%F0%9F%9A%80&build=make+all&env=MSG%3D%E4%BD%A0%E5%A5%BD");
+    assert.equal(plusQuery.state.cmd, "echo hello world 🚀");
+    assert.equal(plusQuery.state.build, "make all");
+    assert.deepEqual(plusQuery.state.env, ["MSG=你好"]);
+    assert.deepEqual(plusQuery.state, pct20Query.state);
+    assert.equal(plusQuery.state.cmd.includes("\0"), false);
+    const uniSerialized = serializeStateToSearch(plusQuery.state);
+    assert.deepEqual(parseStateFromSearch(uniSerialized).state, plusQuery.state);
+
+    // 4. 100-step computeSweepRunParams float-drift invariance
+    const stepState = { stddevStart: 0.1, stddevStep: 0.1, seed: 42 };
+    for (let i = 1; i <= 100; i++) {
+      const p = computeSweepRunParams(stepState, i);
+      assert.equal(p.index, i);
+      assert.equal(p.seed, 42 + (i - 1));
+      const expected = Math.round(i * 100) / 1000;
+      assert.equal(
+        p.stddev,
+        expected,
+        `step ${i}: expected stddev=${expected}, got ${p.stddev}`
+      );
+      assert.equal(
+        String(p.stddev).length <= 6,
+        true,
+        `step ${i}: unexpected float drift string ${p.stddev}`
+      );
+    }
+
+    // 5. MAX_SEED boundary in computeSweepRunParams keeps all sweep runs unique and <= MAX_SEED
+    const maxSeedState = { stddevStart: 1, stddevStep: 1, seed: MAX_SEED, runs: 2 };
+    assert.deepEqual(computeSweepRunParams(maxSeedState, 1), {
+      index: 1,
+      stddev: 1,
+      seed: MAX_SEED - 1,
+    });
+    assert.deepEqual(computeSweepRunParams(maxSeedState, 2), {
+      index: 2,
+      stddev: 2,
+      seed: MAX_SEED,
     });
   });
 });
