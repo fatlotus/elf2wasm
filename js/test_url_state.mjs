@@ -225,4 +225,27 @@ describe("web/url_state.mjs: serializeStateToSearch & round-trip", () => {
       assert.deepEqual(parsed.state.env, [...preset.env]);
     }
   });
+
+  it("round-trips ghcr.io/fatlotus/golang-with-cache:1.27-alpine base image preset", () => {
+    const image = "ghcr.io/fatlotus/golang-with-cache:1.27-alpine";
+    const expectedSearch = "?image=ghcr.io%2Ffatlotus%2Fgolang-with-cache%3A1.27-alpine";
+
+    const search = serializeStateToSearch({
+      ...DEFAULT_UI_STATE,
+      image,
+    });
+    assert.equal(search, expectedSearch);
+
+    const parsed = parseStateFromSearch(search, SAMPLE_PRESETS);
+    assert.equal(parsed.activePresetId, null);
+    assert.deepEqual(parsed.state, {
+      image,
+      cmd: "",
+      repo: "",
+      ref: "",
+      mount: "/workspace",
+      cwd: "",
+      env: [],
+    });
+  });
 });

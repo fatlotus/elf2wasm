@@ -40,6 +40,7 @@ import {
   runDockerImage,
   fetchGitArchive,
   getGoDefaultEnv,
+  isGoImageRef,
   isGoContainer,
   mergeEnv,
 } from "./docker_sdk.mjs";
@@ -1189,6 +1190,11 @@ test("Go container default env helpers (getGoDefaultEnv, isGoContainer, override
   ]);
 
   // Positive Go container detections
+  assert.equal(isGoImageRef("golang:1.27"), true);
+  assert.equal(isGoImageRef("ghcr.io/fatlotus/golang-with-cache:1.27-alpine"), true);
+  assert.equal(isGoImageRef({ repository: "fatlotus/golang-with-cache" }), true);
+  assert.equal(isGoImageRef("alpine:latest"), false);
+
   assert.equal(isGoContainer([], [], [], ["/bin/sh"], "golang:1.27"), true);
   assert.equal(isGoContainer([], [], [], ["/bin/sh"], "library/golang:1.24"), true);
   assert.equal(isGoContainer([], [], [], ["/bin/sh"], "localhost:5000/golang:1.27"), true);
@@ -1196,9 +1202,24 @@ test("Go container default env helpers (getGoDefaultEnv, isGoContainer, override
     isGoContainer([], [], [], ["/bin/sh"], "registry.example.com:5000/library/golang:1.27-alpine"),
     true
   );
+  assert.equal(
+    isGoContainer([], [], [], ["/bin/sh"], "ghcr.io/fatlotus/golang-with-cache:1.27-alpine"),
+    true
+  );
+  assert.equal(
+    isGoContainer(
+      ["GOLANG_VERSION=1.27.0", "GOPATH=/go"],
+      [],
+      [],
+      ["/bin/sh"],
+      "ghcr.io/fatlotus/golang-with-cache:1.27-alpine"
+    ),
+    true
+  );
   assert.equal(isGoContainer([], [], [], ["/bin/sh"], "localhost:5000/golang@sha256:deadbeef"), true);
   assert.equal(isGoContainer([], [], [], ["/bin/sh"], "localhost:5000/golang"), true);
   assert.equal(isGoContainer([], [], [], ["/bin/sh"], { repository: "library/golang" }), true);
+  assert.equal(isGoContainer([], [], [], ["/bin/sh"], { repository: "fatlotus/golang-with-cache" }), true);
   assert.equal(isGoContainer(["GOLANG_VERSION=1.24.3"], [], [], ["/bin/sh"], "custom:latest"), true);
   assert.equal(isGoContainer(["GOPATH=/go"], [], [], ["/bin/sh"], "custom:latest"), true);
   assert.equal(isGoContainer(["PATH=/bin"], [], [], ["/usr/local/go/bin/go", "version"], "custom:latest"), true);
@@ -1336,6 +1357,16 @@ test("Go container default env injection via mock registry", async (t) => {
     layers: [{ files: probeFiles }],
   });
 
+  reg.addImage("fatlotus/golang-with-cache", "1.27-alpine", {
+    mediaTypeMode: "oci",
+    multiArch: false,
+    config: {
+      cmd: ["/bin/envprobe"],
+      env: ["PATH=/usr/local/go/bin:/usr/bin:/bin"],
+    },
+    layers: [{ files: probeFiles }],
+  });
+
   reg.addImage("library/alpine", "3.20", {
     mediaTypeMode: "oci",
     multiArch: false,
@@ -1359,6 +1390,16 @@ test("Go container default env injection via mock registry", async (t) => {
   const goRes = await runDockerImage(`${reg.host}/library/golang:1.27`, { docker });
   assert.equal(goRes.exitCode, 0);
   assert.deepEqual(parseVars(goRes.stdout), {
+    GODEBUG: "asyncpreemptoff=1",
+    GOMEMLIMIT: "256MiB",
+    GOMAXPROCS: "1",
+    CGO_ENABLED: "0",
+  });
+
+  // 1b. golang-with-cache image gets all 4 defaults via isGoImageRef
+  const goCacheRes = await runDockerImage(`${reg.host}/fatlotus/golang-with-cache:1.27-alpine`, { docker });
+  assert.equal(goCacheRes.exitCode, 0);
+  assert.deepEqual(parseVars(goCacheRes.stdout), {
     GODEBUG: "asyncpreemptoff=1",
     GOMEMLIMIT: "256MiB",
     GOMAXPROCS: "1",

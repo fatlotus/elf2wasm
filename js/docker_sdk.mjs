@@ -16,7 +16,7 @@ import {
 } from "./oci_client.mjs";
 import { fetchGitArchive } from "./git_client.mjs";
 
-export { parseImageRef, fetchGitArchive, getGoDefaultEnv, isGoContainer, mergeEnv };
+export { parseImageRef, fetchGitArchive, getGoDefaultEnv, isGoImageRef, isGoContainer, mergeEnv };
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: false });
@@ -164,7 +164,7 @@ function isGoImageRef(imageRef) {
     repo = String(imageRef.repository || imageRef.name || "");
   }
   const lastSegment = (repo.split("/").pop() || "").toLowerCase();
-  return lastSegment === "golang";
+  return lastSegment === "golang" || lastSegment === "golang-with-cache";
 }
 
 function isGoContainer(imageEnv, entrypoint = [], cmd = [], fullArgv = [], imageRef = null) {

@@ -754,6 +754,8 @@ describe("Static Assets Staging Script (worker/scripts/build_assets.mjs)", () =>
       const rootIndex = await fs.readFile(path.join(testDistDir, "index.html"), "utf8");
       const webIndex = await fs.readFile(path.join(testDistDir, "web", "index.html"), "utf8");
       assert.equal(rootIndex, webIndex);
+      assert.match(rootIndex, /data-image="ghcr\.io\/fatlotus\/golang-with-cache:1\.27-alpine"/);
+      assert.match(webIndex, /data-image="ghcr\.io\/fatlotus\/golang-with-cache:1\.27-alpine"/);
       await fs.access(path.join(testDistDir, "web", "app.mjs"));
       await fs.access(path.join(testDistDir, "web", "url_state.mjs"));
       await fs.access(path.join(testDistDir, "web", "styles.css"));
