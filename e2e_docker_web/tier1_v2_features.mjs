@@ -10,7 +10,6 @@ import {
   Suite,
   assert,
   assertIncludes,
-  assertNotIncludes,
   waitFor,
 } from "./helpers/test_runner.mjs";
 import {
@@ -125,12 +124,14 @@ export async function runV2Tier1(opts = {}) {
       );
 
       const termColors = await getEffectiveColors(browser, "#terminal, [data-terminal], .terminal-output, .terminal");
-      if (termColors && termColors.contrast !== null) {
-        assert.ok(
-          termColors.contrast >= 4.5,
-          `Light mode terminal contrast must be >= 4.5, got ${termColors.contrast.toFixed(2)} (bg=${termColors.backgroundColor}, fg=${termColors.color})`
-        );
-      }
+      assert.ok(
+        termColors && termColors.contrast !== null,
+        `Light mode terminal element must exist with resolvable colors, got: ${JSON.stringify(termColors)}`
+      );
+      assert.ok(
+        termColors.contrast >= 4.5,
+        `Light mode terminal contrast must be >= 4.5, got ${termColors.contrast.toFixed(2)} (bg=${termColors.backgroundColor}, fg=${termColors.color})`
+      );
 
       assert.deepEqual(browser.exceptions, [], `Uncaught exceptions in Light mode: ${JSON.stringify(browser.exceptions)}`);
       assert.deepEqual(browser.consoleErrors, [], `Console errors in Light mode: ${JSON.stringify(browser.consoleErrors)}`);
@@ -236,36 +237,38 @@ export async function runV2Tier1(opts = {}) {
   suite.add("T1-V2.5", "F7/F12 Visual Layer Builder <-> Dockerfile bidirectional sync (FROM, GIT, WORKDIR, ENV, RUN, SWEEP)", async () => {
     await ensureOfflineEnv();
 
-    // Part A: Verify web/dockerfile.mjs module contract directly if present
-    if (fs.existsSync(REQUIRED_ARTIFACTS.dockerfileModule)) {
-      const dfMod = await import(pathToFileURL(REQUIRED_ARTIFACTS.dockerfileModule).href);
-      const parseFn = dfMod.parseDockerfile || dfMod.parse;
-      const serializeFn = dfMod.serializeDockerfile || dfMod.serialize;
-      assert.equal(typeof parseFn, "function", "web/dockerfile.mjs must export parseDockerfile()");
-      assert.equal(typeof serializeFn, "function", "web/dockerfile.mjs must export serializeDockerfile()");
+    // Part A: Verify web/dockerfile.mjs module contract unconditionally
+    assert.ok(
+      fs.existsSync(REQUIRED_ARTIFACTS.dockerfileModule),
+      `Required module web/dockerfile.mjs must exist at ${REQUIRED_ARTIFACTS.dockerfileModule}`
+    );
+    const dfMod = await import(pathToFileURL(REQUIRED_ARTIFACTS.dockerfileModule).href);
+    const parseFn = dfMod.parseDockerfile || dfMod.parse;
+    const serializeFn = dfMod.serializeDockerfile || dfMod.serialize;
+    assert.equal(typeof parseFn, "function", "web/dockerfile.mjs must export parseDockerfile()");
+    assert.equal(typeof serializeFn, "function", "web/dockerfile.mjs must export serializeDockerfile()");
 
-      const sampleDf = [
-        "FROM alpine:latest",
-        "RUN git clone --branch main https://github.com/example/demo /workspace",
-        "WORKDIR /workspace",
-        "ENV MODE=fast",
-        "RUN echo hello",
-        "# elf2wasm:sweep param=env envKey=MODE mode=list values=alpha,beta",
-        "RUN echo $MODE",
-      ].join("\n");
-      const parsed = parseFn(sampleDf);
-      const layers = Array.isArray(parsed) ? parsed : parsed?.layers;
-      assert.ok(Array.isArray(layers) && layers.length >= 6, `Expected >= 6 parsed layers, got ${JSON.stringify(parsed)}`);
-      const types = new Set(layers.map((l) => l.type));
-      for (const t of ["from", "git", "workdir", "env", "run", "sweep"]) {
-        assert.ok(types.has(t), `Parsed layers must include type "${t}", got: ${Array.from(types).join(", ")}`);
-      }
-      const roundTripped = serializeFn(layers);
-      assertIncludes(roundTripped, "FROM alpine:latest");
-      assertIncludes(roundTripped, "WORKDIR /workspace");
-      assertIncludes(roundTripped, "ENV MODE=fast");
-      assertIncludes(roundTripped, "RUN echo $MODE");
+    const sampleDf = [
+      "FROM alpine:latest",
+      "RUN git clone --branch main https://github.com/example/demo /workspace",
+      "WORKDIR /workspace",
+      "ENV MODE=fast",
+      "RUN echo hello",
+      "# elf2wasm:sweep param=env envKey=MODE mode=list values=alpha,beta",
+      "RUN echo $MODE",
+    ].join("\n");
+    const parsed = parseFn(sampleDf);
+    const layers = Array.isArray(parsed) ? parsed : parsed?.layers;
+    assert.ok(Array.isArray(layers) && layers.length >= 6, `Expected >= 6 parsed layers, got ${JSON.stringify(parsed)}`);
+    const types = new Set(layers.map((l) => l.type));
+    for (const t of ["from", "git", "workdir", "env", "run", "sweep"]) {
+      assert.ok(types.has(t), `Parsed layers must include type "${t}", got: ${Array.from(types).join(", ")}`);
     }
+    const roundTripped = serializeFn(layers);
+    assertIncludes(roundTripped, "FROM alpine:latest");
+    assertIncludes(roundTripped, "WORKDIR /workspace");
+    assertIncludes(roundTripped, "ENV MODE=fast");
+    assertIncludes(roundTripped, "RUN echo $MODE");
 
     // Part B: Opaque-box browser DOM bidirectional sync
     const browser = await launchCdpBrowser({ chromePath, colorScheme: "light" });
@@ -284,20 +287,59 @@ export async function runV2Tier1(opts = {}) {
 
       // Switch to visual layer builder and verify layers rendered
       await setEditorMode(browser, "builder");
-      const controls = await inspectLayerControls(browser);
+      const controlsBefore = await inspectLayerControls(browser);
       assert.ok(
-        controls.layerCardCount >= 3,
-        `Visual layer builder must render layer rows for pasted Dockerfile (found ${controls.layerCardCount})`
+        controlsBefore.layerCardCount >= 3,
+        `Visual layer builder must render layer rows for pasted Dockerfile (found ${controlsBefore.layerCardCount})`
       );
 
-      // Add a new RUN layer via builder UI button if available
+      // Add a new RUN layer via builder UI button unconditionally
       const addRes = await clickControlByLabel(browser, /add\s+(run|layer|step)|\+\s*run/i);
-      if (addRes.clicked) {
-        await setEditorMode(browser, "dockerfile");
-        const updatedDf = await getDockerfileText(browser);
-        assertIncludes(updatedDf, `FROM ${alpineRef}`);
-        assertIncludes(updatedDf, "GREETING=hello_sync");
-      }
+      assert.equal(addRes.clicked, true, "Visual layer builder must expose a clickable Add RUN/Layer button");
+
+      const controlsAfter = await inspectLayerControls(browser);
+      assert.ok(
+        controlsAfter.layerCardCount >= controlsBefore.layerCardCount + 1,
+        `Adding a layer must increase layerCardCount from ${controlsBefore.layerCardCount} to at least ${controlsBefore.layerCardCount + 1}, got ${controlsAfter.layerCardCount}`
+      );
+
+      // Mutate the newly added layer card's input/textarea and verify reverse sync to Dockerfile text
+      const edited = await browser.evaluate(
+        `(() => {
+          const cards = Array.from(document.querySelectorAll(
+            "[data-layer-id], [data-layer-index], .layer-card, .layer-row, .layer-item"
+          ));
+          const lastCard = cards[cards.length - 1];
+          if (!lastCard) return false;
+          const field = lastCard.querySelector(
+            "textarea, input[type='text'], input:not([type='hidden']):not([type='checkbox']):not([type='radio'])"
+          );
+          if (!field) return false;
+          const proto = field.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const desc = Object.getOwnPropertyDescriptor(proto, "value");
+          if (desc && desc.set) {
+            desc.set.call(field, "echo BUILDER_SYNC_ADDED_99");
+          } else {
+            field.value = "echo BUILDER_SYNC_ADDED_99";
+          }
+          field.dispatchEvent(new Event("input", { bubbles: true }));
+          field.dispatchEvent(new Event("change", { bubbles: true }));
+          return true;
+        })()`,
+        { awaitPromise: false }
+      );
+      assert.equal(edited, true, "Newly added layer card must expose an editable input/textarea");
+
+      await setEditorMode(browser, "dockerfile");
+      const updatedDf = await getDockerfileText(browser);
+      assert.notEqual(
+        updatedDf.trim(),
+        inputDockerfile.trim(),
+        "Visual layer builder mutation must update the serialized Dockerfile text"
+      );
+      assertIncludes(updatedDf, `FROM ${alpineRef}`);
+      assertIncludes(updatedDf, "GREETING=hello_sync");
+      assertIncludes(updatedDf, "BUILDER_SYNC_ADDED_99");
 
       assert.deepEqual(browser.exceptions, [], `Uncaught exceptions: ${JSON.stringify(browser.exceptions)}`);
     } finally {

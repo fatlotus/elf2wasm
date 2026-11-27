@@ -147,7 +147,8 @@ export async function runV2Tier2(opts = {}) {
       await setDockerfileText(browser, "INVALID_DIRECTIVE_XYZ foo bar\nRUN echo nope\n");
 
       // Trigger execution or wait for inline error indicator
-      await clickGlobalRun(browser, "local");
+      const badRun = await clickGlobalRun(browser, "local");
+      assert.equal(badRun.clicked, true, "Run All Locally must be clickable on invalid Dockerfile");
 
       await waitFor(
         async () => {
@@ -160,7 +161,8 @@ export async function runV2Tier2(opts = {}) {
 
       // Fix the Dockerfile and verify clean recovery
       await setDockerfileText(browser, `FROM ${alpineRef}\nRUN echo RECOVERED_OK\n`);
-      await clickGlobalRun(browser, "local");
+      const goodRun = await clickGlobalRun(browser, "local");
+      assert.equal(goodRun.clicked, true, "Run All Locally must be clickable after fixing Dockerfile");
       await waitForTerminalMatch(browser, "RECOVERED_OK", {
         timeoutMs: 90000,
         label: "recovery after fixing Dockerfile",
@@ -188,12 +190,46 @@ export async function runV2Tier2(opts = {}) {
         await setDockerfileText(browser, df);
         await setEditorMode(browser, "builder");
         await setEditorMode(browser, "dockerfile");
+        const runRes = await clickGlobalRun(browser, "local");
+        assert.ok(runRes.clicked, "Run All Locally must be clickable for invalid sweep boundary test");
+
+        await waitFor(
+          async () => {
+            const state = await browser.evaluate(
+              `(() => {
+                const bodyText = document.body.innerText || "";
+                const hasValidationError = /error|invalid|empty|must\\s+be|at\\s+least|clamp/i.test(bodyText);
+                const btns = Array.from(document.querySelectorAll("button"));
+                const runBtn = btns.find((b) => /run\\s+all\\s+locally|run\\s+locally|^run\\b/i.test(b.textContent || ""));
+                const runEnabled = Boolean(runBtn && !runBtn.disabled);
+                return { hasValidationError, runEnabled };
+              })()`,
+              { awaitPromise: false }
+            );
+            return state.hasValidationError || state.runEnabled;
+          },
+          { timeoutMs: 30000, intervalMs: 200, label: "invalid sweep validation error or safe clamped completion" }
+        );
         assert.deepEqual(
           browser.exceptions,
           [],
           `Invalid sweep boundary must not crash UI: ${JSON.stringify(browser.exceptions)}`
         );
       }
+
+      // Verify clean recovery with a valid Dockerfile after invalid sweep boundaries
+      await setDockerfileText(browser, `FROM ${alpineRef}\nRUN echo SWEEP_BOUNDARY_RECOVERED\n`);
+      const recoverRun = await clickGlobalRun(browser, "local");
+      assert.ok(recoverRun.clicked, "Run All Locally must be clickable for sweep boundary recovery");
+      await waitForTerminalMatch(browser, "SWEEP_BOUNDARY_RECOVERED", {
+        timeoutMs: 90000,
+        label: "recovery after invalid sweep boundaries",
+      });
+      assert.deepEqual(
+        browser.exceptions,
+        [],
+        `Uncaught exceptions during sweep boundary recovery: ${JSON.stringify(browser.exceptions)}`
+      );
     } finally {
       await browser.close();
     }

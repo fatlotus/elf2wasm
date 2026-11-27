@@ -61,21 +61,23 @@ export async function runV2Tier4(opts = {}) {
       assert.ok(lightColors.bgLuminance > 0.65, `Expected Light mode initially, got L=${lightColors.bgLuminance}`);
 
       // 2. Paste Dockerfile & Run All Remotely
-      const df = [
+      const remoteDf = [
         `FROM ${alpineRef}`,
         "ENV JOURNEY_TOKEN=e2e_journey_77",
-        "RUN printf 'JOURNEY_FILE=%s\\n' \"$JOURNEY_TOKEN\" > /tmp/journey.txt && echo \"JOURNEY_OUT=$JOURNEY_TOKEN\"",
+        "RUN printf 'JOURNEY_FILE=%s\\n' \"$JOURNEY_TOKEN\" > /tmp/journey.txt && echo \"JOURNEY_REMOTE=$JOURNEY_TOKEN:$(od -An -tx1 -N8 /dev/urandom | tr -d ' \\n')\"",
       ].join("\n");
-      await setDockerfileText(browser, df);
+      await setDockerfileText(browser, remoteDf);
 
       const remoteClick = await clickGlobalRun(browser, "remote");
       assert.ok(remoteClick.clicked, "Could not click Run All Remotely");
 
-      const remoteTerminal = await waitForTerminalMatch(browser, "JOURNEY_OUT=e2e_journey_77", {
+      const remoteTerminal = await waitForTerminalMatch(browser, /JOURNEY_REMOTE=e2e_journey_77:[0-9a-f]{16}/, {
         timeoutMs: 120000,
         label: "remote journey output",
       });
-      assertIncludes(remoteTerminal, "JOURNEY_OUT=e2e_journey_77");
+      const remoteMatch = remoteTerminal.match(/JOURNEY_REMOTE=e2e_journey_77:([0-9a-f]{16})/);
+      assert.ok(remoteMatch, `Remote terminal missing JOURNEY_REMOTE hash: ${remoteTerminal}`);
+      const remoteHash = remoteMatch[1];
 
       // 3. Download outputs (.tar.gz) and verify archive contents
       const dlClick = await clickControlByLabel(browser, /download|tar\.gz/i);
@@ -99,15 +101,38 @@ export async function runV2Tier4(opts = {}) {
         { timeoutMs: 5000, intervalMs: 100, label: "switch to Dark mode" }
       );
 
-      // 5. Run All Locally and verify identical output
+      // 5. Update token to JOURNEY_LOCAL, clear network logs, Run All Locally & verify identical hash with zero /api/eval calls
+      browser.clearLogs();
+      const localDf = [
+        `FROM ${alpineRef}`,
+        "ENV JOURNEY_TOKEN=e2e_journey_77",
+        "RUN printf 'JOURNEY_FILE=%s\\n' \"$JOURNEY_TOKEN\" > /tmp/journey.txt && echo \"JOURNEY_LOCAL=$JOURNEY_TOKEN:$(od -An -tx1 -N8 /dev/urandom | tr -d ' \\n')\"",
+      ].join("\n");
+      await setDockerfileText(browser, localDf);
+
       const localClick = await clickGlobalRun(browser, "local");
       assert.ok(localClick.clicked, "Could not click Run All Locally");
 
-      const localTerminal = await waitForTerminalMatch(browser, "JOURNEY_OUT=e2e_journey_77", {
+      const localTerminal = await waitForTerminalMatch(browser, /JOURNEY_LOCAL=e2e_journey_77:[0-9a-f]{16}/, {
         timeoutMs: 120000,
         label: "local journey output",
       });
-      assertIncludes(localTerminal, "JOURNEY_OUT=e2e_journey_77");
+      const localMatch = localTerminal.match(/JOURNEY_LOCAL=e2e_journey_77:([0-9a-f]{16})/);
+      assert.ok(localMatch, `Local terminal missing JOURNEY_LOCAL hash: ${localTerminal}`);
+      const localHash = localMatch[1];
+      assert.equal(
+        localHash,
+        remoteHash,
+        `Local vs Remote deterministic journey hash mismatch: local=${localHash} remote=${remoteHash}`
+      );
+      const localEvalCalls = browser.networkRequests.filter(
+        (r) => r.method === "POST" && r.url.includes("/api/eval")
+      );
+      assert.equal(
+        localEvalCalls.length,
+        0,
+        `Run All Locally must make zero POST /api/eval requests, saw ${localEvalCalls.length}`
+      );
 
       assert.deepEqual(browser.exceptions, [], `Uncaught exceptions in user journey: ${JSON.stringify(browser.exceptions)}`);
     } finally {
@@ -124,7 +149,8 @@ export async function runV2Tier4(opts = {}) {
 
       // 1. Trigger failing remote run (non-existent image tag)
       await setDockerfileText(browser, `FROM 127.0.0.1:${registry.port}/library/does-not-exist:nope\nRUN echo hi\n`);
-      await clickGlobalRun(browser, "remote");
+      const remoteFailClick = await clickGlobalRun(browser, "remote");
+      assert.ok(remoteFailClick.clicked, "Could not click Run All Remotely for failing image test");
 
       await waitFor(
         async () => {
@@ -137,7 +163,8 @@ export async function runV2Tier4(opts = {}) {
 
       // 2. Recover cleanly and test Stop/Cancel on a long-running sleep
       await setDockerfileText(browser, `FROM ${alpineRef}\nRUN echo BEFORE_SLEEP && sleep 30 && echo AFTER_SLEEP\n`);
-      await clickGlobalRun(browser, "local");
+      const sleepRunClick = await clickGlobalRun(browser, "local");
+      assert.ok(sleepRunClick.clicked, "Could not click Run All Locally for Stop/Cancel test");
 
       await waitForTerminalMatch(browser, "BEFORE_SLEEP", {
         timeoutMs: 60000,
@@ -153,7 +180,7 @@ export async function runV2Tier4(opts = {}) {
           return browser.evaluate(
             `(() => {
               const btns = Array.from(document.querySelectorAll("button"));
-              const runBtn = btns.find((b) => /run\s+all\s+locally|run\s+locally|^run\b/i.test(b.textContent || ""));
+              const runBtn = btns.find((b) => /run\\s+all\\s+locally|run\\s+locally|^run\\b/i.test(b.textContent || ""));
               return Boolean(runBtn && !runBtn.disabled);
             })()`,
             { awaitPromise: false }
@@ -178,13 +205,27 @@ export async function runV2Tier4(opts = {}) {
 
       const clicked = await clickPresetMatching(browser, /express/i);
       assert.ok(clicked.clicked, "Express.js preset must be clickable");
-      await clickGlobalRun(browser, "local");
+      const runClick = await clickGlobalRun(browser, "local");
+      assert.equal(runClick.clicked, true, "Run All Locally must be clickable for Express.js preset");
 
-      const output = await waitForTerminalMatch(browser, /exit\s*(code)?\s*[:=]?\s*0|pass|ok|express/i, {
-        timeoutMs: 180000,
-        label: "Express.js preset execution",
-      });
-      assert.ok(output.length > 0, "Express.js preset must produce terminal output");
+      const output = await waitForTerminalMatch(
+        browser,
+        /exit\s*(?:code)?\s*[:=]\s*0\b|\b\d+\s+passing\b|\b\d+\s+passed\b/i,
+        {
+          timeoutMs: 180000,
+          label: "Express.js preset clean completion",
+        }
+      );
+      assert.equal(
+        /exit\s*(?:code)?\s*[:=]\s*[1-9]\d*\b/i.test(output),
+        false,
+        `Express.js preset must not exit with non-zero code:\n${output}`
+      );
+      assert.equal(
+        /traceback\s*\(most\s+recent\s+call\s+last\)|\bfatal\s+error\b|\bunhandled\s+exception\b/i.test(output),
+        false,
+        `Express.js preset must not emit fatal error/traceback:\n${output}`
+      );
       assert.deepEqual(browser.exceptions, [], `Uncaught exceptions: ${JSON.stringify(browser.exceptions)}`);
     } finally {
       await browser.close();
@@ -201,13 +242,27 @@ export async function runV2Tier4(opts = {}) {
 
       const clicked = await clickPresetMatching(browser, /flask/i);
       assert.ok(clicked.clicked, "Flask preset must be clickable");
-      await clickGlobalRun(browser, "local");
+      const runClick = await clickGlobalRun(browser, "local");
+      assert.equal(runClick.clicked, true, "Run All Locally must be clickable for Flask preset");
 
-      const output = await waitForTerminalMatch(browser, /exit\s*(code)?\s*[:=]?\s*0|pass|ok|flask/i, {
-        timeoutMs: 180000,
-        label: "Flask preset execution",
-      });
-      assert.ok(output.length > 0, "Flask preset must produce terminal output");
+      const output = await waitForTerminalMatch(
+        browser,
+        /exit\s*(?:code)?\s*[:=]\s*0\b|\b\d+\s+passing\b|\b\d+\s+passed\b/i,
+        {
+          timeoutMs: 180000,
+          label: "Flask preset clean completion",
+        }
+      );
+      assert.equal(
+        /exit\s*(?:code)?\s*[:=]\s*[1-9]\d*\b/i.test(output),
+        false,
+        `Flask preset must not exit with non-zero code:\n${output}`
+      );
+      assert.equal(
+        /traceback\s*\(most\s+recent\s+call\s+last\)|\bfatal\s+error\b|\bunhandled\s+exception\b/i.test(output),
+        false,
+        `Flask preset must not emit fatal error/traceback:\n${output}`
+      );
       assert.deepEqual(browser.exceptions, [], `Uncaught exceptions: ${JSON.stringify(browser.exceptions)}`);
     } finally {
       await browser.close();

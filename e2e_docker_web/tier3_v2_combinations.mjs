@@ -101,76 +101,116 @@ export async function runV2Tier3(opts = {}) {
     }
   });
 
-  suite.add("T3-V2.2", "F4/F5/F8 Local browser vs Remote Worker determinism parity (same delayStddevMs/delaySeed)", async () => {
+  suite.add("T3-V2.2", "F4/F5/F8 Local browser vs Remote Worker determinism parity (delaySeed=0 and delaySeed=4242)", async () => {
     await ensureEnv();
 
-    const parityCmd = "od -An -tx1 -N8 /dev/urandom | tr -d ' \\n' > /tmp/det.hex && echo PARITY=$(cat /tmp/det.hex)";
+    const makeCmd = (tag) =>
+      `od -An -tx1 -N8 /dev/urandom | tr -d ' \\n' > /tmp/det.hex && echo ${tag}=$(cat /tmp/det.hex)`;
 
-    // 1. Remote evaluation via POST /api/eval
-    const remoteRes = await postEvalJson(server.url, {
+    // 1a. Remote evaluation with default delayStddevMs=0, delaySeed=0
+    const remoteDefault = await postEvalJson(server.url, {
       baseImage: alpineRef,
-      cmd: ["/bin/sh", "-c", parityCmd],
+      cmd: ["/bin/sh", "-c", makeCmd("PARITY_DEFAULT")],
       cwd: "/",
-      delayStddevMs: 5,
+      delayStddevMs: 0,
+      delaySeed: 0,
+      returnOutputDiff: true,
+    });
+    assert.equal(remoteDefault.status, 200, `Remote default /api/eval failed: ${remoteDefault.text}`);
+    assert.equal(remoteDefault.json?.exitCode, 0, `Remote default exitCode != 0: ${JSON.stringify(remoteDefault.json)}`);
+    const remoteDefaultMatch = remoteDefault.json.stdout.match(/PARITY_DEFAULT=([0-9a-f]{16})/);
+    assert.ok(remoteDefaultMatch, `Remote default stdout missing PARITY_DEFAULT=<hex>: ${remoteDefault.json.stdout}`);
+    const remoteDefaultHex = remoteDefaultMatch[1];
+
+    const decodedDefault = decodeTarGzBase64(remoteDefault.json.outputDiffTarGzBase64);
+    const detDefaultFile = findTarEntry(decodedDefault.entries, "tmp/det.hex");
+    assert.ok(detDefaultFile, "Remote default diff tar must include tmp/det.hex");
+    assert.equal(Buffer.from(detDefaultFile.data).toString("utf8"), remoteDefaultHex);
+
+    // 1b. Remote evaluation with non-zero delaySeed=4242
+    const remoteSeed = await postEvalJson(server.url, {
+      baseImage: alpineRef,
+      cmd: ["/bin/sh", "-c", makeCmd("PARITY_SEED4242")],
+      cwd: "/",
+      delayStddevMs: 0,
       delaySeed: 4242,
       returnOutputDiff: true,
     });
-    assert.equal(remoteRes.status, 200, `Remote /api/eval failed: ${remoteRes.text}`);
-    assert.equal(remoteRes.json?.exitCode, 0, `Remote exitCode != 0: ${JSON.stringify(remoteRes.json)}`);
-    const remoteMatch = remoteRes.json.stdout.match(/PARITY=([0-9a-f]{16})/);
-    assert.ok(remoteMatch, `Remote stdout missing PARITY=<hex>: ${remoteRes.json.stdout}`);
-    const remoteHex = remoteMatch[1];
+    assert.equal(remoteSeed.status, 200, `Remote seeded /api/eval failed: ${remoteSeed.text}`);
+    assert.equal(remoteSeed.json?.exitCode, 0, `Remote seeded exitCode != 0: ${JSON.stringify(remoteSeed.json)}`);
+    const remoteSeedMatch = remoteSeed.json.stdout.match(/PARITY_SEED4242=([0-9a-f]{16})/);
+    assert.ok(remoteSeedMatch, `Remote seeded stdout missing PARITY_SEED4242=<hex>: ${remoteSeed.json.stdout}`);
+    const remoteSeedHex = remoteSeedMatch[1];
 
-    const decoded = decodeTarGzBase64(remoteRes.json.outputDiffTarGzBase64);
-    const detFile = findTarEntry(decoded.entries, "tmp/det.hex");
-    assert.ok(detFile, "Remote diff tar must include tmp/det.hex");
-    assert.equal(Buffer.from(detFile.data).toString("utf8"), remoteHex);
+    const decodedSeed = decodeTarGzBase64(remoteSeed.json.outputDiffTarGzBase64);
+    const detSeedFile = findTarEntry(decodedSeed.entries, "tmp/det.hex");
+    assert.ok(detSeedFile, "Remote seeded diff tar must include tmp/det.hex");
+    assert.equal(Buffer.from(detSeedFile.data).toString("utf8"), remoteSeedHex);
 
-    // 2. Local browser evaluation with identical command & seed/delay
+    assert.notEqual(
+      remoteSeedHex,
+      remoteDefaultHex,
+      `Varying delaySeed (0 vs 4242) must produce distinct deterministic PRNG output (both were ${remoteDefaultHex})`
+    );
+
+    // 2. Local browser evaluation with identical commands for BOTH delaySeed=0 and delaySeed=4242
     const browser = await launchCdpBrowser({ chromePath, colorScheme: "light" });
     try {
       await browser.navigate(server.url);
       await browser.waitForSelector("body", 10000);
 
-      const df = [
+      // 2a. Local default run (delaySeed=0)
+      const defaultDf = [
+        `FROM ${alpineRef}`,
+        `RUN ${makeCmd("PARITY_DEFAULT")}`,
+      ].join("\n");
+      await setDockerfileText(browser, defaultDf);
+      const clickedDefault = await clickGlobalRun(browser, "local");
+      assert.ok(clickedDefault.clicked, "Could not trigger Run All Locally for default parity run");
+
+      const localDefaultOut = await waitForTerminalMatch(browser, /PARITY_DEFAULT=[0-9a-f]{16}/, {
+        timeoutMs: 120000,
+        label: "local browser default parity output",
+      });
+      const localDefaultMatch = localDefaultOut.match(/PARITY_DEFAULT=([0-9a-f]{16})/);
+      assert.ok(localDefaultMatch, `Local default output missing PARITY_DEFAULT=<hex>: ${localDefaultOut}`);
+      assert.equal(
+        localDefaultMatch[1],
+        remoteDefaultHex,
+        `Local vs Remote deterministic mismatch (delaySeed=0)! local=${localDefaultMatch[1]} remote=${remoteDefaultHex}`
+      );
+
+      // 2b. Local seeded run (delaySeed=4242 via single-value seed sweep)
+      const seededDf = [
         `FROM ${alpineRef}`,
         "# elf2wasm:sweep param=seed mode=list values=4242",
-        `RUN ${parityCmd}`,
+        `RUN ${makeCmd("PARITY_SEED4242")}`,
       ].join("\n");
-      // Also run with delayStddevMs=0/seed=4242 or exact parity via local run
-      const simpleDf = [
-        `FROM ${alpineRef}`,
-        `RUN ${parityCmd}`,
-      ].join("\n");
+      await setDockerfileText(browser, seededDf);
+      const clickedSeed = await clickGlobalRun(browser, "local");
+      assert.ok(clickedSeed.clicked, "Could not trigger Run All Locally for seeded parity run");
 
-      // Compare against remote with matching default delayStddevMs=0, delaySeed=0
-      const remoteDefault = await postEvalJson(server.url, {
-        baseImage: alpineRef,
-        cmd: ["/bin/sh", "-c", parityCmd],
-        cwd: "/",
-        delayStddevMs: 0,
-        delaySeed: 0,
-        returnOutputDiff: true,
-      });
-      assert.equal(remoteDefault.status, 200);
-      const expectedMatch = remoteDefault.json.stdout.match(/PARITY=([0-9a-f]{16})/);
-      assert.ok(expectedMatch, `Remote default stdout missing PARITY=<hex>: ${remoteDefault.json.stdout}`);
-
-      await setDockerfileText(browser, simpleDf);
-      const clicked = await clickGlobalRun(browser, "local");
-      assert.ok(clicked.clicked, "Could not trigger Run All Locally");
-
-      const localOut = await waitForTerminalMatch(browser, /PARITY=[0-9a-f]{16}/, {
-        timeoutMs: 120000,
-        label: "local browser parity output",
-      });
-      const localMatch = localOut.match(/PARITY=([0-9a-f]{16})/);
-      assert.ok(localMatch, `Local browser output missing PARITY=<hex>: ${localOut}`);
-      assert.equal(
-        localMatch[1],
-        expectedMatch[1],
-        `Local browser vs Remote Worker deterministic output mismatch! local=${localMatch[1]} remote=${expectedMatch[1]}`
+      await waitFor(
+        async () => {
+          const rows = await getSweepTableRows(browser);
+          return rows.length >= 1 && rows.some((r) => r.text.includes("4242")) ? rows : false;
+        },
+        { timeoutMs: 120000, intervalMs: 300, label: "seeded sweep row (4242)" }
       );
+      await clickSweepTableRow(browser, 0);
+
+      const localSeedOut = await waitForTerminalMatch(browser, /PARITY_SEED4242=[0-9a-f]{16}/, {
+        timeoutMs: 30000,
+        label: "local browser seeded (4242) parity output",
+      });
+      const localSeedMatch = localSeedOut.match(/PARITY_SEED4242=([0-9a-f]{16})/);
+      assert.ok(localSeedMatch, `Local seeded output missing PARITY_SEED4242=<hex>: ${localSeedOut}`);
+      assert.equal(
+        localSeedMatch[1],
+        remoteSeedHex,
+        `Local vs Remote deterministic mismatch (delaySeed=4242)! local=${localSeedMatch[1]} remote=${remoteSeedHex}`
+      );
+
       assert.deepEqual(browser.exceptions, [], `Uncaught exceptions: ${JSON.stringify(browser.exceptions)}`);
     } finally {
       await browser.close();
@@ -291,7 +331,7 @@ export async function runV2Tier3(opts = {}) {
         await waitFor(
           async () => {
             const text = await getTerminalOutput(browser);
-            return expectedOutputs.some((exp) => text.includes(exp));
+            return expectedOutputs.some((exp) => !seenOutputs.has(exp) && text.includes(exp));
           },
           { timeoutMs: 5000, intervalMs: 100, label: `terminal update for sweep row ${i}` }
         );
@@ -326,7 +366,8 @@ export async function runV2Tier3(opts = {}) {
         "RUN echo DELAY_SWEEP_OK",
       ].join("\n");
       await setDockerfileText(browser, delayDf);
-      await clickGlobalRun(browser, "local");
+      const delayRun = await clickGlobalRun(browser, "local");
+      assert.ok(delayRun.clicked, "Could not start delay sweep");
 
       const delayRows = await waitFor(
         async () => {
@@ -340,26 +381,50 @@ export async function runV2Tier3(opts = {}) {
       assertIncludes(delayText, "5");
       assertIncludes(delayText, "10");
 
-      // 2. Seed range sweep: start=10, step=1, count=3 -> 10, 11, 12
+      // 2. Seed range sweep: start=10, step=1, count=3 -> 10, 11, 12 with distinct /dev/urandom outputs
       const seedDf = [
         `FROM ${alpineRef}`,
         "# elf2wasm:sweep param=seed mode=range start=10 step=1 count=3",
-        "RUN echo SEED_SWEEP_OK",
+        "RUN echo SEED_HEX=$(od -An -tx1 -N8 /dev/urandom | tr -d ' \\n')",
       ].join("\n");
       await setDockerfileText(browser, seedDf);
-      await clickGlobalRun(browser, "local");
+      const seedRun = await clickGlobalRun(browser, "local");
+      assert.ok(seedRun.clicked, "Could not start seed sweep");
 
       const seedRows = await waitFor(
         async () => {
           const rows = await getSweepTableRows(browser);
-          return rows.length === 3 ? rows : false;
+          if (rows.length !== 3) return false;
+          const joined = rows.map((r) => r.text).join(" | ");
+          return joined.includes("11") && joined.includes("12") ? rows : false;
         },
-        { timeoutMs: 120000, intervalMs: 300, label: "3 seed sweep rows" }
+        { timeoutMs: 120000, intervalMs: 300, label: "3 seed sweep rows (10, 11, 12)" }
       );
       const seedText = seedRows.map((r) => r.text).join(" | ");
       assertIncludes(seedText, "10");
       assertIncludes(seedText, "11");
       assertIncludes(seedText, "12");
+
+      // Click each of the 3 seed rows and verify 3 distinct SEED_HEX values are produced
+      const seenSeedHexes = new Set();
+      for (let i = 0; i < 3; i++) {
+        const rowClicked = await clickSweepTableRow(browser, i);
+        assert.ok(rowClicked, `Could not click seed sweep row ${i}`);
+        const hex = await waitFor(
+          async () => {
+            const text = await getTerminalOutput(browser);
+            const m = text.match(/SEED_HEX=([0-9a-f]{16})/);
+            return m && !seenSeedHexes.has(m[1]) ? m[1] : false;
+          },
+          { timeoutMs: 5000, intervalMs: 100, label: `distinct SEED_HEX for seed sweep row ${i}` }
+        );
+        seenSeedHexes.add(hex);
+      }
+      assert.equal(
+        seenSeedHexes.size,
+        3,
+        `Seed sweep (10, 11, 12) must produce 3 distinct SEED_HEX values; saw ${Array.from(seenSeedHexes).join(", ")}`
+      );
 
       assert.deepEqual(browser.exceptions, [], `Uncaught exceptions: ${JSON.stringify(browser.exceptions)}`);
     } finally {
