@@ -1335,6 +1335,74 @@ export class Elf2WasmSystem {
     }
   }
 
+  _callVfsDiffExport(exportName, { baseSnapshotId = null, pathPrefix = null } = {}) {
+    if (!this.runtimeInst) {
+      throw new Error("Elf2WasmSystem created without runtimeWasm");
+    }
+    const rExp = this.runtimeInst.exports;
+    if (typeof rExp[exportName] !== "function") {
+      throw new Error(`${exportName} is not exported by runtime WASM`);
+    }
+    let useBase = 0;
+    let snapId = 0;
+    if (baseSnapshotId !== null && baseSnapshotId !== undefined) {
+      if (
+        typeof baseSnapshotId !== "number" ||
+        !Number.isInteger(baseSnapshotId) ||
+        baseSnapshotId < 1 ||
+        baseSnapshotId > 0xffff_ffff
+      ) {
+        throw new RangeError(
+          `Invalid baseSnapshotId: ${baseSnapshotId} (must be an integer in 1..4294967295)`
+        );
+      }
+      useBase = 1;
+      snapId = baseSnapshotId;
+    }
+
+    let pPtr = 0;
+    let pLen = 0;
+    if (typeof pathPrefix === "string" && pathPrefix.length > 0) {
+      const pBytes = textEncoder.encode(pathPrefix);
+      pLen = pBytes.length;
+      pPtr = rExp.alloc(pLen) >>> 0;
+      new Uint8Array(rExp.memory.buffer, pPtr, pLen).set(pBytes);
+    }
+
+    const outLenPtr = rExp.alloc(4) >>> 0;
+    let outPtr = 0;
+    let outLen = 0;
+    try {
+      outPtr = rExp[exportName](snapId, useBase, pPtr, pLen, outLenPtr) >>> 0;
+      outLen = new DataView(rExp.memory.buffer).getUint32(outLenPtr, true);
+    } finally {
+      rExp.dealloc(outLenPtr, 4);
+      if (pPtr !== 0 && pLen > 0) {
+        rExp.dealloc(pPtr, pLen);
+      }
+    }
+
+    if (outPtr === 0 || outLen === 0) {
+      throw new Error(
+        `${exportName} failed (baseSnapshotId=${baseSnapshotId ?? "none"}, pathPrefix=${pathPrefix ?? ""})`
+      );
+    }
+    try {
+      return new Uint8Array(rExp.memory.buffer, outPtr, outLen).slice();
+    } finally {
+      rExp.dealloc(outPtr, outLen);
+    }
+  }
+
+  exportVfsDiffTar(options = {}) {
+    return this._callVfsDiffExport("runtime_export_vfs_tar", options);
+  }
+
+  listVfsDiff(options = {}) {
+    const jsonBytes = this._callVfsDiffExport("runtime_list_vfs_diff", options);
+    return JSON.parse(textDecoder.decode(jsonBytes));
+  }
+
   _notifyInput() {
     this._inputSignaled = true;
     if (this._inputWaiters.length === 0) return;

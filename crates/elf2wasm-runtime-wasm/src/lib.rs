@@ -11,7 +11,8 @@ use elf2wasm_runtime_core::scheduler::ThreadState;
 use elf2wasm_runtime_core::stack::setup_guest_stack_ctx_with_ids_and_random;
 use elf2wasm_runtime_core::syscalls::{handle_syscall, HostState, PendingHostAction};
 use elf2wasm_runtime_core::vfs::{
-    path_hash, DirEntry, FileStat, VirtualFs, AT_FDCWD, EFAULT, EINVAL, ENOMEM,
+    encode_vfs_diff_json, path_hash, DirEntry, FileStat, VirtualFs, AT_FDCWD, EFAULT, EINVAL,
+    ENOMEM,
 };
 
 const GLOBAL_ID_FSBASE: u32 = 0;
@@ -1100,3 +1101,89 @@ pub extern "C" fn runtime_drop_vfs_snapshot(snapshot_id: u32) -> i32 {
     };
     state.vfs.drop_vfs_snapshot(snapshot_id)
 }
+
+#[no_mangle]
+pub extern "C" fn runtime_export_vfs_tar(
+    base_snap_id: u32,
+    use_base: u32,
+    prefix_ptr: *const u8,
+    prefix_len: usize,
+    out_len_ptr: *mut usize,
+) -> *mut u8 {
+    if out_len_ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    let Some(state) = state_ref() else {
+        unsafe { *out_len_ptr = 0 };
+        return core::ptr::null_mut();
+    };
+    let base = if use_base != 0 {
+        if !state.vfs.has_snapshot(base_snap_id) {
+            unsafe { *out_len_ptr = 0 };
+            return core::ptr::null_mut();
+        }
+        Some(base_snap_id)
+    } else {
+        None
+    };
+    let prefix = if prefix_len > 0 {
+        if prefix_ptr.is_null() {
+            unsafe { *out_len_ptr = 0 };
+            return core::ptr::null_mut();
+        }
+        let slice = unsafe { core::slice::from_raw_parts(prefix_ptr, prefix_len) };
+        let Ok(s) = core::str::from_utf8(slice) else {
+            unsafe { *out_len_ptr = 0 };
+            return core::ptr::null_mut();
+        };
+        Some(s)
+    } else {
+        None
+    };
+    let tar = state.vfs.export_tar(base, prefix);
+    export_owned_bytes(tar, out_len_ptr)
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_list_vfs_diff(
+    base_snap_id: u32,
+    use_base: u32,
+    prefix_ptr: *const u8,
+    prefix_len: usize,
+    out_len_ptr: *mut usize,
+) -> *mut u8 {
+    if out_len_ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    let Some(state) = state_ref() else {
+        unsafe { *out_len_ptr = 0 };
+        return core::ptr::null_mut();
+    };
+    let base = if use_base != 0 {
+        if !state.vfs.has_snapshot(base_snap_id) {
+            unsafe { *out_len_ptr = 0 };
+            return core::ptr::null_mut();
+        }
+        Some(base_snap_id)
+    } else {
+        None
+    };
+    let prefix = if prefix_len > 0 {
+        if prefix_ptr.is_null() {
+            unsafe { *out_len_ptr = 0 };
+            return core::ptr::null_mut();
+        }
+        let slice = unsafe { core::slice::from_raw_parts(prefix_ptr, prefix_len) };
+        let Ok(s) = core::str::from_utf8(slice) else {
+            unsafe { *out_len_ptr = 0 };
+            return core::ptr::null_mut();
+        };
+        Some(s)
+    } else {
+        None
+    };
+    let diff = state.vfs.list_diff(base, prefix);
+    let json = encode_vfs_diff_json(&diff);
+    export_owned_bytes(json, out_len_ptr)
+}
+

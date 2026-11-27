@@ -4,6 +4,8 @@ pub mod stack;
 pub mod syscalls;
 pub mod vfs;
 
+pub use vfs::{encode_vfs_diff_json, VfsDiffEntry, VfsDiffKind};
+
 #[cfg(test)]
 mod tests {
     use crate::context::GuestContext;

@@ -141,6 +141,75 @@ pub enum OverlayNode {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfsDiffKind {
+    File,
+    Dir,
+    Symlink,
+    Deleted,
+}
+
+impl VfsDiffKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VfsDiffKind::File => "file",
+            VfsDiffKind::Dir => "dir",
+            VfsDiffKind::Symlink => "symlink",
+            VfsDiffKind::Deleted => "deleted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VfsDiffEntry {
+    pub path: String,
+    pub kind: VfsDiffKind,
+    pub size: u64,
+}
+
+fn push_json_escaped_str(out: &mut Vec<u8>, s: &str) {
+    out.push(b'"');
+    for b in s.bytes() {
+        match b {
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            c if c < 0x20 => {
+                let hex = b"0123456789abcdef";
+                out.extend_from_slice(b"\\u00");
+                out.push(hex[(c >> 4) as usize]);
+                out.push(hex[(c & 0x0f) as usize]);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(b'"');
+}
+
+/// Encode a slice of [`VfsDiffEntry`] values as compact RFC 8259 JSON UTF-8 bytes.
+pub fn encode_vfs_diff_json(entries: &[VfsDiffEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + entries.len() * 48);
+    out.push(b'[');
+    for (i, entry) in entries.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(b"{\"path\":");
+        push_json_escaped_str(&mut out, &entry.path);
+        out.extend_from_slice(b",\"kind\":\"");
+        out.extend_from_slice(entry.kind.as_str().as_bytes());
+        out.extend_from_slice(b"\",\"size\":");
+        out.extend_from_slice(entry.size.to_string().as_bytes());
+        out.push(b'}');
+    }
+    out.push(b']');
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct PipeBuffer {
     pub buf: VecDeque<u8>,
@@ -611,6 +680,542 @@ impl VirtualFs {
         } else {
             -1
         }
+    }
+
+    pub fn has_snapshot(&self, snapshot_id: u32) -> bool {
+        snapshot_id != 0 && self.snapshots.contains_key(&snapshot_id)
+    }
+
+    /// Return sorted normalized paths of all entries currently in the VFS overlay.
+    pub fn overlay_paths(&self) -> Vec<String> {
+        self.overlay.keys().cloned().collect()
+    }
+
+    fn normalize_prefix(path_prefix: Option<&str>) -> Option<String> {
+        let raw = path_prefix?;
+        if raw.is_empty() {
+            return None;
+        }
+        let norm = normalize_guest_path(raw);
+        if norm == "/" {
+            None
+        } else {
+            Some(norm)
+        }
+    }
+
+    fn matches_prefix(path: &str, prefix: Option<&str>) -> bool {
+        if path == "/" {
+            return false;
+        }
+        let Some(pfx) = prefix else {
+            return true;
+        };
+        path == pfx
+            || (path.len() > pfx.len()
+                && path.starts_with(pfx)
+                && path.as_bytes()[pfx.len()] == b'/')
+    }
+
+    fn nodes_unchanged(cur: &OverlayNode, base: &OverlayNode) -> bool {
+        match (cur, base) {
+            (
+                OverlayNode::File {
+                    data: d1,
+                    mode: m1,
+                    mtime_ns: t1,
+                },
+                OverlayNode::File {
+                    data: d2,
+                    mode: m2,
+                    mtime_ns: t2,
+                },
+            ) => Arc::ptr_eq(d1, d2) && m1 == m2 && t1 == t2,
+            (
+                OverlayNode::Dir {
+                    mode: m1,
+                    mtime_ns: t1,
+                },
+                OverlayNode::Dir {
+                    mode: m2,
+                    mtime_ns: t2,
+                },
+            ) => m1 == m2 && t1 == t2,
+            (
+                OverlayNode::Symlink {
+                    target: s1,
+                    mtime_ns: t1,
+                },
+                OverlayNode::Symlink {
+                    target: s2,
+                    mtime_ns: t2,
+                },
+            ) => s1 == s2 && t1 == t2,
+            _ => false,
+        }
+    }
+
+    fn has_ancestor_in_set(path: &str, set: &HashSet<&str>) -> bool {
+        let mut cur = parent_guest_path(path);
+        while cur != "/" {
+            if set.contains(cur) {
+                return true;
+            }
+            cur = parent_guest_path(cur);
+        }
+        false
+    }
+
+    fn compute_diff_sets<'a>(
+        &'a self,
+        base_snapshot_id: Option<u32>,
+        path_prefix: Option<&str>,
+    ) -> (Vec<(&'a String, &'a OverlayNode)>, Vec<&'a str>, Vec<&'a str>) {
+        let norm_prefix = Self::normalize_prefix(path_prefix);
+        let pfx = norm_prefix.as_deref();
+        let base_map = base_snapshot_id.and_then(|id| self.snapshots.get(&id));
+
+        let mut deleted_paths: Vec<&'a str> = Vec::new();
+        let mut replaced_dir_whiteouts: Vec<&'a str> = Vec::new();
+
+        if let Some(base) = base_map {
+            let mut raw_deleted: Vec<&'a str> = Vec::new();
+            let mut raw_replaced: Vec<&'a str> = Vec::new();
+            for (path, base_node) in base {
+                if !Self::matches_prefix(path, pfx) {
+                    continue;
+                }
+                match self.overlay.get(path) {
+                    None => raw_deleted.push(path.as_str()),
+                    Some(cur_node) => {
+                        if matches!(base_node, OverlayNode::Dir { .. })
+                            && !matches!(cur_node, OverlayNode::Dir { .. })
+                        {
+                            raw_replaced.push(path.as_str());
+                        }
+                    }
+                }
+            }
+            let mut all_removed: HashSet<&'a str> =
+                HashSet::with_capacity(raw_deleted.len() + raw_replaced.len());
+            for &p in &raw_deleted {
+                all_removed.insert(p);
+            }
+            for &p in &raw_replaced {
+                all_removed.insert(p);
+            }
+            for p in raw_deleted {
+                if !Self::has_ancestor_in_set(p, &all_removed) {
+                    deleted_paths.push(p);
+                }
+            }
+            for p in raw_replaced {
+                if !Self::has_ancestor_in_set(p, &all_removed) {
+                    replaced_dir_whiteouts.push(p);
+                }
+            }
+        }
+
+        let mut changed_entries: Vec<(&'a String, &'a OverlayNode)> = Vec::new();
+        for (path, cur_node) in &self.overlay {
+            if !Self::matches_prefix(path, pfx) {
+                continue;
+            }
+            if let Some(base_node) = base_map.and_then(|b| b.get(path)) {
+                if Self::nodes_unchanged(cur_node, base_node) {
+                    continue;
+                }
+            }
+            changed_entries.push((path, cur_node));
+        }
+
+        (changed_entries, deleted_paths, replaced_dir_whiteouts)
+    }
+
+    pub fn list_diff(
+        &self,
+        base_snapshot_id: Option<u32>,
+        path_prefix: Option<&str>,
+    ) -> Vec<VfsDiffEntry> {
+        let (changed_entries, deleted_paths, _) =
+            self.compute_diff_sets(base_snapshot_id, path_prefix);
+        let mut out = Vec::with_capacity(changed_entries.len() + deleted_paths.len());
+        for (path, node) in changed_entries {
+            let (kind, size) = match node {
+                OverlayNode::File { data, .. } => (VfsDiffKind::File, data.len() as u64),
+                OverlayNode::Dir { .. } => (VfsDiffKind::Dir, 0),
+                OverlayNode::Symlink { target, .. } => (VfsDiffKind::Symlink, target.len() as u64),
+            };
+            out.push(VfsDiffEntry {
+                path: path.clone(),
+                kind,
+                size,
+            });
+        }
+        for path in deleted_paths {
+            out.push(VfsDiffEntry {
+                path: path.to_string(),
+                kind: VfsDiffKind::Deleted,
+                size: 0,
+            });
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
+    }
+
+    pub fn export_tar(
+        &self,
+        base_snapshot_id: Option<u32>,
+        path_prefix: Option<&str>,
+    ) -> Vec<u8> {
+        let (changed_entries, deleted_paths, replaced_dir_whiteouts) =
+            self.compute_diff_sets(base_snapshot_id, path_prefix);
+
+        let mut out: Vec<u8> = Vec::new();
+
+        // 1. OCI whiteouts (.wh.<name>) for deletions and replaced directories.
+        let mut whiteouts: Vec<&str> =
+            Vec::with_capacity(deleted_paths.len() + replaced_dir_whiteouts.len());
+        whiteouts.extend_from_slice(&deleted_paths);
+        whiteouts.extend_from_slice(&replaced_dir_whiteouts);
+        whiteouts.sort_unstable();
+        whiteouts.dedup();
+        for path in whiteouts {
+            let trimmed = path.trim_start_matches('/');
+            if trimmed.is_empty() {
+                continue;
+            }
+            let wh_tar_path = match trimmed.rfind('/') {
+                Some(idx) => format!("{}/.wh.{}", &trimmed[..idx], &trimmed[idx + 1..]),
+                None => format!(".wh.{}", trimmed),
+            };
+            write_tar_entry(&mut out, &wh_tar_path, b'0', 0o644, 0, "", &[]);
+        }
+
+        // 2. Directories (parents before children via BTreeMap lexicographical order).
+        for (path, node) in &changed_entries {
+            if let OverlayNode::Dir { mode, mtime_ns } = node {
+                let trimmed = path.trim_start_matches('/');
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let tar_path = format!("{}/", trimmed);
+                write_tar_entry(
+                    &mut out,
+                    &tar_path,
+                    b'5',
+                    *mode & 0o7777,
+                    *mtime_ns / 1_000_000_000,
+                    "",
+                    &[],
+                );
+            }
+        }
+
+        // 3. Symlinks.
+        for (path, node) in &changed_entries {
+            if let OverlayNode::Symlink { target, mtime_ns } = node {
+                let trimmed = path.trim_start_matches('/');
+                if trimmed.is_empty() {
+                    continue;
+                }
+                write_tar_entry(
+                    &mut out,
+                    trimmed,
+                    b'2',
+                    0o777,
+                    *mtime_ns / 1_000_000_000,
+                    target,
+                    &[],
+                );
+            }
+        }
+
+        // 4. Regular files.
+        for (path, node) in &changed_entries {
+            if let OverlayNode::File {
+                data,
+                mode,
+                mtime_ns,
+            } = node
+            {
+                let trimmed = path.trim_start_matches('/');
+                if trimmed.is_empty() {
+                    continue;
+                }
+                write_tar_entry(
+                    &mut out,
+                    trimmed,
+                    b'0',
+                    *mode & 0o7777,
+                    *mtime_ns / 1_000_000_000,
+                    "",
+                    data.as_slice(),
+                );
+            }
+        }
+
+        // 5. End-of-archive: two 512-byte zero blocks.
+        out.resize(out.len() + 1024, 0);
+        out
+    }
+
+    /// Extract a USTAR/PAX/GNU-longname tar archive into the VFS overlay.
+    ///
+    /// Supports OCI whiteouts (`.wh.<name>` and `.wh..wh..opq`), `mount_path`,
+    /// and `strip_components`, matching `extractTarToVfs` + `applyVfsOverlay` in
+    /// `js/elf2wasm_shim.mjs`.
+    pub fn extract_tar(
+        &mut self,
+        tar_bytes: &[u8],
+        mount_path: &str,
+        strip_components: usize,
+        ignore_whiteouts: bool,
+    ) -> Result<usize, String> {
+        let mount = normalize_guest_path(if mount_path.is_empty() { "/" } else { mount_path });
+
+        enum TarWhiteout {
+            Opaque(String),
+            Remove(String),
+        }
+
+        let mut files: BTreeMap<String, (Vec<u8>, u32)> = BTreeMap::new();
+        let mut symlinks: BTreeMap<String, String> = BTreeMap::new();
+        let mut dirs: BTreeMap<String, u32> = BTreeMap::new();
+        let mut whiteouts: Vec<TarWhiteout> = Vec::new();
+
+        if mount != "/" {
+            dirs.insert(mount.clone(), 0o755);
+        }
+
+        let mut offset: usize = 0;
+        let mut next_long_name: Option<String> = None;
+        let mut next_long_link: Option<String> = None;
+        let mut next_pax: Option<BTreeMap<String, String>> = None;
+        let mut global_pax: BTreeMap<String, String> = BTreeMap::new();
+
+        while offset + 512 <= tar_bytes.len() {
+            let hdr = &tar_bytes[offset..offset + 512];
+            if hdr.iter().all(|&b| b == 0) {
+                offset += 512;
+                continue;
+            }
+
+            let name_field = read_tar_str(&hdr[0..100]);
+            let mode = parse_tar_num(&hdr[100..108]).unwrap_or(0) as u32;
+            let mut size = parse_tar_num(&hdr[124..136]).unwrap_or(0);
+            let typeflag = hdr[156];
+            let link_field = read_tar_str(&hdr[157..257]);
+            let prefix_field = read_tar_str(&hdr[345..500]);
+
+            offset += 512;
+
+            if let Some(pax) = next_pax.as_ref() {
+                if let Some(sz_str) = pax.get("size") {
+                    if let Ok(pax_sz) = sz_str.parse::<u64>() {
+                        size = pax_sz;
+                    }
+                }
+            }
+
+            let size_usize = usize::try_from(size)
+                .map_err(|_| format!("tar entry size overflows usize: {}", size))?;
+            let data_end = offset.saturating_add(size_usize).min(tar_bytes.len());
+            let payload = &tar_bytes[offset..data_end];
+            let padded_blocks = size_usize.div_ceil(512).saturating_mul(512);
+            offset = offset.saturating_add(padded_blocks);
+
+            match typeflag {
+                b'L' => {
+                    let s = String::from_utf8_lossy(payload)
+                        .trim_end_matches('\0')
+                        .to_string();
+                    next_long_name = Some(s);
+                    continue;
+                }
+                b'K' => {
+                    let s = String::from_utf8_lossy(payload)
+                        .trim_end_matches('\0')
+                        .to_string();
+                    next_long_link = Some(s);
+                    continue;
+                }
+                b'x' => {
+                    next_pax = Some(parse_pax_records(payload));
+                    continue;
+                }
+                b'g' => {
+                    for (k, v) in parse_pax_records(payload) {
+                        global_pax.insert(k, v);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
+            let mut raw_path = if !prefix_field.is_empty() {
+                format!("{}/{}", prefix_field, name_field)
+            } else {
+                name_field
+            };
+            if let Some(ln) = next_long_name.take() {
+                raw_path = ln;
+            }
+            if let Some(pax_path) = next_pax
+                .as_ref()
+                .and_then(|p| p.get("path"))
+                .or_else(|| global_pax.get("path"))
+            {
+                raw_path = pax_path.clone();
+            }
+
+            let mut link_target = link_field;
+            if let Some(ll) = next_long_link.take() {
+                link_target = ll;
+            }
+            if let Some(pax_link) = next_pax
+                .as_ref()
+                .and_then(|p| p.get("linkpath"))
+                .or_else(|| global_pax.get("linkpath"))
+            {
+                link_target = pax_link.clone();
+            }
+            next_pax = None;
+
+            let Some(guest_path) = resolve_tar_entry_path(&raw_path, &mount, strip_components)
+            else {
+                continue;
+            };
+
+            if !ignore_whiteouts {
+                let (parent_dir, base) = split_parent_base(&guest_path);
+                if base == ".wh..wh..opq" {
+                    whiteouts.push(TarWhiteout::Opaque(parent_dir.to_string()));
+                    continue;
+                }
+                if let Some(target_name) = base.strip_prefix(".wh.") {
+                    if !target_name.is_empty() {
+                        let target_path = if parent_dir == "/" {
+                            format!("/{}", target_name)
+                        } else {
+                            format!("{}/{}", parent_dir, target_name)
+                        };
+                        whiteouts.push(TarWhiteout::Remove(target_path));
+                    }
+                    continue;
+                }
+            }
+
+            match typeflag {
+                b'5' => {
+                    symlinks.remove(&guest_path);
+                    files.remove(&guest_path);
+                    dirs.insert(guest_path, if mode != 0 { mode & 0o7777 } else { 0o755 });
+                }
+                b'2' => {
+                    files.remove(&guest_path);
+                    dirs.remove(&guest_path);
+                    symlinks.insert(guest_path, link_target);
+                }
+                b'1' => {
+                    let Some(target_guest) =
+                        resolve_tar_entry_path(&link_target, &mount, strip_components)
+                    else {
+                        continue;
+                    };
+                    if let Some((existing_bytes, existing_mode)) = files.get(&target_guest).cloned()
+                    {
+                        symlinks.remove(&guest_path);
+                        dirs.remove(&guest_path);
+                        let m = if mode != 0 {
+                            mode & 0o7777
+                        } else if existing_mode != 0 {
+                            existing_mode
+                        } else {
+                            0o644
+                        };
+                        files.insert(guest_path, (existing_bytes, m));
+                    } else if let Some(target_bytes) = self.vfs_read_file(&target_guest) {
+                        symlinks.remove(&guest_path);
+                        dirs.remove(&guest_path);
+                        let m = if mode != 0 { mode & 0o7777 } else { 0o644 };
+                        files.insert(guest_path, (target_bytes, m));
+                    } else {
+                        files.remove(&guest_path);
+                        dirs.remove(&guest_path);
+                        symlinks.insert(guest_path, target_guest);
+                    }
+                }
+                b'0' | 0 => {
+                    let file_mode = if mode != 0 { mode & 0o7777 } else { 0o644 };
+                    symlinks.remove(&guest_path);
+                    dirs.remove(&guest_path);
+                    files.insert(guest_path, (payload.to_vec(), file_mode));
+                }
+                _ => {}
+            }
+        }
+
+        let mut applied = 0usize;
+
+        // 1. Apply whiteouts before this layer's entries.
+        for wh in whiteouts {
+            match wh {
+                TarWhiteout::Opaque(dir) => {
+                    if dir == "/" {
+                        let non_root: Vec<String> = self
+                            .overlay
+                            .keys()
+                            .filter(|k| k.as_str() != "/")
+                            .cloned()
+                            .collect();
+                        for k in non_root {
+                            self.overlay.remove(&k);
+                        }
+                    } else {
+                        self.vfs_remove_path(&dir);
+                        self.vfs_add_dir(&dir, 0o755);
+                    }
+                    applied += 1;
+                }
+                TarWhiteout::Remove(path) => {
+                    self.vfs_remove_path(&path);
+                    applied += 1;
+                }
+            }
+        }
+
+        // 2. Apply directories sorted by depth ascending.
+        let mut sorted_dirs: Vec<(String, u32)> = dirs.into_iter().collect();
+        sorted_dirs.sort_by(|a, b| {
+            let da = a.0.matches('/').count();
+            let db = b.0.matches('/').count();
+            da.cmp(&db).then_with(|| a.0.cmp(&b.0))
+        });
+        for (path, mode) in sorted_dirs {
+            self.vfs_add_dir(&path, mode);
+            applied += 1;
+        }
+
+        // 3. Apply symlinks sorted by depth ascending.
+        let mut sorted_symlinks: Vec<(String, String)> = symlinks.into_iter().collect();
+        sorted_symlinks.sort_by(|a, b| {
+            let da = a.0.matches('/').count();
+            let db = b.0.matches('/').count();
+            da.cmp(&db).then_with(|| a.0.cmp(&b.0))
+        });
+        for (path, target) in sorted_symlinks {
+            self.vfs_add_symlink(&path, &target);
+            applied += 1;
+        }
+
+        // 4. Apply regular files.
+        for (path, (bytes, mode)) in files {
+            self.vfs_write_file(&path, &bytes, mode);
+            applied += 1;
+        }
+
+        Ok(applied)
     }
 
     /// Earliest scheduled delivery timestamp among all pipes with an open reader.
@@ -3673,4 +4278,463 @@ mod tests {
         assert!(fd2 >= 3, "expected valid fd, got {}", fd2);
         assert_eq!(vfs.get_fd(fd2 as i32).unwrap().so_base_addr, Some(0x0300_0000));
     }
+
+    fn verify_tar_headers(tar: &[u8]) {
+        assert_eq!(tar.len() % 512, 0, "tar must be 512-byte aligned");
+        assert!(tar.len() >= 1024, "tar must include 1024-byte trailer");
+        assert!(
+            tar[tar.len() - 1024..].iter().all(|&b| b == 0),
+            "tar must end with 1024 zero bytes"
+        );
+        let mut off = 0;
+        while off + 512 <= tar.len() {
+            let hdr = &tar[off..off + 512];
+            if hdr.iter().all(|&b| b == 0) {
+                off += 512;
+                continue;
+            }
+            assert_eq!(&hdr[257..263], b"ustar\0");
+            assert_eq!(&hdr[263..265], b"00");
+            let stored_cksum = parse_tar_num(&hdr[148..156]).unwrap() as u32;
+            let mut calc: u32 = 0;
+            for (i, &b) in hdr.iter().enumerate() {
+                calc += if (148..156).contains(&i) {
+                    b' ' as u32
+                } else {
+                    b as u32
+                };
+            }
+            assert_eq!(stored_cksum, calc, "tar header checksum mismatch at offset {}", off);
+            let size = parse_tar_num(&hdr[124..136]).unwrap() as usize;
+            off += 512 + size.div_ceil(512) * 512;
+        }
+    }
+
+    #[test]
+    fn test_vfs_diff_and_export_tar_basic() {
+        let mut vfs = VirtualFs::new_in_memory(&[]);
+        vfs.vfs_write_file("/workspace/keep.txt", b"unchanged", 0o644);
+        vfs.vfs_write_file("/workspace/mod.txt", b"v1", 0o644);
+        vfs.vfs_write_file("/workspace/chmod_me.txt", b"same-data", 0o644);
+        vfs.vfs_write_file("/workspace/delete_me.txt", b"bye", 0o644);
+
+        let snap = vfs.snapshot_vfs();
+        assert!(vfs.has_snapshot(snap));
+        assert!(!vfs.has_snapshot(0));
+        assert!(!vfs.has_snapshot(snap + 99));
+
+        // Mutate: modify file, chmod file, add dir + file + symlink, delete file.
+        vfs.vfs_write_file("/workspace/mod.txt", b"v2-updated", 0o644);
+        assert_eq!(vfs.chmod_at(AT_FDCWD, "/workspace/chmod_me.txt", 0o755), 0);
+        vfs.vfs_add_dir("/workspace/sub", 0o750);
+        vfs.vfs_write_file("/workspace/sub/new.txt", b"hello", 0o600);
+        vfs.vfs_add_symlink("/workspace/link.txt", "sub/new.txt");
+        assert!(vfs.vfs_remove_path("/workspace/delete_me.txt"));
+
+        let diff = vfs.list_diff(Some(snap), None);
+        assert!(!diff.iter().any(|e| e.path == "/workspace/keep.txt"));
+        assert_eq!(
+            diff.iter().find(|e| e.path == "/workspace/mod.txt"),
+            Some(&VfsDiffEntry {
+                path: "/workspace/mod.txt".to_string(),
+                kind: VfsDiffKind::File,
+                size: 10,
+            })
+        );
+        assert_eq!(
+            diff.iter().find(|e| e.path == "/workspace/chmod_me.txt"),
+            Some(&VfsDiffEntry {
+                path: "/workspace/chmod_me.txt".to_string(),
+                kind: VfsDiffKind::File,
+                size: 9,
+            })
+        );
+        assert_eq!(
+            diff.iter().find(|e| e.path == "/workspace/sub"),
+            Some(&VfsDiffEntry {
+                path: "/workspace/sub".to_string(),
+                kind: VfsDiffKind::Dir,
+                size: 0,
+            })
+        );
+        assert_eq!(
+            diff.iter().find(|e| e.path == "/workspace/link.txt"),
+            Some(&VfsDiffEntry {
+                path: "/workspace/link.txt".to_string(),
+                kind: VfsDiffKind::Symlink,
+                size: "sub/new.txt".len() as u64,
+            })
+        );
+        assert_eq!(
+            diff.iter().find(|e| e.path == "/workspace/delete_me.txt"),
+            Some(&VfsDiffEntry {
+                path: "/workspace/delete_me.txt".to_string(),
+                kind: VfsDiffKind::Deleted,
+                size: 0,
+            })
+        );
+
+        let tar = vfs.export_tar(Some(snap), None);
+        verify_tar_headers(&tar);
+
+        // Round-trip: restore base snapshot and extract exported diff tar.
+        assert_eq!(vfs.restore_vfs(snap), 0);
+        assert!(vfs.vfs_read_file("/workspace/delete_me.txt").is_some());
+        assert_eq!(vfs.vfs_read_file("/workspace/mod.txt").unwrap(), b"v1");
+
+        let count = vfs.extract_tar(&tar, "/", 0, false).unwrap();
+        assert!(count >= 6);
+        assert_eq!(vfs.vfs_read_file("/workspace/keep.txt").unwrap(), b"unchanged");
+        assert_eq!(vfs.vfs_read_file("/workspace/mod.txt").unwrap(), b"v2-updated");
+        assert_eq!(vfs.vfs_read_file("/workspace/sub/new.txt").unwrap(), b"hello");
+        assert_eq!(
+            vfs.readlink(AT_FDCWD, "/workspace/link.txt").unwrap(),
+            b"sub/new.txt"
+        );
+        assert!(vfs.vfs_read_file("/workspace/delete_me.txt").is_none());
+        let st = vfs.stat_path(AT_FDCWD, "/workspace/chmod_me.txt", 0).unwrap();
+        assert_eq!(st.st_mode & 0o777, 0o755);
+    }
+
+    #[test]
+    fn test_vfs_diff_deleted_dir_prunes_descendants_and_hyphen_sibling() {
+        let mut vfs = VirtualFs::new_in_memory(&[]);
+        vfs.vfs_write_file("/tmp/dir/a.txt", b"a", 0o644);
+        vfs.vfs_write_file("/tmp/dir/sub/b.txt", b"b", 0o644);
+        vfs.vfs_write_file("/tmp/dir-other/keep.txt", b"k", 0o644);
+
+        let snap = vfs.snapshot_vfs();
+        assert!(vfs.vfs_remove_path("/tmp/dir"));
+        assert!(vfs.vfs_remove_path("/tmp/dir-other/keep.txt"));
+
+        let diff = vfs.list_diff(Some(snap), None);
+        let paths: Vec<&str> = diff.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"/tmp/dir"));
+        assert!(!paths.contains(&"/tmp/dir/a.txt"));
+        assert!(!paths.contains(&"/tmp/dir/sub/b.txt"));
+        assert!(paths.contains(&"/tmp/dir-other/keep.txt"));
+
+        let tar = vfs.export_tar(Some(snap), None);
+        verify_tar_headers(&tar);
+        assert_eq!(vfs.restore_vfs(snap), 0);
+        vfs.extract_tar(&tar, "/", 0, false).unwrap();
+        assert!(vfs.vfs_read_file("/tmp/dir/a.txt").is_none());
+        assert!(vfs.vfs_read_file("/tmp/dir/sub/b.txt").is_none());
+        assert!(vfs.vfs_read_file("/tmp/dir-other/keep.txt").is_none());
+    }
+
+    #[test]
+    fn test_vfs_diff_path_prefix_filtering() {
+        let mut vfs = VirtualFs::new_in_memory(&[]);
+        let snap = vfs.snapshot_vfs();
+        vfs.vfs_write_file("/workspace/a.txt", b"a", 0o644);
+        vfs.vfs_write_file("/workspace-extra/b.txt", b"b", 0o644);
+        vfs.vfs_write_file("/tmp/c.txt", b"c", 0o644);
+
+        let diff = vfs.list_diff(Some(snap), Some("/workspace"));
+        assert!(diff.iter().any(|e| e.path == "/workspace/a.txt"));
+        assert!(!diff.iter().any(|e| e.path.starts_with("/workspace-extra")));
+        assert!(!diff.iter().any(|e| e.path.starts_with("/tmp")));
+    }
+
+    #[test]
+    fn test_vfs_export_tar_pax_long_paths_and_symlinks() {
+        let mut vfs = VirtualFs::new_in_memory(&[]);
+        let long_path = format!(
+            "/workspace/{}/deep_file.txt",
+            "a_very_long_directory_segment_1234567890".repeat(4)
+        );
+        let long_target = format!(
+            "../{}/target.txt",
+            "long_symlink_target_component_0987654321".repeat(4)
+        );
+        assert!(long_path.len() > 120);
+        assert!(long_target.len() > 120);
+
+        vfs.vfs_write_file(&long_path, b"pax-content", 0o644);
+        vfs.vfs_add_symlink("/workspace/long_link", &long_target);
+
+        let tar = vfs.export_tar(None, Some("/workspace"));
+        verify_tar_headers(&tar);
+
+        // Verify round-trip preserves exact > 120-byte path and symlink target.
+        let mut vfs2 = VirtualFs::new_in_memory(&[]);
+        vfs2.extract_tar(&tar, "/", 0, false).unwrap();
+        assert_eq!(vfs2.vfs_read_file(&long_path).unwrap(), b"pax-content");
+        assert_eq!(
+            vfs2.readlink(AT_FDCWD, "/workspace/long_link").unwrap(),
+            long_target.as_bytes()
+        );
+    }
+
+    #[test]
+    fn test_vfs_diff_dir_replaced_by_file_and_json_escaping() {
+        let mut vfs = VirtualFs::new_in_memory(&[]);
+        vfs.vfs_write_file("/tmp/x/child.txt", b"old", 0o644);
+        let snap = vfs.snapshot_vfs();
+
+        // Replace directory /tmp/x with a regular file /tmp/x.
+        assert!(vfs.vfs_remove_path("/tmp/x"));
+        vfs.vfs_write_file("/tmp/x", b"now-a-file", 0o644);
+
+        let diff = vfs.list_diff(Some(snap), None);
+        // /tmp/x is reported as File; /tmp/x/child.txt is pruned because /tmp/x was replaced.
+        assert_eq!(
+            diff,
+            vec![VfsDiffEntry {
+                path: "/tmp/x".to_string(),
+                kind: VfsDiffKind::File,
+                size: 10,
+            }]
+        );
+
+        let tar = vfs.export_tar(Some(snap), None);
+        verify_tar_headers(&tar);
+        assert_eq!(vfs.restore_vfs(snap), 0);
+        vfs.extract_tar(&tar, "/", 0, false).unwrap();
+        assert_eq!(vfs.vfs_read_file("/tmp/x").unwrap(), b"now-a-file");
+        assert!(vfs.vfs_read_file("/tmp/x/child.txt").is_none());
+
+        // JSON escaping check.
+        let json_bytes = encode_vfs_diff_json(&[VfsDiffEntry {
+            path: "/tmp/a\"b\\c\n\t\x01".to_string(),
+            kind: VfsDiffKind::File,
+            size: 42,
+        }]);
+        let json = String::from_utf8(json_bytes).unwrap();
+        assert_eq!(
+            json,
+            r#"[{"path":"/tmp/a\"b\\c\n\t\u0001","kind":"file","size":42}]"#
+        );
+    }
+
+    #[test]
+    fn test_vfs_export_tar_empty_diff_and_full_export() {
+        let mut vfs = VirtualFs::new_in_memory(&[]);
+        vfs.vfs_write_file("/workspace/one.txt", b"1", 0o644);
+        let snap = vfs.snapshot_vfs();
+
+        assert!(vfs.list_diff(Some(snap), None).is_empty());
+        let empty_tar = vfs.export_tar(Some(snap), None);
+        assert_eq!(empty_tar.len(), 1024);
+        assert!(empty_tar.iter().all(|&b| b == 0));
+
+        let full = vfs.list_diff(None, None);
+        assert!(!full.iter().any(|e| e.path == "/"));
+        assert!(full.iter().any(|e| e.path == "/workspace/one.txt"));
+    }
 }
+
+fn utf8_truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn push_pax_record(out: &mut Vec<u8>, key: &str, value: &str) {
+    // Format: "<len> <key>=<value>\n" where <len> includes itself.
+    let tail_len = 1 + key.len() + 1 + value.len() + 1;
+    let mut digits = 1usize;
+    loop {
+        let total = digits + tail_len;
+        let actual_digits = total.to_string().len();
+        if actual_digits == digits {
+            out.extend_from_slice(total.to_string().as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(key.as_bytes());
+            out.push(b'=');
+            out.extend_from_slice(value.as_bytes());
+            out.push(b'\n');
+            break;
+        }
+        digits = actual_digits;
+    }
+}
+
+fn write_ustar_header(
+    out: &mut Vec<u8>,
+    name: &str,
+    typeflag: u8,
+    mode: u32,
+    size: u64,
+    mtime_sec: u64,
+    linkname: &str,
+) {
+    let mut hdr = [0u8; 512];
+    let name_bytes = utf8_truncate(name, 100).as_bytes();
+    hdr[..name_bytes.len()].copy_from_slice(name_bytes);
+
+    let mode_str = format!("{:07o}\0", mode & 0o7777);
+    hdr[100..108].copy_from_slice(mode_str.as_bytes());
+    hdr[108..116].copy_from_slice(b"0000000\0");
+    hdr[116..124].copy_from_slice(b"0000000\0");
+
+    let size_str = format!("{:011o}\0", size.min(0o77777777777));
+    hdr[124..136].copy_from_slice(size_str.as_bytes());
+
+    let mtime_str = format!("{:011o}\0", mtime_sec.min(0o77777777777));
+    hdr[136..148].copy_from_slice(mtime_str.as_bytes());
+
+    hdr[148..156].fill(b' ');
+    hdr[156] = typeflag;
+
+    let link_bytes = utf8_truncate(linkname, 100).as_bytes();
+    hdr[157..157 + link_bytes.len()].copy_from_slice(link_bytes);
+
+    hdr[257..263].copy_from_slice(b"ustar\0");
+    hdr[263..265].copy_from_slice(b"00");
+    hdr[265..269].copy_from_slice(b"root");
+    hdr[297..301].copy_from_slice(b"root");
+    hdr[329..337].copy_from_slice(b"0000000\0");
+    hdr[337..345].copy_from_slice(b"0000000\0");
+
+    let sum: u32 = hdr.iter().map(|&b| b as u32).sum();
+    let cksum_str = format!("{:06o}\0 ", sum);
+    hdr[148..156].copy_from_slice(cksum_str.as_bytes());
+
+    out.extend_from_slice(&hdr);
+}
+
+fn write_tar_entry(
+    out: &mut Vec<u8>,
+    tar_path: &str,
+    typeflag: u8,
+    mode: u32,
+    mtime_sec: u64,
+    linkname: &str,
+    data: &[u8],
+) {
+    let size = data.len() as u64;
+    let needs_pax = tar_path.len() > 100 || linkname.len() > 100 || size >= 0o100000000000;
+    if needs_pax {
+        let mut pax = Vec::new();
+        if tar_path.len() > 100 {
+            push_pax_record(&mut pax, "path", tar_path);
+        }
+        if linkname.len() > 100 {
+            push_pax_record(&mut pax, "linkpath", linkname);
+        }
+        if size >= 0o100000000000 {
+            push_pax_record(&mut pax, "size", &size.to_string());
+        }
+        let base = tar_path.rsplit('/').find(|s| !s.is_empty()).unwrap_or("entry");
+        let pax_name = format!("PaxHeaders.0/{}", utf8_truncate(base, 87));
+        write_ustar_header(out, &pax_name, b'x', 0o644, pax.len() as u64, 0, "");
+        out.extend_from_slice(&pax);
+        let pad = (512 - (pax.len() % 512)) % 512;
+        out.resize(out.len() + pad, 0);
+    }
+
+    write_ustar_header(out, tar_path, typeflag, mode, size, mtime_sec, linkname);
+    if !data.is_empty() {
+        out.extend_from_slice(data);
+        let pad = (512 - (data.len() % 512)) % 512;
+        out.resize(out.len() + pad, 0);
+    }
+}
+
+fn read_tar_str(field: &[u8]) -> String {
+    let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+    String::from_utf8_lossy(&field[..end]).into_owned()
+}
+
+fn parse_tar_num(field: &[u8]) -> Option<u64> {
+    if field.is_empty() {
+        return Some(0);
+    }
+    if (field[0] & 0x80) != 0 {
+        // GNU base-256 (big-endian, high bit set on first byte).
+        let mut val: u64 = (field[0] & 0x7f) as u64;
+        for &b in &field[1..] {
+            val = val.checked_shl(8)?.checked_add(b as u64)?;
+        }
+        return Some(val);
+    }
+    let s = read_tar_str(field);
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Some(0);
+    }
+    u64::from_str_radix(trimmed, 8).ok()
+}
+
+fn parse_pax_records(data: &[u8]) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let Some(sp_rel) = data[pos..].iter().position(|&b| b == b' ') else {
+            break;
+        };
+        let len_str = String::from_utf8_lossy(&data[pos..pos + sp_rel]);
+        let Ok(rec_len) = len_str.trim().parse::<usize>() else {
+            break;
+        };
+        if rec_len == 0 || pos + rec_len > data.len() {
+            break;
+        }
+        let rec_body = &data[pos + sp_rel + 1..pos + rec_len];
+        let rec_body = rec_body.strip_suffix(b"\n").unwrap_or(rec_body);
+        if let Some(eq_idx) = rec_body.iter().position(|&b| b == b'=') {
+            let key = String::from_utf8_lossy(&rec_body[..eq_idx]).into_owned();
+            let val = String::from_utf8_lossy(&rec_body[eq_idx + 1..]).into_owned();
+            map.insert(key, val);
+        }
+        pos += rec_len;
+    }
+    map
+}
+
+fn resolve_tar_entry_path(
+    raw_path: &str,
+    mount_path: &str,
+    strip_components: usize,
+) -> Option<String> {
+    let cleaned = raw_path.trim_end_matches('/');
+    if cleaned.is_empty() || cleaned == "." {
+        return None;
+    }
+    let parts: Vec<&str> = cleaned
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    if parts.len() <= strip_components {
+        return None;
+    }
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in &parts[strip_components..] {
+        if *seg == ".." {
+            if stack.pop().is_none() && mount_path != "/" {
+                return None;
+            }
+        } else {
+            stack.push(seg);
+        }
+    }
+    if stack.is_empty() {
+        return None;
+    }
+    let rel = stack.join("/");
+    if mount_path == "/" {
+        Some(format!("/{}", rel))
+    } else {
+        Some(format!("{}/{}", mount_path.trim_end_matches('/'), rel))
+    }
+}
+
+fn split_parent_base(norm_path: &str) -> (&str, &str) {
+    let trimmed = norm_path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return ("/", "");
+    }
+    match trimmed.rfind('/') {
+        Some(0) => ("/", &trimmed[1..]),
+        Some(idx) => (&trimmed[..idx], &trimmed[idx + 1..]),
+        None => ("/", trimmed),
+    }
+}
+
