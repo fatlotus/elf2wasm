@@ -15,11 +15,125 @@ import {
   decompressLayer,
 } from "./oci_client.mjs";
 import { fetchGitArchive } from "./git_client.mjs";
+import { expandSweepValues } from "../web/dockerfile.mjs";
 
 export { parseImageRef, fetchGitArchive, getGoDefaultEnv, isGoImageRef, isGoContainer, mergeEnv };
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: false });
+
+/**
+ * Gzip-compress bytes using Web CompressionStream with Node `node:zlib` fallback.
+ *
+ * @param {string|Uint8Array|ArrayBuffer|ArrayBufferView} input
+ * @returns {Promise<Uint8Array>}
+ */
+export async function gzipBytes(input) {
+  const bytes = toUint8Array(input);
+  if (typeof CompressionStream === "function") {
+    const cs = new CompressionStream("gzip");
+    const writer = cs.writable.getWriter();
+    const writePromise = writer.write(bytes).then(() => writer.close());
+    const reader = cs.readable.getReader();
+    const chunks = [];
+    let total = 0;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.byteLength;
+    }
+    await writePromise;
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+      out.set(c, offset);
+      offset += c.byteLength;
+    }
+    return out;
+  }
+  const { gzipSync } = await import("node:zlib");
+  return new Uint8Array(gzipSync(bytes));
+}
+
+/**
+ * Gunzip bytes using Web DecompressionStream with Node `node:zlib` fallback.
+ * Passes through uncompressed inputs unchanged when gzip magic (`0x1f 0x8b`) is absent.
+ *
+ * @param {string|Uint8Array|ArrayBuffer|ArrayBufferView} input
+ * @returns {Promise<Uint8Array>}
+ */
+export async function gunzipBytes(input) {
+  const bytes = toUint8Array(input);
+  if (bytes.length < 2 || bytes[0] !== 0x1f || bytes[1] !== 0x8b) {
+    return bytes;
+  }
+  if (typeof DecompressionStream === "function") {
+    const ds = new DecompressionStream("gzip");
+    const writer = ds.writable.getWriter();
+    const writePromise = writer.write(bytes).then(() => writer.close());
+    const reader = ds.readable.getReader();
+    const chunks = [];
+    let total = 0;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.byteLength;
+    }
+    await writePromise;
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+      out.set(c, offset);
+      offset += c.byteLength;
+    }
+    return out;
+  }
+  const { gunzipSync } = await import("node:zlib");
+  return new Uint8Array(gunzipSync(bytes));
+}
+
+/**
+ * Encode a Uint8Array to base64 (Node Buffer fast path; browser chunked loop).
+ *
+ * @param {Uint8Array|ArrayBuffer|ArrayBufferView} bytes
+ * @returns {string}
+ */
+export function uint8ArrayToBase64(bytes) {
+  const u8 = toUint8Array(bytes);
+  if (u8.byteLength === 0) return "";
+  if (typeof Buffer !== "undefined" && typeof Buffer.from === "function") {
+    return Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength).toString("base64");
+  }
+  const CHUNK_SIZE = 0x8000;
+  let binary = "";
+  for (let i = 0; i < u8.length; i += CHUNK_SIZE) {
+    const slice = u8.subarray(i, Math.min(i + CHUNK_SIZE, u8.length));
+    binary += String.fromCharCode.apply(null, slice);
+  }
+  return btoa(binary);
+}
+
+/**
+ * Decode a base64 string to a Uint8Array (Node Buffer fast path; browser atob fallback).
+ *
+ * @param {string} b64
+ * @returns {Uint8Array}
+ */
+export function base64ToUint8Array(b64) {
+  if (typeof b64 !== "string" || !b64.trim()) return new Uint8Array(0);
+  if (typeof Buffer !== "undefined" && typeof Buffer.from === "function") {
+    const buf = Buffer.from(b64, "base64");
+    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  }
+  const binary = atob(b64);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    out[i] = binary.charCodeAt(i);
+  }
+  return out;
+}
 
 function toUint8Array(input) {
   if (typeof input === "string") return textEncoder.encode(input);
@@ -837,6 +951,75 @@ export class ContainerEngine {
     rec.sys.dropVfsSnapshot(snapshotId);
   }
 
+  exportVfsDiffTar(containerId, { baseSnapshotId, pathPrefix } = {}) {
+    const rec = this._getContainer(containerId);
+    if (rec.stopped) throw new Error(`Container ${containerId} has been stopped`);
+    if (rec.busy) {
+      throw new Error(`Cannot export VFS diff on container ${containerId} while an execution is active`);
+    }
+    return rec.sys.exportVfsDiffTar({ baseSnapshotId, pathPrefix });
+  }
+
+  listVfsDiff(containerId, { baseSnapshotId, pathPrefix } = {}) {
+    const rec = this._getContainer(containerId);
+    if (rec.stopped) throw new Error(`Container ${containerId} has been stopped`);
+    if (rec.busy) {
+      throw new Error(`Cannot list VFS diff on container ${containerId} while an execution is active`);
+    }
+    return rec.sys.listVfsDiff({ baseSnapshotId, pathPrefix });
+  }
+
+  async applyTarOverlay(
+    containerId,
+    tarBytes,
+    { mountPath = "/", stripComponents = 0, ignoreWhiteouts = false } = {}
+  ) {
+    const rec = this._getContainer(containerId);
+    if (rec.stopped) throw new Error(`Container ${containerId} has been stopped`);
+    if (rec.busy) {
+      throw new Error(`Cannot apply tar overlay on container ${containerId} while an execution is active`);
+    }
+    const rawTar = await gunzipBytes(toUint8Array(tarBytes));
+    extractTarToVfs(rec.sys, rawTar, {
+      mountPath: normalizeMountPath(mountPath, "/"),
+      stripComponents,
+      ignoreWhiteouts,
+    });
+  }
+
+  async mountGitRepo(
+    containerId,
+    { repo, ref, mountPath, stripComponents, gitProxyBase, onProgress, signal } = {}
+  ) {
+    const rec = this._getContainer(containerId);
+    if (rec.stopped) throw new Error(`Container ${containerId} has been stopped`);
+    if (rec.busy) {
+      throw new Error(`Cannot mount git repo on container ${containerId} while an execution is active`);
+    }
+    if (signal?.aborted) throw makeAbortError();
+    const resolvedMount = normalizeMountPath(mountPath, "/workspace");
+    const archive = await fetchGitArchive({
+      repo,
+      ref,
+      gitProxyBase: gitProxyBase ?? this.gitProxyBase,
+      onProgress,
+      signal,
+    });
+    if (signal?.aborted || rec.stopped) throw makeAbortError();
+    const strip = stripComponents !== undefined ? stripComponents : archive.stripComponents;
+    extractTarToVfs(rec.sys, archive.tarBytes, {
+      mountPath: resolvedMount,
+      stripComponents: strip,
+      ignoreWhiteouts: true,
+    });
+    archive.tarBytes = null;
+    return { repo: archive.repo, ref: archive.ref, mountPath: resolvedMount };
+  }
+
+  async runLayerPipeline(layers, options = {}) {
+    return await executeLayerPipeline(layers, options, this);
+  }
+
   async execContainer(containerId, options = {}) {
     const rec = this._getContainer(containerId);
     if (rec.stopped || this.disposed) {
@@ -1112,6 +1295,26 @@ class DirectBackend {
     this.engine.dropVfsSnapshot(containerId, snapshotId);
   }
 
+  async exportVfsDiffTar(containerId, options = {}) {
+    return this.engine.exportVfsDiffTar(containerId, options);
+  }
+
+  async listVfsDiff(containerId, options = {}) {
+    return this.engine.listVfsDiff(containerId, options);
+  }
+
+  async applyTarOverlay(containerId, tarBytes, options = {}) {
+    await this.engine.applyTarOverlay(containerId, tarBytes, options);
+  }
+
+  async mountGitRepo(containerId, options = {}) {
+    return await this.engine.mountGitRepo(containerId, options);
+  }
+
+  async runLayerPipeline(layers, options = {}) {
+    return await this.engine.runLayerPipeline(layers, options);
+  }
+
   async execContainer(containerId, options = {}) {
     return await this.engine.execContainer(containerId, options);
   }
@@ -1141,6 +1344,7 @@ class WorkerBackend {
     this.pending = new Map();
     this.progressListeners = new Map();
     this.execHandlers = new Map();
+    this.pipelineHandlers = new Map();
     this.containerHandlers = new Map();
     this._dead = false;
     this._deadError = null;
@@ -1155,6 +1359,23 @@ class WorkerBackend {
           this.progressListeners.get(msg.reqId) ||
           (msg.containerId ? this.containerHandlers.get(msg.containerId)?.onProgress : null);
         if (cb) cb(msg.data);
+        return;
+      }
+
+      if (msg.event === "pipelineEvent") {
+        const h = this.pipelineHandlers.get(msg.reqId);
+        if (!h) return;
+        if (msg.kind === "layerStart" && h.onLayerStart) h.onLayerStart(msg.data);
+        else if (msg.kind === "layerOutput" && h.onLayerOutput) {
+          const data = msg.data?.chunk
+            ? { ...msg.data, chunk: new Uint8Array(msg.data.chunk) }
+            : msg.data;
+          h.onLayerOutput(data);
+        } else if (msg.kind === "layerComplete" && h.onLayerComplete) h.onLayerComplete(msg.data);
+        else if (msg.kind === "variationStart" && h.onVariationStart) h.onVariationStart(msg.data);
+        else if (msg.kind === "variationComplete" && h.onVariationComplete) {
+          h.onVariationComplete(msg.data);
+        }
         return;
       }
 
@@ -1194,6 +1415,7 @@ class WorkerBackend {
         this.pending.delete(msg.id);
         this.progressListeners.delete(msg.id);
         this.execHandlers.delete(msg.id);
+        this.pipelineHandlers.delete(msg.id);
         if (msg.ok) {
           p.resolve(msg.result);
         } else {
@@ -1227,6 +1449,7 @@ class WorkerBackend {
       this.pending.clear();
       this.progressListeners.clear();
       this.execHandlers.clear();
+      this.pipelineHandlers.clear();
       for (const [, handlers] of this.containerHandlers) {
         if (handlers && typeof handlers.onExit === "function") {
           try {
@@ -1260,7 +1483,11 @@ class WorkerBackend {
     return () => this._crashListeners.delete(cb);
   }
 
-  _call(type, payload = {}, { onProgress, onStdout, onStderr, signal, transfer = [] } = {}) {
+  _call(
+    type,
+    payload = {},
+    { onProgress, onStdout, onStderr, pipelineHandlers, signal, transfer = [] } = {}
+  ) {
     if (this._dead) {
       return Promise.reject(this._deadError || new Error("Container worker is no longer alive"));
     }
@@ -1275,6 +1502,9 @@ class WorkerBackend {
       }
       if (typeof onStdout === "function" || typeof onStderr === "function") {
         this.execHandlers.set(id, { onStdout, onStderr });
+      }
+      if (pipelineHandlers) {
+        this.pipelineHandlers.set(id, pipelineHandlers);
       }
       let onAbort = null;
       if (signal) {
@@ -1301,6 +1531,7 @@ class WorkerBackend {
         this.pending.delete(id);
         this.progressListeners.delete(id);
         this.execHandlers.delete(id);
+        this.pipelineHandlers.delete(id);
         if (signal && onAbort) signal.removeEventListener("abort", onAbort);
         reject(err);
       }
@@ -1449,6 +1680,101 @@ class WorkerBackend {
     await this._call("dropVfsSnapshot", { containerId, snapshotId });
   }
 
+  async exportVfsDiffTar(containerId, options = {}) {
+    const res = await this._call("exportVfsDiffTar", {
+      containerId,
+      options: {
+        baseSnapshotId: options.baseSnapshotId,
+        pathPrefix: options.pathPrefix,
+      },
+    });
+    return res ? new Uint8Array(res) : new Uint8Array(0);
+  }
+
+  async listVfsDiff(containerId, options = {}) {
+    return await this._call("listVfsDiff", {
+      containerId,
+      options: {
+        baseSnapshotId: options.baseSnapshotId,
+        pathPrefix: options.pathPrefix,
+      },
+    });
+  }
+
+  async applyTarOverlay(containerId, tarBytes, options = {}) {
+    const copy = toUint8Array(tarBytes).slice();
+    await this._call(
+      "applyTarOverlay",
+      {
+        containerId,
+        tarBytes: copy,
+        options: {
+          mountPath: options.mountPath,
+          stripComponents: options.stripComponents,
+          ignoreWhiteouts: options.ignoreWhiteouts,
+        },
+      },
+      { transfer: [copy.buffer] }
+    );
+  }
+
+  async mountGitRepo(containerId, options = {}) {
+    return await this._call(
+      "mountGitRepo",
+      {
+        containerId,
+        options: {
+          repo: options.repo,
+          ref: options.ref,
+          mountPath: options.mountPath,
+          stripComponents: options.stripComponents,
+          gitProxyBase: options.gitProxyBase,
+        },
+      },
+      { onProgress: options.onProgress, signal: options.signal }
+    );
+  }
+
+  async runLayerPipeline(layers, options = {}) {
+    const cleanOptions = {
+      apiBase: options.apiBase,
+      executorOverride: options.executorOverride,
+      platform: options.platform,
+      registryProxyBase: options.registryProxyBase,
+      gitProxyBase: options.gitProxyBase,
+      user: options.user,
+      uid: options.uid,
+      gid: options.gid,
+      stdin: options.stdin,
+      delayStddevMs: options.delayStddevMs,
+      delaySeed: options.delaySeed,
+      timeoutMs: options.timeoutMs,
+      stopOnError: options.stopOnError,
+      stopOnSweepFailure: options.stopOnSweepFailure,
+      _hasLayerStart: typeof options.onLayerStart === "function",
+      _hasLayerOutput: typeof options.onLayerOutput === "function",
+      _hasLayerComplete: typeof options.onLayerComplete === "function",
+      _hasVariationStart: typeof options.onVariationStart === "function",
+      _hasVariationComplete: typeof options.onVariationComplete === "function",
+    };
+    const pipelineHandlers = {
+      onLayerStart: options.onLayerStart,
+      onLayerOutput: options.onLayerOutput,
+      onLayerComplete: options.onLayerComplete,
+      onVariationStart: options.onVariationStart,
+      onVariationComplete: options.onVariationComplete,
+    };
+    return await this._call(
+      "runLayerPipeline",
+      { layers, options: cleanOptions },
+      {
+        onProgress: options.onProgress,
+        pipelineHandlers,
+        signal: options.signal,
+      }
+    );
+  }
+
   async execContainer(containerId, options = {}) {
     const transfer = [];
     let stdinCopy;
@@ -1508,6 +1834,7 @@ class WorkerBackend {
     this.pending.clear();
     this.progressListeners.clear();
     this.execHandlers.clear();
+    this.pipelineHandlers.clear();
     this.containerHandlers.clear();
     this._crashListeners.clear();
   }
@@ -1626,6 +1953,22 @@ export class DockerContainer {
     await this._backend.dropVfsSnapshot(this._containerId, snapshotId);
   }
 
+  async exportVfsDiffTar(options = {}) {
+    return await this._backend.exportVfsDiffTar(this._containerId, options);
+  }
+
+  async listVfsDiff(options = {}) {
+    return await this._backend.listVfsDiff(this._containerId, options);
+  }
+
+  async applyTarOverlay(tarBytes, options = {}) {
+    await this._backend.applyTarOverlay(this._containerId, tarBytes, options);
+  }
+
+  async mountGitRepo(options = {}) {
+    return await this._backend.mountGitRepo(this._containerId, options);
+  }
+
   async exec(options = {}) {
     return await this._backend.execContainer(this._containerId, options);
   }
@@ -1739,6 +2082,10 @@ export class Elf2WasmDocker {
   async loadOciTarball(tarBytes, options = {}) {
     const meta = await this._backend.loadOciTarball(tarBytes, options);
     return new DockerImage(this._backend, meta);
+  }
+
+  async runLayerPipeline(layers, options = {}) {
+    return await this._backend.runLayerPipeline(layers, options);
   }
 
   async dispose() {
@@ -2152,3 +2499,765 @@ export async function runSweep(imageRef, options = {}) {
     }
   }
 }
+
+function resolveEffectiveExecutor(layer, executorOverride) {
+  if (executorOverride === "local" || executorOverride === "remote") {
+    return executorOverride;
+  }
+  return layer?.executor === "remote" ? "remote" : "local";
+}
+
+function pipelineNeedsLocalEngine(layers, executorOverride) {
+  if (!Array.isArray(layers)) return false;
+  for (const layer of layers) {
+    if (!layer || typeof layer !== "object") continue;
+    if (layer.type === "run" && resolveEffectiveExecutor(layer, executorOverride) === "local") {
+      return true;
+    }
+  }
+  return false;
+}
+
+function resolveEvalUrl(apiBase) {
+  if (typeof apiBase === "string" && apiBase.trim()) {
+    return `${apiBase.trim().replace(/\/+$/, "")}/api/eval`;
+  }
+  if (
+    typeof self !== "undefined" &&
+    self.location &&
+    typeof self.location.origin === "string" &&
+    self.location.origin &&
+    self.location.origin !== "null"
+  ) {
+    return `${self.location.origin.replace(/\/+$/, "")}/api/eval`;
+  }
+  return "/api/eval";
+}
+
+/**
+ * Internal multi-layer pipeline executor shared by `ContainerEngine.runLayerPipeline`
+ * and standalone `runLayerPipeline` (with zero-WASM pure-remote support when `engine` is null).
+ *
+ * @param {object[]} layers
+ * @param {object} options
+ * @param {ContainerEngine | null} engine
+ */
+async function executeLayerPipeline(layers, options = {}, engine = null) {
+  if (!Array.isArray(layers)) {
+    throw new TypeError("runLayerPipeline requires an array of layers");
+  }
+  if (options.signal?.aborted) {
+    throw makeAbortError();
+  }
+
+  const executorOverride =
+    options.executorOverride === "local" || options.executorOverride === "remote"
+      ? options.executorOverride
+      : null;
+  const stopOnError = options.stopOnError !== undefined ? Boolean(options.stopOnError) : true;
+  const stopOnSweepFailure =
+    options.stopOnSweepFailure !== undefined ? Boolean(options.stopOnSweepFailure) : false;
+  const fetchFn = typeof options.fetch === "function" ? options.fetch : globalThis.fetch;
+  const baseDelayStddevMs = options.delayStddevMs ?? 0;
+  const baseDelaySeed = options.delaySeed ?? 0;
+
+  let localContainerId = null;
+  let localImageId = null;
+  let preSweepSnapshotId = null;
+
+  const state = {
+    baseImage: "alpine:latest",
+    gitRepos: [],
+    mountedLocalGitCount: 0,
+    cwd: "",
+    env: [],
+    inputLayerDiffs: [],
+    pendingLocalDiffs: [],
+  };
+
+  const ensureLocalContainer = async () => {
+    if (localContainerId !== null) {
+      while (state.mountedLocalGitCount < state.gitRepos.length) {
+        const g = state.gitRepos[state.mountedLocalGitCount];
+        await engine.mountGitRepo(localContainerId, {
+          repo: g.repo,
+          ref: g.ref,
+          mountPath: g.mountPath,
+          gitProxyBase: options.gitProxyBase,
+          onProgress: options.onProgress,
+          signal: options.signal,
+        });
+        state.mountedLocalGitCount++;
+      }
+      while (state.pendingLocalDiffs.length > 0) {
+        const diffBytes = state.pendingLocalDiffs.shift();
+        await engine.applyTarOverlay(localContainerId, diffBytes, {
+          mountPath: "/",
+          stripComponents: 0,
+          ignoreWhiteouts: false,
+        });
+      }
+      return localContainerId;
+    }
+
+    if (!engine) {
+      throw new Error("Local execution requires an initialized ContainerEngine");
+    }
+
+    const meta = await engine.pullImage(state.baseImage, {
+      platform: options.platform ?? "linux/amd64",
+      registryProxyBase: options.registryProxyBase,
+      onProgress: options.onProgress,
+      signal: options.signal,
+    });
+    localImageId = meta.imageId;
+
+    const firstGit = state.gitRepos.length > 0 ? state.gitRepos[0] : undefined;
+    const { containerId } = await engine.createContainer(localImageId, {
+      cmd: ["/bin/sh"],
+      cwd: state.cwd || undefined,
+      env: state.env.length > 0 ? state.env : undefined,
+      tty: false,
+      stdin: "",
+      user: options.user,
+      uid: options.uid,
+      gid: options.gid,
+      gitRepo: firstGit
+        ? {
+            repo: firstGit.repo,
+            ref: firstGit.ref,
+            mountPath: firstGit.mountPath,
+            gitProxyBase: options.gitProxyBase,
+          }
+        : undefined,
+      gitProxyBase: options.gitProxyBase,
+      onProgress: options.onProgress,
+      signal: options.signal,
+    });
+    localContainerId = containerId;
+    state.mountedLocalGitCount = firstGit ? 1 : 0;
+
+    engine.releaseImage(localImageId);
+    localImageId = null;
+
+    while (state.mountedLocalGitCount < state.gitRepos.length) {
+      const g = state.gitRepos[state.mountedLocalGitCount];
+      await engine.mountGitRepo(localContainerId, {
+        repo: g.repo,
+        ref: g.ref,
+        mountPath: g.mountPath,
+        gitProxyBase: options.gitProxyBase,
+        onProgress: options.onProgress,
+        signal: options.signal,
+      });
+      state.mountedLocalGitCount++;
+    }
+
+    while (state.pendingLocalDiffs.length > 0) {
+      const diffBytes = state.pendingLocalDiffs.shift();
+      await engine.applyTarOverlay(localContainerId, diffBytes, {
+        mountPath: "/",
+        stripComponents: 0,
+        ignoreWhiteouts: false,
+      });
+    }
+
+    return localContainerId;
+  };
+
+  const executeSingleLayer = async (
+    layer,
+    layerIndex,
+    { variationIndex = null, variation = null, delayStddevMs = baseDelayStddevMs, delaySeed = baseDelaySeed } = {}
+  ) => {
+    if (options.signal?.aborted) {
+      throw makeAbortError();
+    }
+
+    const layerId = layer?.id || `layer-${layerIndex + 1}`;
+    const type = layer?.type;
+
+    if (type === "from") {
+      const exec = resolveEffectiveExecutor(layer, executorOverride);
+      if (typeof options.onLayerStart === "function") {
+        options.onLayerStart({ layerIndex, layer, executor: exec, variationIndex, variation });
+      }
+      state.baseImage = String(layer.image || "alpine:latest").trim() || "alpine:latest";
+      const res = {
+        layerIndex,
+        layerId,
+        type: "from",
+        executor: exec,
+        ok: true,
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        virtualTimeNs: 0,
+        error: null,
+        outputDiffTarGz: null,
+        modifiedFiles: [],
+        ...(variationIndex !== null ? { variationIndex } : {}),
+      };
+      if (typeof options.onLayerComplete === "function") options.onLayerComplete(res);
+      return res;
+    }
+
+    if (type === "git") {
+      const exec = resolveEffectiveExecutor(layer, executorOverride);
+      if (typeof options.onLayerStart === "function") {
+        options.onLayerStart({ layerIndex, layer, executor: exec, variationIndex, variation });
+      }
+      const gitSpec = {
+        repo: String(layer.repo || "").trim(),
+        ...(layer.ref ? { ref: String(layer.ref).trim() } : {}),
+        mountPath: normalizeMountPath(layer.mountPath, "/workspace"),
+      };
+      state.gitRepos.push(gitSpec);
+      if (localContainerId !== null && engine) {
+        await engine.mountGitRepo(localContainerId, {
+          ...gitSpec,
+          gitProxyBase: options.gitProxyBase,
+          onProgress: options.onProgress,
+          signal: options.signal,
+        });
+        state.mountedLocalGitCount = state.gitRepos.length;
+      }
+      const res = {
+        layerIndex,
+        layerId,
+        type: "git",
+        executor: exec,
+        ok: true,
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        virtualTimeNs: 0,
+        error: null,
+        outputDiffTarGz: null,
+        modifiedFiles: [],
+        ...(variationIndex !== null ? { variationIndex } : {}),
+      };
+      if (typeof options.onLayerComplete === "function") options.onLayerComplete(res);
+      return res;
+    }
+
+    if (type === "workdir") {
+      if (typeof options.onLayerStart === "function") {
+        options.onLayerStart({ layerIndex, layer, executor: null, variationIndex, variation });
+      }
+      state.cwd = String(layer.path || "").trim();
+      const res = {
+        layerIndex,
+        layerId,
+        type: "workdir",
+        executor: null,
+        ok: true,
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        virtualTimeNs: 0,
+        error: null,
+        outputDiffTarGz: null,
+        modifiedFiles: [],
+        ...(variationIndex !== null ? { variationIndex } : {}),
+      };
+      if (typeof options.onLayerComplete === "function") options.onLayerComplete(res);
+      return res;
+    }
+
+    if (type === "env") {
+      if (typeof options.onLayerStart === "function") {
+        options.onLayerStart({ layerIndex, layer, executor: null, variationIndex, variation });
+      }
+      if (layer.key) {
+        state.env = mergeEnv(state.env, [], [`${layer.key}=${layer.value ?? ""}`]);
+      }
+      const res = {
+        layerIndex,
+        layerId,
+        type: "env",
+        executor: null,
+        ok: true,
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        virtualTimeNs: 0,
+        error: null,
+        outputDiffTarGz: null,
+        modifiedFiles: [],
+        ...(variationIndex !== null ? { variationIndex } : {}),
+      };
+      if (typeof options.onLayerComplete === "function") options.onLayerComplete(res);
+      return res;
+    }
+
+    if (type === "run") {
+      const target = resolveEffectiveExecutor(layer, executorOverride);
+      if (typeof options.onLayerStart === "function") {
+        options.onLayerStart({ layerIndex, layer, executor: target, variationIndex, variation });
+      }
+
+      const cmdArgv = Array.isArray(layer.cmd)
+        ? layer.cmd.map(String)
+        : ["sh", "-c", String(layer.cmd ?? "")];
+      const effectiveCwd =
+        state.cwd || (state.gitRepos.length > 0 ? state.gitRepos[state.gitRepos.length - 1].mountPath : "");
+
+      if (target === "local") {
+        const cid = await ensureLocalContainer();
+        const beforeSnap = engine.snapshotVfs(cid);
+        let execRes;
+        let outputDiffTarGz = null;
+        let modifiedFiles = [];
+        try {
+          execRes = await engine.execContainer(cid, {
+            cmd: cmdArgv,
+            env: state.env,
+            cwd: effectiveCwd || undefined,
+            tty: false,
+            stdin: options.stdin !== undefined ? options.stdin : "",
+            delayStddevMs,
+            delaySeed,
+            timeoutMs: options.timeoutMs,
+            signal: options.signal,
+            onStdout:
+              typeof options.onLayerOutput === "function"
+                ? (chunk) =>
+                    options.onLayerOutput({
+                      layerIndex,
+                      layer,
+                      stream: "stdout",
+                      chunk,
+                      variationIndex,
+                      variation,
+                    })
+                : undefined,
+            onStderr:
+              typeof options.onLayerOutput === "function"
+                ? (chunk) =>
+                    options.onLayerOutput({
+                      layerIndex,
+                      layer,
+                      stream: "stderr",
+                      chunk,
+                      variationIndex,
+                      variation,
+                    })
+                : undefined,
+          });
+          modifiedFiles = engine.listVfsDiff(cid, { baseSnapshotId: beforeSnap });
+          const rawDiffTar = engine.exportVfsDiffTar(cid, { baseSnapshotId: beforeSnap });
+          if (rawDiffTar && rawDiffTar.byteLength > 0) {
+            outputDiffTarGz = await gzipBytes(rawDiffTar);
+            if (modifiedFiles.length > 0) {
+              state.inputLayerDiffs.push(uint8ArrayToBase64(outputDiffTarGz));
+            }
+          }
+        } finally {
+          engine.dropVfsSnapshot(cid, beforeSnap);
+        }
+
+        const ok = execRes.exitCode === 0 && !execRes.timedOut && !execRes.error;
+        const res = {
+          layerIndex,
+          layerId,
+          type: "run",
+          executor: "local",
+          ok,
+          exitCode: execRes.exitCode,
+          stdout: execRes.stdout,
+          stderr: execRes.stderr,
+          virtualTimeNs: execRes.virtualTimeNs ?? 0,
+          ...(execRes.timedOut ? { timedOut: true } : {}),
+          error: execRes.error ?? null,
+          outputDiffTarGz,
+          modifiedFiles,
+          ...(variationIndex !== null ? { variationIndex } : {}),
+        };
+        if (typeof options.onLayerComplete === "function") options.onLayerComplete(res);
+        return res;
+      }
+
+      // Remote execution via POST /api/eval
+      const evalUrl = resolveEvalUrl(options.apiBase);
+      const reqBody = {
+        baseImage: state.baseImage,
+        ...(state.gitRepos.length > 0
+          ? { gitRepo: state.gitRepos[state.gitRepos.length - 1] }
+          : {}),
+        inputLayerDiffs: state.inputLayerDiffs,
+        cmd: cmdArgv,
+        env: state.env,
+        cwd: effectiveCwd,
+        user: options.user ?? "",
+        stdin: typeof options.stdin === "string" ? options.stdin : "",
+        delayStddevMs,
+        delaySeed,
+        timeoutMs: options.timeoutMs ?? 30000,
+        returnOutputDiff: true,
+      };
+
+      let resp;
+      let data = null;
+      try {
+        resp = await fetchFn(evalUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          body: JSON.stringify(reqBody),
+          signal: options.signal,
+        });
+        const text = await resp.text();
+        try {
+          data = text ? JSON.parse(text) : null;
+        } catch {
+          data = null;
+        }
+      } catch (err) {
+        if (options.signal?.aborted || err?.name === "AbortError") {
+          throw makeAbortError();
+        }
+        const failRes = {
+          layerIndex,
+          layerId,
+          type: "run",
+          executor: "remote",
+          ok: false,
+          exitCode: 1,
+          stdout: "",
+          stderr: "",
+          virtualTimeNs: 0,
+          error: err?.message ? String(err.message) : String(err),
+          errorCode: "NETWORK_ERROR",
+          outputDiffTarGz: null,
+          modifiedFiles: [],
+          ...(variationIndex !== null ? { variationIndex } : {}),
+        };
+        if (typeof options.onLayerComplete === "function") options.onLayerComplete(failRes);
+        return failRes;
+      }
+
+      if (!resp.ok || !data || data.ok === false) {
+        const failRes = {
+          layerIndex,
+          layerId,
+          type: "run",
+          executor: data?.executor || "remote",
+          ok: false,
+          exitCode: typeof data?.exitCode === "number" ? data.exitCode : 1,
+          stdout: typeof data?.stdout === "string" ? data.stdout : "",
+          stderr: typeof data?.stderr === "string" ? data.stderr : "",
+          virtualTimeNs: data?.virtualTimeNs ?? 0,
+          ...(data?.timedOut ? { timedOut: true } : {}),
+          error: data?.error || `Remote eval failed (HTTP ${resp.status})`,
+          errorCode: data?.code || null,
+          outputDiffTarGz: null,
+          modifiedFiles: Array.isArray(data?.modifiedFiles) ? data.modifiedFiles : [],
+          ...(variationIndex !== null ? { variationIndex } : {}),
+        };
+        if (typeof options.onLayerComplete === "function") options.onLayerComplete(failRes);
+        return failRes;
+      }
+
+      const stdout = typeof data.stdout === "string" ? data.stdout : "";
+      const stderr = typeof data.stderr === "string" ? data.stderr : "";
+      if (typeof options.onLayerOutput === "function") {
+        if (stdout) {
+          options.onLayerOutput({
+            layerIndex,
+            layer,
+            stream: "stdout",
+            chunk: textEncoder.encode(stdout),
+            variationIndex,
+            variation,
+          });
+        }
+        if (stderr) {
+          options.onLayerOutput({
+            layerIndex,
+            layer,
+            stream: "stderr",
+            chunk: textEncoder.encode(stderr),
+            variationIndex,
+            variation,
+          });
+        }
+      }
+
+      let outputDiffTarGz = null;
+      if (typeof data.outputDiffTarGzBase64 === "string" && data.outputDiffTarGzBase64.length > 0) {
+        outputDiffTarGz = base64ToUint8Array(data.outputDiffTarGzBase64);
+        state.inputLayerDiffs.push(data.outputDiffTarGzBase64);
+        if (localContainerId !== null && engine) {
+          await engine.applyTarOverlay(localContainerId, outputDiffTarGz, {
+            mountPath: "/",
+            stripComponents: 0,
+            ignoreWhiteouts: false,
+          });
+        } else {
+          state.pendingLocalDiffs.push(outputDiffTarGz);
+        }
+      }
+
+      const exitCode = typeof data.exitCode === "number" ? data.exitCode : 0;
+      const timedOut = Boolean(data.timedOut);
+      const ok = exitCode === 0 && !timedOut && !data.error;
+      const res = {
+        layerIndex,
+        layerId,
+        type: "run",
+        executor: data.executor || "remote-wasmi",
+        ok,
+        exitCode,
+        stdout,
+        stderr,
+        virtualTimeNs: data.virtualTimeNs ?? 0,
+        ...(timedOut ? { timedOut: true } : {}),
+        error: data.error ?? null,
+        outputDiffTarGz,
+        modifiedFiles: Array.isArray(data.modifiedFiles) ? data.modifiedFiles : [],
+        ...(variationIndex !== null ? { variationIndex } : {}),
+      };
+      if (typeof options.onLayerComplete === "function") options.onLayerComplete(res);
+      return res;
+    }
+
+    // Unknown layer type -> no-op
+    return {
+      layerIndex,
+      layerId,
+      type: String(type || "unknown"),
+      executor: null,
+      ok: true,
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+      virtualTimeNs: 0,
+      error: null,
+      outputDiffTarGz: null,
+      modifiedFiles: [],
+      ...(variationIndex !== null ? { variationIndex } : {}),
+    };
+  };
+
+  const preSweepResults = [];
+  let sweepResult = null;
+  let overallOk = true;
+
+  try {
+    for (let i = 0; i < layers.length; i++) {
+      if (options.signal?.aborted) {
+        throw makeAbortError();
+      }
+      const layer = layers[i];
+      if (!layer || typeof layer !== "object") continue;
+
+      if (layer.type === "sweep") {
+        const variations = expandSweepValues(layer);
+        const downstreamLayers = layers.slice(i + 1);
+        const downstreamNeedsLocal = pipelineNeedsLocalEngine(downstreamLayers, executorOverride);
+
+        if ((localContainerId !== null || downstreamNeedsLocal) && engine) {
+          const cid = await ensureLocalContainer();
+          preSweepSnapshotId = engine.snapshotVfs(cid);
+        }
+
+        const frozen = {
+          baseImage: state.baseImage,
+          gitRepos: state.gitRepos.map((g) => ({ ...g })),
+          mountedLocalGitCount: state.mountedLocalGitCount,
+          cwd: state.cwd,
+          env: state.env.slice(),
+          inputLayerDiffs: state.inputLayerDiffs.slice(),
+          pendingLocalDiffs: state.pendingLocalDiffs.slice(),
+        };
+
+        const variationResults = [];
+        let passedCount = 0;
+        let failedCount = 0;
+
+        for (let vIdx = 0; vIdx < variations.length; vIdx++) {
+          if (options.signal?.aborted) {
+            throw makeAbortError();
+          }
+          const variation = variations[vIdx];
+          const variationIndex = vIdx + 1;
+
+          if (localContainerId !== null && preSweepSnapshotId !== null && engine) {
+            engine.restoreVfs(localContainerId, preSweepSnapshotId);
+          }
+
+          state.baseImage = frozen.baseImage;
+          state.gitRepos = frozen.gitRepos.map((g) => ({ ...g }));
+          state.mountedLocalGitCount = frozen.mountedLocalGitCount;
+          state.cwd = frozen.cwd;
+          state.env = frozen.env.slice();
+          state.inputLayerDiffs = frozen.inputLayerDiffs.slice();
+          state.pendingLocalDiffs = frozen.pendingLocalDiffs.slice();
+
+          let varDelayStddevMs = baseDelayStddevMs;
+          let varDelaySeed = baseDelaySeed;
+          if (variation.delayStddevMs !== undefined) {
+            varDelayStddevMs = variation.delayStddevMs;
+          }
+          if (variation.delaySeed !== undefined) {
+            varDelaySeed = variation.delaySeed;
+          }
+          if (variation.envOverride) {
+            state.env = mergeEnv(state.env, [], [
+              `${variation.envOverride[0]}=${variation.envOverride[1]}`,
+            ]);
+          }
+
+          if (typeof options.onVariationStart === "function") {
+            options.onVariationStart({
+              variationIndex,
+              totalVariations: variations.length,
+              variation,
+            });
+          }
+
+          const varLayers = [];
+          let varOk = true;
+          let varExitCode = 0;
+          let varStdout = "";
+          let varStderr = "";
+
+          for (let j = 0; j < downstreamLayers.length; j++) {
+            const dl = downstreamLayers[j];
+            const dlIndex = i + 1 + j;
+            const lr = await executeSingleLayer(dl, dlIndex, {
+              variationIndex,
+              variation,
+              delayStddevMs: varDelayStddevMs,
+              delaySeed: varDelaySeed,
+            });
+            varLayers.push(lr);
+            if (lr.stdout) varStdout += lr.stdout;
+            if (lr.stderr) varStderr += lr.stderr;
+            varExitCode = lr.exitCode;
+            if (!lr.ok) {
+              varOk = false;
+              if (stopOnError) break;
+            }
+          }
+
+          if (varOk) passedCount++;
+          else failedCount++;
+
+          const vRes = {
+            variationIndex,
+            label: variation.label,
+            variation,
+            ok: varOk,
+            layers: varLayers,
+            exitCode: varExitCode,
+            stdout: varStdout,
+            stderr: varStderr,
+          };
+          variationResults.push(vRes);
+
+          if (typeof options.onVariationComplete === "function") {
+            options.onVariationComplete(vRes);
+          }
+
+          if (!varOk && stopOnSweepFailure) {
+            break;
+          }
+        }
+
+        sweepResult = {
+          layerIndex: i,
+          layer,
+          variations: variationResults,
+          passedCount,
+          failedCount,
+        };
+        if (failedCount > 0) overallOk = false;
+        break;
+      }
+
+      const layerRes = await executeSingleLayer(layer, i);
+      preSweepResults.push(layerRes);
+      if (!layerRes.ok) {
+        overallOk = false;
+        if (stopOnError) break;
+      }
+    }
+
+    return {
+      ok: overallOk,
+      layers: preSweepResults,
+      sweep: sweepResult,
+    };
+  } finally {
+    if (engine && localContainerId !== null && preSweepSnapshotId !== null) {
+      try {
+        engine.dropVfsSnapshot(localContainerId, preSweepSnapshotId);
+      } catch {
+        // ignore cleanup error
+      }
+    }
+    if (engine && localContainerId !== null) {
+      try {
+        await engine.stopContainer(localContainerId);
+      } catch {
+        // ignore cleanup error
+      }
+    }
+    if (engine && localImageId !== null) {
+      try {
+        engine.releaseImage(localImageId);
+      } catch {
+        // ignore cleanup error
+      }
+    }
+  }
+}
+
+/**
+ * High-level multi-layer pipeline runner supporting per-layer `local` vs `remote`
+ * execution, `.tar.gz` VFS diff handoff, and generalized `sweep` fan-out.
+ *
+ * Pure-remote optimization: if no `run` layer resolves to `"local"` and no
+ * `options.docker` is provided, executes directly against `/api/eval` without
+ * initializing local WASM modules.
+ *
+ * @param {object[]} layers
+ * @param {object} [options]
+ */
+export async function runLayerPipeline(layers, options = {}) {
+  if (options.docker) {
+    return await options.docker.runLayerPipeline(layers, options);
+  }
+
+  const executorOverride =
+    options.executorOverride === "local" || options.executorOverride === "remote"
+      ? options.executorOverride
+      : null;
+
+  if (!pipelineNeedsLocalEngine(layers, executorOverride)) {
+    return await executeLayerPipeline(layers, options, null);
+  }
+
+  const docker = await Elf2WasmDocker.create({
+    compilerWasmUrl: options.compilerWasmUrl,
+    runtimeWasmUrl: options.runtimeWasmUrl,
+    registryProxyBase: options.registryProxyBase,
+    gitProxyBase: options.gitProxyBase,
+    useWorker: options.useWorker,
+    compilerWasm: options.compilerWasm,
+    runtimeWasm: options.runtimeWasm,
+    workerUrl: options.workerUrl,
+    maxCachedImages: options.maxCachedImages,
+  });
+
+  try {
+    return await docker.runLayerPipeline(layers, options);
+  } finally {
+    await docker.dispose();
+  }
+}
+

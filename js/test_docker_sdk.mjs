@@ -39,6 +39,11 @@ import {
   DockerContainer,
   runDockerImage,
   runSweep,
+  runLayerPipeline,
+  gzipBytes,
+  gunzipBytes,
+  uint8ArrayToBase64,
+  base64ToUint8Array,
   fetchGitArchive,
   getGoDefaultEnv,
   isGoImageRef,
@@ -3967,6 +3972,501 @@ test("M19 Tier 2 regression: container.exec() rejects invalid delayStddevMs/dela
     await mockReg.stop();
   }
 });
+
+// ============================================================================
+// M4: Cross-env helpers, VFS diff/overlay/git primitives, multi-layer pipeline
+//     (local, pure-remote, mixed local<->remote whiteouts), and generalized sweep
+// ============================================================================
+test("M4: gzipBytes/gunzipBytes and uint8ArrayToBase64/base64ToUint8Array round-trip", async () => {
+  const payload = new Uint8Array(70_000);
+  for (let i = 0; i < payload.length; i++) payload[i] = i & 0xff;
+
+  const gz = await gzipBytes(payload);
+  assert.equal(gz[0], 0x1f);
+  assert.equal(gz[1], 0x8b);
+  assert.ok(gz.byteLength < payload.byteLength);
+
+  const restored = await gunzipBytes(gz);
+  assert.deepEqual(restored, payload);
+
+  // Non-gzip passthrough
+  const raw = new TextEncoder().encode("not gzipped");
+  assert.deepEqual(await gunzipBytes(raw), raw);
+
+  // Base64 round-trip for >64 KiB payload & empty
+  const b64 = uint8ArrayToBase64(payload);
+  assert.deepEqual(base64ToUint8Array(b64), payload);
+  assert.equal(uint8ArrayToBase64(new Uint8Array(0)), "");
+  assert.deepEqual(base64ToUint8Array(""), new Uint8Array(0));
+});
+
+test("M4: container exportVfsDiffTar, listVfsDiff, applyTarOverlay (with whiteouts), and mountGitRepo", async () => {
+  const reg = createMockRegistry({ requireAuth: false });
+  const gitSrv = createMockGitServer();
+  gitSrv.addRepo("acme/demo", "main", [
+    { path: "hello.txt", content: "from-git-repo\n" },
+  ]);
+
+  const probeElf = buildStaticTestElf(`
+    static long sys3(long n, long a, long b, long c) {
+      long r;
+      __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c) : "rcx", "r11", "memory");
+      return r;
+    }
+    void entry_c(void) { sys3(231, 0, 0, 0); }
+    __asm__(".global _start\\n_start:\\n call entry_c\\n");
+  `);
+
+  reg.addImage("library/m4-prim", "latest", {
+    mediaTypeMode: "oci",
+    multiArch: false,
+    config: { cmd: ["/bin/probe"], workingDir: "/" },
+    layers: [
+      {
+        files: [
+          { path: "bin/probe", type: "file", content: probeElf, mode: 0o755 },
+          { path: "keep.txt", type: "file", content: "keep" },
+          { path: "drop.txt", type: "file", content: "drop-me" },
+        ],
+      },
+    ],
+  });
+
+  await reg.start();
+  await gitSrv.start();
+  const srv = createServer({
+    port: 0,
+    host: "127.0.0.1",
+    allowLocalRegistries: true,
+  });
+  await srv.start();
+
+  const docker = await Elf2WasmDocker.create({
+    compilerWasmUrl: `${srv.url}/wasm/elf2wasm_compiler_wasm.wasm`,
+    runtimeWasmUrl: `${srv.url}/wasm/elf2wasm_runtime_wasm.wasm`,
+    registryProxyBase: `${srv.url}/api/v2`,
+    gitProxyBase: `${srv.url}/api/git/archive`,
+    useWorker: false,
+  });
+
+  try {
+    const img = await docker.pullImage(`${reg.host}/library/m4-prim:latest`);
+    const c = await img.createContainer();
+    const snap = await c.snapshotVfs();
+
+    await c.writeFile("/created.txt", "hello-diff");
+    const diffList = await c.listVfsDiff({ baseSnapshotId: snap });
+    assert.ok(diffList.some((e) => e.path === "/created.txt" && e.kind === "file"));
+
+    const diffTar = await c.exportVfsDiffTar({ baseSnapshotId: snap });
+    assert.ok(diffTar instanceof Uint8Array && diffTar.byteLength >= 512);
+
+    // Apply gzipped tar overlay containing a new file and a whiteout for /drop.txt
+    const overlayTar = buildCustomTar([
+      { path: "from_overlay.txt", type: "0", content: "overlay-val" },
+      { path: ".wh.drop.txt", type: "0", content: "" },
+    ]);
+    const overlayGz = await gzipBytes(overlayTar);
+    await c.applyTarOverlay(overlayGz, { mountPath: "/" });
+
+    assert.equal(textDecoder.decode(await c.readFile("/from_overlay.txt")), "overlay-val");
+    assert.equal(await c.readFile("/drop.txt"), null, "whiteout in applyTarOverlay must delete /drop.txt");
+    assert.equal(textDecoder.decode(await c.readFile("/keep.txt")), "keep");
+
+    // mountGitRepo
+    const mounted = await c.mountGitRepo({
+      repo: `${gitSrv.url}/acme/demo`,
+      ref: "main",
+      mountPath: "/src",
+    });
+    assert.equal(mounted.mountPath, "/src");
+    assert.equal(textDecoder.decode(await c.readFile("/src/hello.txt")), "from-git-repo\n");
+
+    await c.dropVfsSnapshot(snap);
+    await c.stop();
+    await img.dispose();
+  } finally {
+    await docker.dispose();
+    await srv.stop();
+    await gitSrv.stop();
+    await reg.stop();
+  }
+});
+
+test("M4: pure-remote runLayerPipeline skips local WASM init, handles sweep, executorOverride, and remote errors", async () => {
+  const requests = [];
+  const mockFetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    requests.push({ url, body });
+
+    if (body.cmd.join(" ").includes("FAIL_REMOTE")) {
+      return new Response(
+        JSON.stringify({ ok: false, error: "Fuel exhausted", code: "FUEL_EXHAUSTED" }),
+        { status: 408, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    const diffTar = buildCustomTar([
+      { path: "workspace/step.txt", type: "0", content: `cmd=${body.cmd.join(" ")}` },
+    ]);
+    const diffGz = await gzipBytes(diffTar);
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        executor: "remote-wasmi",
+        exitCode: 0,
+        stdout: `OUT:${body.env.join(",")}|delay=${body.delayStddevMs}|seed=${body.delaySeed}|diffs=${body.inputLayerDiffs.length}\n`,
+        stderr: "",
+        virtualTimeNs: "42000",
+        timedOut: false,
+        error: null,
+        outputDiffTarGzBase64: uint8ArrayToBase64(diffGz),
+        modifiedFiles: [{ path: "/workspace/step.txt", kind: "file", size: 10 }],
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  };
+
+  // Pure-remote: invalid compilerWasmUrl MUST NOT be fetched!
+  const layers = [
+    { id: "l1", type: "from", image: "alpine:latest", executor: "remote" },
+    { id: "l2", type: "workdir", path: "/workspace" },
+    { id: "l3", type: "env", key: "BASE", value: "1" },
+    { id: "l4", type: "run", cmd: "echo build", executor: "remote" },
+    { id: "l5", type: "sweep", param: "env", envKey: "MODE", mode: "list", values: ["fast", "slow"] },
+    { id: "l6", type: "run", cmd: "echo step1", executor: "remote" },
+    { id: "l7", type: "run", cmd: "echo step2", executor: "remote" },
+  ];
+
+  const varStarts = [];
+  const res = await runLayerPipeline(layers, {
+    apiBase: "https://example.test",
+    fetch: mockFetch,
+    compilerWasmUrl: "http://127.0.0.1:1/must-not-be-fetched.wasm",
+    runtimeWasmUrl: "http://127.0.0.1:1/must-not-be-fetched.wasm",
+    onVariationStart: (ev) => varStarts.push(ev.variation.label),
+  });
+
+  assert.equal(res.ok, true);
+  assert.equal(res.layers.length, 4);
+  assert.equal(res.layers[3].executor, "remote-wasmi");
+  assert.ok(res.layers[3].outputDiffTarGz instanceof Uint8Array);
+  assert.equal(res.sweep.variations.length, 2);
+  assert.equal(res.sweep.passedCount, 2);
+  assert.equal(res.sweep.failedCount, 0);
+  assert.deepEqual(varStarts, ["MODE=fast", "MODE=slow"]);
+
+  // Each variation ran 2 downstream layers and started from the frozen 1-diff pre-sweep state
+  assert.equal(requests.length, 5); // 1 pre-sweep + 2 variations * 2 layers
+  assert.equal(requests[0].url, "https://example.test/api/eval");
+  assert.equal(requests[0].body.inputLayerDiffs.length, 0);
+  assert.equal(requests[1].body.inputLayerDiffs.length, 1);
+  assert.ok(requests[1].body.env.includes("MODE=fast"));
+  assert.equal(requests[2].body.inputLayerDiffs.length, 2);
+  assert.equal(requests[3].body.inputLayerDiffs.length, 1);
+  assert.ok(requests[3].body.env.includes("MODE=slow"));
+  assert.equal(requests[4].body.inputLayerDiffs.length, 2);
+
+  // executorOverride: "remote" forces local-tagged layers onto remote without WASM init
+  const errRes = await runLayerPipeline(
+    [
+      { id: "l1", type: "from", image: "alpine:latest", executor: "local" },
+      { id: "l2", type: "run", cmd: "FAIL_REMOTE", executor: "local" },
+      { id: "l3", type: "run", cmd: "echo skipped", executor: "local" },
+    ],
+    {
+      apiBase: "https://example.test",
+      fetch: mockFetch,
+      executorOverride: "remote",
+      stopOnError: true,
+    }
+  );
+  assert.equal(errRes.ok, false);
+  assert.equal(errRes.layers.length, 2); // stopped after l2 failed
+  assert.equal(errRes.layers[1].ok, false);
+  assert.equal(errRes.layers[1].errorCode, "FUEL_EXHAUSTED");
+});
+
+test("M4: mixed local -> remote -> local diff & whiteout handoff + local generalized sweep (env/seed/delay)", async () => {
+  const shElf = buildStaticTestElf(`
+    static long sys4(long n, long a, long b, long c, long d) {
+      long r;
+      register long r10 __asm__("r10") = d;
+      __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10) : "rcx", "r11", "memory");
+      return r;
+    }
+    static long slen(const char *s) { long n = 0; while (s && s[n]) n++; return n; }
+    static int streq(const char *a, const char *b) {
+      while (*a && *b) { if (*a++ != *b++) return 0; }
+      return *a == *b;
+    }
+    static int starts_with(const char *s, const char *p) {
+      while (*p) { if (*s++ != *p++) return 0; }
+      return 1;
+    }
+    static void w_str(const char *s) { sys4(1, 1, (long)s, slen(s), 0); }
+    static void write_file(const char *path, const char *data) {
+      long fd = sys4(257, -100, (long)path, 0x241, 0644);
+      if (fd >= 0) {
+        sys4(1, fd, (long)data, slen(data), 0);
+        sys4(3, fd, 0, 0, 0);
+      }
+    }
+    static void print_file(const char *label, const char *path) {
+      w_str(label);
+      long fd = sys4(257, -100, (long)path, 0, 0);
+      if (fd < 0) { w_str("MISSING\\n"); return; }
+      char buf[128];
+      long n = sys4(0, fd, (long)buf, sizeof(buf) - 1, 0);
+      sys4(3, fd, 0, 0, 0);
+      if (n > 0) { buf[n] = 0; w_str(buf); }
+      w_str("\\n");
+    }
+    void entry_c(long *sp) {
+      long argc = sp[0];
+      char **argv = (char **)(sp + 1);
+      char **envp = argv + argc + 1;
+      const char *cmd = argc >= 3 ? argv[2] : "";
+      const char *mode = "";
+      for (int i = 0; envp[i]; i++) {
+        if (starts_with(envp[i], "MODE=")) { mode = envp[i] + 5; break; }
+      }
+      if (streq(cmd, "write_local")) {
+        write_file("/work/local.txt", "from-local");
+        write_file("/work/to_delete.txt", "bye");
+        w_str("WROTE_LOCAL\\n");
+      } else if (streq(cmd, "check_after_remote")) {
+        print_file("LOCAL=", "/work/local.txt");
+        print_file("REMOTE=", "/work/from_remote.txt");
+        print_file("DELETED=", "/work/to_delete.txt");
+        w_str("MODE="); w_str(mode); w_str("\\n");
+      } else if (streq(cmd, "sweep_step1")) {
+        write_file("/work/ephemeral.txt", mode);
+        w_str("STEP1:"); w_str(mode); w_str("\\n");
+      } else if (streq(cmd, "sweep_step2")) {
+        print_file("STEP2_FILE=", "/work/ephemeral.txt");
+      }
+      sys4(231, 0, 0, 0, 0);
+    }
+    __asm__(".global _start\\n_start:\\n mov %rsp, %rdi\\n and $-16, %rsp\\n call entry_c\\n");
+  `);
+
+  const reg = createMockRegistry({ requireAuth: false });
+  reg.addImage("library/m4-pipe", "latest", {
+    mediaTypeMode: "oci",
+    multiArch: false,
+    config: { cmd: ["/bin/sh"], workingDir: "/work" },
+    layers: [
+      {
+        files: [
+          { path: "bin/sh", type: "file", content: shElf, mode: 0o755 },
+          { path: "work", type: "dir", mode: 0o755 },
+        ],
+      },
+    ],
+  });
+
+  await reg.start();
+  const srv = createServer({ port: 0, host: "127.0.0.1", allowLocalRegistries: true });
+  await srv.start();
+
+  const docker = await Elf2WasmDocker.create({
+    compilerWasmUrl: `${srv.url}/wasm/elf2wasm_compiler_wasm.wasm`,
+    runtimeWasmUrl: `${srv.url}/wasm/elf2wasm_runtime_wasm.wasm`,
+    registryProxyBase: `${srv.url}/api/v2`,
+    useWorker: false,
+  });
+
+  try {
+    let remoteSawInputDiffs = 0;
+    const mockFetch = async (_url, init) => {
+      const body = JSON.parse(init.body);
+      remoteSawInputDiffs = body.inputLayerDiffs.length;
+      const remoteDiffTar = buildCustomTar([
+        { path: "work/from_remote.txt", type: "0", content: "from-remote-wasmi" },
+        { path: "work/.wh.to_delete.txt", type: "0", content: "" },
+      ]);
+      const remoteDiffGz = await gzipBytes(remoteDiffTar);
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          executor: "remote-wasmi",
+          exitCode: 0,
+          stdout: "REMOTE_OK\n",
+          stderr: "",
+          virtualTimeNs: "100",
+          timedOut: false,
+          error: null,
+          outputDiffTarGzBase64: uint8ArrayToBase64(remoteDiffGz),
+          modifiedFiles: [
+            { path: "/work/from_remote.txt", kind: "file", size: 17 },
+            { path: "/work/to_delete.txt", kind: "deleted", size: 0 },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    };
+
+    const layers = [
+      { id: "l1", type: "from", image: `${reg.host}/library/m4-pipe:latest`, executor: "local" },
+      { id: "l2", type: "workdir", path: "/work" },
+      { id: "l3", type: "run", cmd: "write_local", executor: "local" },
+      { id: "l4", type: "run", cmd: "remote_transform", executor: "remote" },
+      { id: "l5", type: "sweep", param: "env", envKey: "MODE", mode: "list", values: ["alpha", "beta"] },
+      { id: "l6", type: "run", cmd: "sweep_step1", executor: "local" },
+      { id: "l7", type: "run", cmd: "sweep_step2", executor: "local" },
+      { id: "l8", type: "run", cmd: "check_after_remote", executor: "local" },
+    ];
+
+    const res = await docker.runLayerPipeline(layers, {
+      apiBase: "https://remote.test",
+      fetch: mockFetch,
+    });
+
+    assert.equal(res.ok, true);
+    assert.equal(remoteSawInputDiffs, 1, "Remote layer must receive local layer's diff tar.gz");
+    assert.ok(res.layers[2].outputDiffTarGz instanceof Uint8Array);
+    assert.ok(res.layers[2].modifiedFiles.some((f) => f.path === "/work/local.txt"));
+
+    assert.equal(res.sweep.variations.length, 2);
+    assert.equal(res.sweep.passedCount, 2);
+
+    const v1 = res.sweep.variations[0];
+    assert.match(v1.layers[0].stdout, /STEP1:alpha/);
+    assert.match(v1.layers[1].stdout, /STEP2_FILE=alpha/);
+    assert.match(v1.layers[2].stdout, /LOCAL=from-local/);
+    assert.match(v1.layers[2].stdout, /REMOTE=from-remote-wasmi/);
+    assert.match(v1.layers[2].stdout, /DELETED=MISSING/);
+    assert.match(v1.layers[2].stdout, /MODE=alpha/);
+
+    const v2 = res.sweep.variations[1];
+    assert.match(v2.layers[0].stdout, /STEP1:beta/);
+    assert.match(v2.layers[1].stdout, /STEP2_FILE=beta/);
+    assert.match(v2.layers[2].stdout, /MODE=beta/);
+  } finally {
+    await docker.dispose();
+    await srv.stop();
+    await reg.stop();
+  }
+});
+
+test("M4: WorkerBackend + container_worker.mjs runLayerPipeline RPC & pipelineEvent streaming", async () => {
+  const shElf = buildStaticTestElf(`
+    static long sys4(long n, long a, long b, long c, long d) {
+      long r;
+      register long r10 __asm__("r10") = d;
+      __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10) : "rcx", "r11", "memory");
+      return r;
+    }
+    static long slen(const char *s) { long n = 0; while (s && s[n]) n++; return n; }
+    static void w_str(const char *s) { sys4(1, 1, (long)s, slen(s), 0); }
+    void entry_c(void) {
+      long fd = sys4(257, -100, (long)"/work/worker_out.txt", 0x241, 0644);
+      if (fd >= 0) {
+        sys4(1, fd, (long)"worker-ok", 9, 0);
+        sys4(3, fd, 0, 0, 0);
+      }
+      w_str("WORKER_PIPE_OK\\n");
+      sys4(231, 0, 0, 0, 0);
+    }
+    __asm__(".global _start\\n_start:\\n call entry_c\\n");
+  `);
+
+  const reg = createMockRegistry({ requireAuth: false });
+  reg.addImage("library/m4-worker", "latest", {
+    mediaTypeMode: "oci",
+    multiArch: false,
+    config: { cmd: ["/bin/sh"], workingDir: "/work" },
+    layers: [
+      {
+        files: [
+          { path: "bin/sh", type: "file", content: shElf, mode: 0o755 },
+          { path: "work", type: "dir", mode: 0o755 },
+        ],
+      },
+    ],
+  });
+  await reg.start();
+  const srv = createServer({ port: 0, host: "127.0.0.1", allowLocalRegistries: true });
+  await srv.start();
+
+  const origWorker = globalThis.Worker;
+  const origSelf = globalThis.self;
+  class InProcessWorker {
+    constructor(url) {
+      this._listeners = new Map();
+      this._terminated = false;
+      this._workerListeners = [];
+      globalThis.self = {
+        addEventListener: (type, fn) => {
+          if (type === "message") this._workerListeners.push(fn);
+        },
+        postMessage: (data) => {
+          if (this._terminated) return;
+          queueMicrotask(() => {
+            if (this._terminated) return;
+            for (const fn of this._listeners.get("message") || []) fn({ data });
+          });
+        },
+      };
+      this._ready = import(`${url.href}?m4inproc=${Date.now()}_${Math.random()}`);
+    }
+    addEventListener(type, fn) {
+      if (!this._listeners.has(type)) this._listeners.set(type, new Set());
+      this._listeners.get(type).add(fn);
+    }
+    postMessage(data) {
+      if (this._terminated) return;
+      this._ready.then(() => {
+        if (this._terminated) return;
+        for (const fn of this._workerListeners) fn({ data });
+      });
+    }
+    terminate() {
+      this._terminated = true;
+    }
+  }
+  globalThis.Worker = InProcessWorker;
+
+  let workerDocker = null;
+  try {
+    workerDocker = await Elf2WasmDocker.create({
+      compilerWasmUrl: `${srv.url}/wasm/elf2wasm_compiler_wasm.wasm`,
+      runtimeWasmUrl: `${srv.url}/wasm/elf2wasm_runtime_wasm.wasm`,
+      registryProxyBase: `${srv.url}/api/v2`,
+      useWorker: true,
+    });
+
+    const events = [];
+    const res = await workerDocker.runLayerPipeline(
+      [
+        { id: "l1", type: "from", image: `${reg.host}/library/m4-worker:latest`, executor: "local" },
+        { id: "l2", type: "sweep", param: "seed", mode: "range", start: 1, step: 1, count: 2 },
+        { id: "l3", type: "run", cmd: "run_worker", executor: "local" },
+      ],
+      {
+        onLayerStart: (ev) => events.push(`start:${ev.layer.type}`),
+        onLayerOutput: (ev) => events.push(`out:${textDecoder.decode(ev.chunk).trim()}`),
+        onVariationStart: (ev) => events.push(`var:${ev.variation.label}`),
+      }
+    );
+
+    assert.equal(res.ok, true);
+    assert.equal(res.sweep.variations.length, 2);
+    assert.ok(res.sweep.variations[0].layers[0].outputDiffTarGz instanceof Uint8Array);
+    assert.ok(events.includes("var:seed=1"));
+    assert.ok(events.includes("var:seed=2"));
+    assert.ok(events.includes("out:WORKER_PIPE_OK"));
+  } finally {
+    if (workerDocker) await workerDocker.dispose();
+    globalThis.Worker = origWorker;
+    globalThis.self = origSelf;
+    await srv.stop();
+    await reg.stop();
+  }
+});
+
+
 
 
 

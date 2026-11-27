@@ -29,6 +29,30 @@ function postReply(id, ok, resultOrError, transfer = []) {
   }
 }
 
+function collectPipelineTransferables(res) {
+  if (!res || typeof res !== "object") return [];
+  const seen = new Set();
+  const collectLayer = (lr) => {
+    if (!lr || !(lr.outputDiffTarGz instanceof Uint8Array)) return;
+    const u8 = lr.outputDiffTarGz;
+    if (u8.byteOffset !== 0 || u8.byteLength !== u8.buffer.byteLength || seen.has(u8.buffer)) {
+      lr.outputDiffTarGz = u8.slice();
+    }
+    seen.add(lr.outputDiffTarGz.buffer);
+  };
+  if (Array.isArray(res.layers)) {
+    for (const lr of res.layers) collectLayer(lr);
+  }
+  if (res.sweep && Array.isArray(res.sweep.variations)) {
+    for (const v of res.sweep.variations) {
+      if (Array.isArray(v.layers)) {
+        for (const lr of v.layers) collectLayer(lr);
+      }
+    }
+  }
+  return Array.from(seen);
+}
+
 async function handleMessage(ev) {
   const msg = ev.data;
   if (!msg || typeof msg !== "object") return;
@@ -196,6 +220,116 @@ async function handleMessage(ev) {
       case "dropVfsSnapshot": {
         engine.dropVfsSnapshot(payload.containerId, payload.snapshotId);
         postReply(id, true, { ok: true });
+        break;
+      }
+
+      case "exportVfsDiffTar": {
+        const bytes = engine.exportVfsDiffTar(payload.containerId, payload.options || {});
+        const copy = bytes instanceof Uint8Array ? bytes.slice() : new Uint8Array(bytes || 0);
+        postReply(id, true, copy, [copy.buffer]);
+        break;
+      }
+
+      case "listVfsDiff": {
+        const entries = engine.listVfsDiff(payload.containerId, payload.options || {});
+        postReply(id, true, entries);
+        break;
+      }
+
+      case "applyTarOverlay": {
+        await engine.applyTarOverlay(payload.containerId, payload.tarBytes, payload.options || {});
+        postReply(id, true, { ok: true });
+        break;
+      }
+
+      case "mountGitRepo": {
+        const ctrl = new AbortController();
+        if (id) activeAborts.set(id, ctrl);
+        try {
+          const opts = payload.options || {};
+          const res = await engine.mountGitRepo(payload.containerId, {
+            ...opts,
+            signal: ctrl.signal,
+            onProgress: (data) => {
+              self.postMessage({ event: "progress", reqId: id, data });
+            },
+          });
+          postReply(id, true, res);
+        } finally {
+          if (id) activeAborts.delete(id);
+        }
+        break;
+      }
+
+      case "runLayerPipeline": {
+        const ctrl = new AbortController();
+        if (id) activeAborts.set(id, ctrl);
+        try {
+          const opts = payload.options || {};
+          const res = await engine.runLayerPipeline(payload.layers || [], {
+            ...opts,
+            signal: ctrl.signal,
+            onProgress: (data) => {
+              self.postMessage({ event: "progress", reqId: id, data });
+            },
+            onLayerStart: opts._hasLayerStart
+              ? (data) => {
+                  self.postMessage({ event: "pipelineEvent", reqId: id, kind: "layerStart", data });
+                }
+              : undefined,
+            onLayerOutput: opts._hasLayerOutput
+              ? (data) => {
+                  const copy =
+                    data.chunk instanceof Uint8Array
+                      ? data.chunk.slice()
+                      : new Uint8Array(data.chunk || 0);
+                  self.postMessage(
+                    {
+                      event: "pipelineEvent",
+                      reqId: id,
+                      kind: "layerOutput",
+                      data: { ...data, chunk: copy },
+                    },
+                    [copy.buffer]
+                  );
+                }
+              : undefined,
+            onLayerComplete: opts._hasLayerComplete
+              ? (data) => {
+                  self.postMessage({
+                    event: "pipelineEvent",
+                    reqId: id,
+                    kind: "layerComplete",
+                    data,
+                  });
+                }
+              : undefined,
+            onVariationStart: opts._hasVariationStart
+              ? (data) => {
+                  self.postMessage({
+                    event: "pipelineEvent",
+                    reqId: id,
+                    kind: "variationStart",
+                    data,
+                  });
+                }
+              : undefined,
+            onVariationComplete: opts._hasVariationComplete
+              ? (data) => {
+                  self.postMessage({
+                    event: "pipelineEvent",
+                    reqId: id,
+                    kind: "variationComplete",
+                    data,
+                  });
+                }
+              : undefined,
+          });
+          const transfer = collectPipelineTransferables(res);
+          postReply(id, true, res, transfer);
+        } finally {
+          if (id) activeAborts.delete(id);
+        }
         break;
       }
 
