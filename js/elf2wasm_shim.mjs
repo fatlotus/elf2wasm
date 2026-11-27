@@ -1369,14 +1369,17 @@ export class Elf2WasmSystem {
       new Uint8Array(rExp.memory.buffer, pPtr, pLen).set(pBytes);
     }
 
-    const outLenPtr = rExp.alloc(4) >>> 0;
+    let outLenPtr = 0;
     let outPtr = 0;
     let outLen = 0;
     try {
+      outLenPtr = rExp.alloc(4) >>> 0;
       outPtr = rExp[exportName](snapId, useBase, pPtr, pLen, outLenPtr) >>> 0;
       outLen = new DataView(rExp.memory.buffer).getUint32(outLenPtr, true);
     } finally {
-      rExp.dealloc(outLenPtr, 4);
+      if (outLenPtr !== 0) {
+        rExp.dealloc(outLenPtr, 4);
+      }
       if (pPtr !== 0 && pLen > 0) {
         rExp.dealloc(pPtr, pLen);
       }

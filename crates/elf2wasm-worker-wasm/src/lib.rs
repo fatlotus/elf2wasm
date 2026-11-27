@@ -138,14 +138,17 @@ fn compute_bundle_hash(main_bytes: &[u8], sos: &[(String, Vec<u8>)]) -> u64 {
 }
 
 fn is_memory_limit_error(msg: &str) -> bool {
-    msg.contains("MEMORY_LIMIT")
-        || msg.contains("exceeds guest memory limit")
-        || msg.contains("exceeds guest code/data limit")
-        || msg.contains("exceeds maximum linear memory")
-        || msg.contains("exceeding maximum")
-        || msg.contains("exceeds reserved")
-        || msg.contains("memory limit")
-        || msg.contains("ResourceLimiter")
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("memory_limit")
+        || lower.contains("exceeds guest memory limit")
+        || lower.contains("exceeds guest code/data limit")
+        || lower.contains("exceeds maximum linear memory")
+        || lower.contains("exceeding maximum")
+        || lower.contains("exceeds reserved")
+        || lower.contains("memory limit")
+        || lower.contains("resource limiter")
+        || lower.contains("resourcelimiter")
+        || lower.contains("out of memory")
 }
 
 impl WorkerSession {
@@ -1387,5 +1390,35 @@ mod tests {
             .decode(&resp.stdout_base64)
             .unwrap();
         assert_eq!(stdout, b"CP");
+    }
+
+    #[test]
+    fn test_worker_memory_limit_error_code() {
+        let elf = build_full_test_elf();
+        let mut sess = WorkerSession::new();
+        sess.state.vfs.vfs_write_file("/bin/testapp", &elf, 0o755);
+
+        let req = RunCommandRequest {
+            cmd: vec!["/bin/testapp".to_string()],
+            env: default_env(),
+            cwd: "/".to_string(),
+            uid: 0,
+            gid: 0,
+            stdin_base64: String::new(),
+            delay_stddev_ms: 0.0,
+            delay_seed: 0,
+            max_fuel: DEFAULT_MAX_FUEL,
+            max_memory_bytes: 65_536,
+        };
+        let resp = sess.run_command(&req);
+        assert!(!resp.ok);
+        assert!(!resp.timed_out);
+        assert_eq!(
+            resp.error_code.as_deref(),
+            Some("MEMORY_LIMIT"),
+            "expected MEMORY_LIMIT, got {:?} with error {:?}",
+            resp.error_code,
+            resp.error
+        );
     }
 }

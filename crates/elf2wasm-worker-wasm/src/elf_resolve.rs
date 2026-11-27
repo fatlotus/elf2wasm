@@ -167,12 +167,22 @@ pub fn resolve_command_path(
         return None;
     }
     let path_env = get_env_var(env, "PATH").unwrap_or(DEFAULT_PATH);
+    let base_cwd = normalize_guest_path(if cwd.is_empty() { "/" } else { cwd });
     for dir in path_env.split(':') {
-        let dir = if dir.is_empty() { "." } else { dir };
-        let candidate = if dir == "/" {
+        let candidate = if dir.is_empty() {
+            if base_cwd == "/" {
+                normalize_guest_path(&format!("/{}", cmd))
+            } else {
+                normalize_guest_path(&format!("{}/{}", base_cwd, cmd))
+            }
+        } else if dir == "/" {
             format!("/{}", cmd)
-        } else {
+        } else if dir.starts_with('/') {
             normalize_guest_path(&format!("{}/{}", dir, cmd))
+        } else if base_cwd == "/" {
+            normalize_guest_path(&format!("/{}/{}", dir, cmd))
+        } else {
+            normalize_guest_path(&format!("{}/{}/{}", base_cwd, dir, cmd))
         };
         let resolved = resolve_vfs_path(vfs, &candidate);
         if vfs.vfs_read_file(&resolved).is_some() {
@@ -539,4 +549,33 @@ pub fn resolve_elf_sos(
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_command_path_empty_path_component_uses_cwd() {
+        let mut vfs = VirtualFs::new_in_memory(&[]);
+        vfs.vfs_write_file("/workspace/localtool", b"#!/bin/sh\n", 0o755);
+
+        let env = vec!["PATH=/usr/bin::/bin".to_string()];
+        let found = resolve_command_path(&vfs, "localtool", &env, "/workspace");
+        assert_eq!(found.as_deref(), Some("/workspace/localtool"));
+
+        // Leading empty component also resolves against cwd.
+        let env_leading = vec!["PATH=:/bin".to_string()];
+        assert_eq!(
+            resolve_command_path(&vfs, "localtool", &env_leading, "/workspace").as_deref(),
+            Some("/workspace/localtool")
+        );
+
+        // Relative PATH component resolves against cwd.
+        let env_rel = vec!["PATH=.:/bin".to_string()];
+        assert_eq!(
+            resolve_command_path(&vfs, "localtool", &env_rel, "/workspace").as_deref(),
+            Some("/workspace/localtool")
+        );
+    }
 }

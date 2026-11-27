@@ -994,10 +994,10 @@ impl VirtualFs {
         let mut next_pax: Option<BTreeMap<String, String>> = None;
         let mut global_pax: BTreeMap<String, String> = BTreeMap::new();
 
-        while offset + 512 <= tar_bytes.len() {
+        while tar_bytes.len().saturating_sub(offset) >= 512 {
             let hdr = &tar_bytes[offset..offset + 512];
             if hdr.iter().all(|&b| b == 0) {
-                offset += 512;
+                offset = offset.saturating_add(512);
                 continue;
             }
 
@@ -1008,7 +1008,7 @@ impl VirtualFs {
             let link_field = read_tar_str(&hdr[157..257]);
             let prefix_field = read_tar_str(&hdr[345..500]);
 
-            offset += 512;
+            offset = offset.saturating_add(512);
 
             if let Some(pax) = next_pax.as_ref() {
                 if let Some(sz_str) = pax.get("size") {
@@ -4523,6 +4523,102 @@ mod tests {
         assert!(!full.iter().any(|e| e.path == "/"));
         assert!(full.iter().any(|e| e.path == "/workspace/one.txt"));
     }
+
+    #[test]
+    fn test_extract_tar_malformed_pax_records_no_panic() {
+        // Direct parse_pax_records edge cases: rec_len <= sp_rel + 1, huge length,
+        // truncated record, zero length, and valid record followed by malformed record.
+        assert!(parse_pax_records(b"1 a=b\n").is_empty());
+        assert!(parse_pax_records(b"2 a=b\n").is_empty());
+        assert!(parse_pax_records(b"0 a=b\n").is_empty());
+        assert!(parse_pax_records(b"99999999999999999999 a=b\n").is_empty());
+        assert!(parse_pax_records(b"50 a=b\n").is_empty());
+        let partial = parse_pax_records(b"6 a=b\n1 c=d\n");
+        assert_eq!(partial.get("a").map(String::as_str), Some("b"));
+        assert!(!partial.contains_key("c"));
+
+        // Feed malformed PAX records via extract_tar to ensure no panic or error.
+        let payloads: &[&[u8]] = &[
+            b"1 a=b\n",
+            b"99999999999999999999 a=b\n",
+            b"50 a=b\n",
+            b"0 a=b\n",
+            b"6 a=b\n1 c=d\n",
+        ];
+        for payload in payloads {
+            let mut tar = Vec::new();
+            write_ustar_header(
+                &mut tar,
+                "PaxHeaders.0/bad",
+                b'x',
+                0o644,
+                payload.len() as u64,
+                0,
+                "",
+            );
+            tar.extend_from_slice(payload);
+            let pad = (512 - (payload.len() % 512)) % 512;
+            tar.resize(tar.len() + pad, 0);
+            tar.resize(tar.len() + 1024, 0);
+
+            let mut vfs = VirtualFs::new_in_memory(&[]);
+            vfs.extract_tar(&tar, "/", 0, false).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_extract_tar_huge_size_and_base256_overflow_no_panic() {
+        // 1. GNU base-256 >64-bit value (2^80) must return None instead of silently truncating.
+        let overflow_base256 = [0x80u8, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(parse_tar_num(&overflow_base256), None);
+        // Valid 64-bit max base-256 value must succeed.
+        let max_u64_base256 = [0x80u8, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert_eq!(parse_tar_num(&max_u64_base256), Some(u64::MAX));
+
+        // 2. Tar header with huge octal size 037777777400 (0xffff_ff00) + trailing block.
+        let mut hdr = [0u8; 512];
+        hdr[0..8].copy_from_slice(b"huge.bin");
+        hdr[100..108].copy_from_slice(b"0000644\0");
+        hdr[124..136].copy_from_slice(b"37777777400\0");
+        hdr[156] = b'0';
+        let mut tar_octal = Vec::with_capacity(1024);
+        tar_octal.extend_from_slice(&hdr);
+        tar_octal.resize(1024, 0);
+        let mut vfs = VirtualFs::new_in_memory(&[]);
+        let _ = vfs.extract_tar(&tar_octal, "/", 0, false);
+
+        // 3. Tar header with >64-bit base-256 size field.
+        let mut hdr_b256 = [0u8; 512];
+        hdr_b256[0..9].copy_from_slice(b"b256.bin\0");
+        hdr_b256[100..108].copy_from_slice(b"0000644\0");
+        hdr_b256[124..136].copy_from_slice(&overflow_base256);
+        hdr_b256[156] = b'0';
+        let mut tar_b256 = Vec::with_capacity(1024);
+        tar_b256.extend_from_slice(&hdr_b256);
+        tar_b256.resize(1024, 0);
+        let mut vfs2 = VirtualFs::new_in_memory(&[]);
+        vfs2.extract_tar(&tar_b256, "/", 0, false).unwrap();
+
+        // 4. Tar header with PAX size=u64::MAX must never panic (either Ok or Err on 32-bit).
+        let pax_payload = b"28 size=18446744073709551615\n";
+        let mut tar_pax = Vec::new();
+        write_ustar_header(
+            &mut tar_pax,
+            "PaxHeaders.0/max",
+            b'x',
+            0o644,
+            pax_payload.len() as u64,
+            0,
+            "",
+        );
+        tar_pax.extend_from_slice(pax_payload);
+        let pad = (512 - (pax_payload.len() % 512)) % 512;
+        tar_pax.resize(tar_pax.len() + pad, 0);
+        write_ustar_header(&mut tar_pax, "max.bin", b'0', 0o644, 0, 0, "");
+        tar_pax.resize(tar_pax.len() + 1024, 0);
+        let mut vfs3 = VirtualFs::new_in_memory(&[]);
+        let _ = vfs3.extract_tar(&tar_pax, "/", 0, false);
+    }
 }
 
 fn utf8_truncate(s: &str, max_bytes: usize) -> &str {
@@ -4651,7 +4747,7 @@ fn parse_tar_num(field: &[u8]) -> Option<u64> {
         // GNU base-256 (big-endian, high bit set on first byte).
         let mut val: u64 = (field[0] & 0x7f) as u64;
         for &b in &field[1..] {
-            val = val.checked_shl(8)?.checked_add(b as u64)?;
+            val = val.checked_mul(256)?.checked_add(b as u64)?;
         }
         return Some(val);
     }
@@ -4674,17 +4770,20 @@ fn parse_pax_records(data: &[u8]) -> BTreeMap<String, String> {
         let Ok(rec_len) = len_str.trim().parse::<usize>() else {
             break;
         };
-        if rec_len == 0 || pos + rec_len > data.len() {
+        let Some(rec_end) = pos.checked_add(rec_len) else {
+            break;
+        };
+        if rec_len <= sp_rel + 1 || rec_end > data.len() {
             break;
         }
-        let rec_body = &data[pos + sp_rel + 1..pos + rec_len];
+        let rec_body = &data[pos + sp_rel + 1..rec_end];
         let rec_body = rec_body.strip_suffix(b"\n").unwrap_or(rec_body);
         if let Some(eq_idx) = rec_body.iter().position(|&b| b == b'=') {
             let key = String::from_utf8_lossy(&rec_body[..eq_idx]).into_owned();
             let val = String::from_utf8_lossy(&rec_body[eq_idx + 1..]).into_owned();
             map.insert(key, val);
         }
-        pos += rec_len;
+        pos = rec_end;
     }
     map
 }
