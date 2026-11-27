@@ -4,6 +4,7 @@ members = [
     "crates/elf2wasm-compiler-wasm",
     "crates/elf2wasm-runtime-core",
     "crates/elf2wasm-runtime-wasm",
+    "crates/elf2wasm-worker-wasm",
 ]
 resolver = "2"
 

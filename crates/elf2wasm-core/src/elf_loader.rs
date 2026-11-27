@@ -15,12 +15,88 @@ pub const MMAP_START: u32 = 0x0800_0000; // 128 MB
 pub const MMAP_END: u32 = 0x0B00_0000; // 176 MB
 pub const STACK_TOP: u32 = 0x0BFF_0000; // ~192 MB
 pub const INITIAL_MEM_PAGES: u32 = 4096; // 256 MB (4096 * 64KB)
+pub const MAX_MEM_PAGES: u32 = 32768; // 2 GiB (32768 * 64KB)
 pub const DISPATCH_TABLE_ADDR: u32 = 0x0001_0000; // 64 KB
 
 const EXPANDED_BRK_SIZE: u32 = 0x0300_0000; // 48 MB
 const EXPANDED_MMAP_SIZE: u32 = 0x1000_0000; // 256 MB
 const EXPANDED_STACK_SIZE: u32 = 0x0100_0000; // 16 MB
 const STACK_GUARD_GAP: u32 = 0x0001_0000; // 64 KB below dispatch_hash_addr
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryLayoutConfig {
+    pub main_pie_base: u32,
+    pub ld_base: u32,
+    pub so_base_start: u32,
+    pub so_align: u32,
+    pub brk_start: u32,
+    pub mmap_start: u32,
+    pub mmap_end: u32,
+    pub stack_top: u32,
+    pub dispatch_hash_addr: u32,
+    pub initial_mem_pages: u32,
+    pub max_mem_pages: u32,
+    pub code_data_limit: u32,
+    pub max_segment_memsz: u32,
+    pub expanded_align: u32,
+    pub expanded_brk_size: u32,
+    pub expanded_mmap_size: u32,
+    pub expanded_stack_size: u32,
+}
+
+impl MemoryLayoutConfig {
+    /// Standard 256 MiB initial / 2 GiB max guest layout (browser/Node V8 default).
+    pub const fn standard() -> Self {
+        Self {
+            main_pie_base: MAIN_PIE_BASE,
+            ld_base: LD_BASE,
+            so_base_start: SO_BASE_START,
+            so_align: SO_ALIGN,
+            brk_start: crate::meta::DEFAULT_BRK_START,
+            mmap_start: crate::meta::DEFAULT_MMAP_START,
+            mmap_end: crate::meta::DEFAULT_MMAP_END,
+            stack_top: crate::meta::DEFAULT_STACK_TOP,
+            dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
+            initial_mem_pages: INITIAL_MEM_PAGES,
+            max_mem_pages: MAX_MEM_PAGES,
+            code_data_limit: GUEST_CODE_DATA_LIMIT as u32,
+            max_segment_memsz: GUEST_MEM_SIZE as u32,
+            expanded_align: 0x0100_0000,
+            expanded_brk_size: EXPANDED_BRK_SIZE,
+            expanded_mmap_size: EXPANDED_MMAP_SIZE,
+            expanded_stack_size: EXPANDED_STACK_SIZE,
+        }
+    }
+
+    /// Compact 40 MiB initial / 64 MiB max guest layout for Cloudflare Workers (128 MiB isolate cap).
+    pub const fn compact() -> Self {
+        Self {
+            main_pie_base: 0x0010_0000,      // 1 MiB
+            ld_base: 0x0080_0000,            // 8 MiB
+            so_base_start: 0x00A0_0000,      // 10 MiB
+            so_align: 0x0001_0000,           // 64 KiB
+            brk_start: 0x0140_0000,          // 20 MiB
+            mmap_start: 0x01A0_0000,         // 26 MiB
+            mmap_end: 0x0220_0000,           // 34 MiB
+            stack_top: 0x023F_0000,          // 36 MiB - 64 KiB (~2 MiB stack)
+            dispatch_hash_addr: 0x0240_0000, // 36 MiB
+            initial_mem_pages: 640,          // 40 MiB (640 * 64 KiB)
+            max_mem_pages: 1024,             // 64 MiB (1024 * 64 KiB)
+            code_data_limit: 0x0280_0000,    // 40 MiB
+            max_segment_memsz: 0x0280_0000,  // 40 MiB
+            expanded_align: 0x0010_0000,     // 1 MiB
+            expanded_brk_size: 0x0040_0000,  // 4 MiB
+            expanded_mmap_size: 0x0080_0000, // 8 MiB
+            expanded_stack_size: 0x0020_0000, // 2 MiB
+        }
+    }
+}
+
+impl Default for MemoryLayoutConfig {
+    fn default() -> Self {
+        Self::standard()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ExecSegment {
@@ -61,6 +137,8 @@ pub struct LoadedImage {
     pub mmap_end: u32,
     pub stack_top: u32,
     pub dispatch_hash_addr: u32,
+    pub initial_mem_pages: u32,
+    pub max_mem_pages: u32,
 }
 
 pub const GUEST_MEM_SIZE: usize = (INITIAL_MEM_PAGES as usize) * 65536; // 256 MB
@@ -70,31 +148,55 @@ fn align_up(val: u32, align: u32) -> Option<u32> {
     val.checked_add(align - 1).map(|v| v & !(align - 1))
 }
 
+/// Compute per-module dynamic guest VA layout `(brk_start, mmap_start, mmap_end, stack_top, dispatch_hash_addr)`
+/// using the supplied [`MemoryLayoutConfig`].
+pub fn compute_guest_layout_with_config(
+    code_so_end: u32,
+    config: &MemoryLayoutConfig,
+) -> Result<(u32, u32, u32, u32, u32)> {
+    let (brk_start, mmap_start, mmap_end, stack_top, dispatch_hash_addr) =
+        if code_so_end <= config.brk_start {
+            (
+                config.brk_start,
+                config.mmap_start,
+                config.mmap_end,
+                config.stack_top,
+                config.dispatch_hash_addr,
+            )
+        } else {
+            let brk_start = align_up(code_so_end, config.expanded_align)
+                .context("brk_start alignment overflow")?;
+            let mmap_start = brk_start
+                .checked_add(config.expanded_brk_size)
+                .context("mmap_start overflow")?;
+            let mmap_end = mmap_start
+                .checked_add(config.expanded_mmap_size)
+                .context("mmap_end overflow")?;
+            let dispatch_hash_addr = mmap_end
+                .checked_add(config.expanded_stack_size)
+                .context("dispatch_hash_addr overflow")?;
+            let stack_top = dispatch_hash_addr
+                .checked_sub(STACK_GUARD_GAP)
+                .context("stack_top underflow")?;
+            (brk_start, mmap_start, mmap_end, stack_top, dispatch_hash_addr)
+        };
+
+    let max_bytes = (config.max_mem_pages as u64) * 65536;
+    if (dispatch_hash_addr as u64) >= max_bytes {
+        bail!(
+            "Guest layout (dispatch_hash_addr=0x{:x}) exceeds maximum linear memory ({} MiB)",
+            dispatch_hash_addr,
+            config.max_mem_pages / 16
+        );
+    }
+
+    Ok((brk_start, mmap_start, mmap_end, stack_top, dispatch_hash_addr))
+}
+
 /// Compute per-module dynamic guest VA layout `(brk_start, mmap_start, mmap_end, stack_top, dispatch_hash_addr)`.
 /// Preserves the exact legacy 256 MiB layout whenever `code_so_end <= BRK_START`.
 pub fn compute_guest_layout(code_so_end: u32) -> Result<(u32, u32, u32, u32, u32)> {
-    if code_so_end <= BRK_START {
-        return Ok((
-            crate::meta::DEFAULT_BRK_START,
-            crate::meta::DEFAULT_MMAP_START,
-            crate::meta::DEFAULT_MMAP_END,
-            crate::meta::DEFAULT_STACK_TOP,
-            crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
-        ));
-    }
-    let brk_start = align_up(code_so_end, 0x0100_0000)
-        .context("brk_start 16MB alignment overflow")?;
-    let mmap_start = brk_start
-        .checked_add(EXPANDED_BRK_SIZE)
-        .context("mmap_start overflow")?;
-    let mmap_end = mmap_start
-        .checked_add(EXPANDED_MMAP_SIZE)
-        .context("mmap_end overflow")?;
-    let dispatch_hash_addr = mmap_end
-        .checked_add(EXPANDED_STACK_SIZE)
-        .context("dispatch_hash_addr overflow")?;
-    let stack_top = dispatch_hash_addr - STACK_GUARD_GAP;
-    Ok((brk_start, mmap_start, mmap_end, stack_top, dispatch_hash_addr))
+    compute_guest_layout_with_config(code_so_end, &MemoryLayoutConfig::standard())
 }
 
 fn elf_span(elf: &Elf, align: u32) -> Result<u32> {
@@ -146,6 +248,7 @@ fn extract_segments(
     elf: &Elf,
     base: u32,
     load_data: bool,
+    config: &MemoryLayoutConfig,
     exec_segments: &mut Vec<ExecSegment>,
     data_segments: &mut Vec<DataSegment>,
 ) -> Result<()> {
@@ -173,15 +276,16 @@ fn extract_segments(
                 bytes.len()
             );
         }
+        let max_seg_memsz = config.max_segment_memsz as usize;
         let memsz = usize::try_from(ph.p_memsz)
             .ok()
-            .filter(|&m| m <= GUEST_MEM_SIZE)
+            .filter(|&m| m <= max_seg_memsz)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "ELF {} segment p_memsz ({}) exceeds guest memory limit ({})",
                     name,
                     ph.p_memsz,
-                    GUEST_MEM_SIZE
+                    max_seg_memsz
                 )
             })?;
         let filesz = ph.p_filesz as usize;
@@ -199,13 +303,14 @@ fn extract_segments(
         let seg_end = (vaddr as usize)
             .checked_add(memsz)
             .context("ELF segment end address overflow")?;
-        if seg_end > GUEST_CODE_DATA_LIMIT {
+        let code_data_limit = config.code_data_limit as usize;
+        if seg_end > code_data_limit {
             bail!(
-                "ELF {} segment [0x{:x}, 0x{:x}) overlaps stack/dispatch region (>= 0x{:x})",
+                "ELF {} segment [0x{:x}, 0x{:x}) exceeds guest code/data limit (0x{:x})",
                 name,
                 vaddr,
                 seg_end,
-                GUEST_CODE_DATA_LIMIT
+                code_data_limit
             );
         }
 
@@ -235,6 +340,15 @@ pub fn load_elf_and_sos_bytes(
     main_bytes: &[u8],
     sos: &[(&str, &[u8])],
 ) -> Result<LoadedImage> {
+    load_elf_and_sos_bytes_with_layout(main_path, main_bytes, sos, &MemoryLayoutConfig::standard())
+}
+
+pub fn load_elf_and_sos_bytes_with_layout(
+    main_path: &str,
+    main_bytes: &[u8],
+    sos: &[(&str, &[u8])],
+    config: &MemoryLayoutConfig,
+) -> Result<LoadedImage> {
     let main_elf = Elf::parse(main_bytes)
         .with_context(|| format!("Failed to parse main ELF: {}", main_path))?;
 
@@ -258,7 +372,7 @@ pub fn load_elf_and_sos_bytes(
     }
 
     let main_base = if main_elf.header.e_type == goblin::elf::header::ET_DYN {
-        MAIN_PIE_BASE
+        config.main_pie_base
     } else {
         0
     };
@@ -282,6 +396,7 @@ pub fn load_elf_and_sos_bytes(
         &main_elf,
         main_base,
         true,
+        config,
         &mut exec_segments,
         &mut data_segments,
     )?;
@@ -360,18 +475,21 @@ pub fn load_elf_and_sos_bytes(
         });
     }
 
-    let ld_base = LD_BASE.max(main_end);
+    let ld_base = config.ld_base.max(main_end);
     let mut next_so_base = if let Some(idx) = interp_idx {
-        let ld_span = elf_span(&parsed_sos[idx].elf, SO_ALIGN)?.max(SO_ALIGN);
+        let ld_span = elf_span(&parsed_sos[idx].elf, config.so_align)?.max(config.so_align);
         let ld_end = ld_base
             .checked_add(ld_span)
-            .filter(|&n| n <= GUEST_CODE_DATA_LIMIT as u32)
+            .filter(|&n| n <= config.code_data_limit)
             .ok_or_else(|| {
-                anyhow::anyhow!("ld.so exceeds reserved VA space (GUEST_CODE_DATA_LIMIT)")
+                anyhow::anyhow!(
+                    "ld.so exceeds reserved VA space (code_data_limit=0x{:x})",
+                    config.code_data_limit
+                )
             })?;
-        SO_BASE_START.max(ld_end)
+        config.so_base_start.max(ld_end)
     } else {
-        SO_BASE_START.max(main_end)
+        config.so_base_start.max(main_end)
     };
 
     let mut ld_loaded = false;
@@ -395,17 +513,23 @@ pub fn load_elf_and_sos_bytes(
                 &pso.elf,
                 ld_base,
                 true,
+                config,
                 &mut exec_segments,
                 &mut data_segments,
             )?;
             collect_symbols(&pso.elf, ld_base, &mut symbols);
         } else {
             let base = next_so_base;
-            let span = elf_span(&pso.elf, SO_ALIGN)?.max(SO_ALIGN);
+            let span = elf_span(&pso.elf, config.so_align)?.max(config.so_align);
             next_so_base = next_so_base
                 .checked_add(span)
-                .filter(|&n| n <= GUEST_CODE_DATA_LIMIT as u32)
-                .ok_or_else(|| anyhow::anyhow!("Shared objects exceed reserved SO VA space"))?;
+                .filter(|&n| n <= config.code_data_limit)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Shared objects exceed reserved SO VA space (code_data_limit=0x{:x})",
+                        config.code_data_limit
+                    )
+                })?;
 
             // Lift its code at `base`, but do NOT preload its data segments:
             // ld.so will openat + mmap it into `base` at runtime!
@@ -415,6 +539,7 @@ pub fn load_elf_and_sos_bytes(
                 &pso.elf,
                 base,
                 false,
+                config,
                 &mut exec_segments,
                 &mut data_segments,
             )?;
@@ -451,7 +576,7 @@ pub fn load_elf_and_sos_bytes(
     }
 
     let (brk_start, mmap_start, mmap_end, stack_top, dispatch_hash_addr) =
-        compute_guest_layout(next_so_base)?;
+        compute_guest_layout_with_config(next_so_base, config)?;
 
     Ok(LoadedImage {
         entry_rip,
@@ -470,6 +595,8 @@ pub fn load_elf_and_sos_bytes(
         mmap_end,
         stack_top,
         dispatch_hash_addr,
+        initial_mem_pages: config.initial_mem_pages,
+        max_mem_pages: config.max_mem_pages,
     })
 }
 
@@ -814,6 +941,113 @@ mod tests {
         }
         // 40 * 64 KiB = 2.5 MiB -> still well within legacy layout (<= BRK_START)
         assert_eq!(image.brk_start, BRK_START);
+        assert_eq!(image.initial_mem_pages, INITIAL_MEM_PAGES);
+        assert_eq!(image.max_mem_pages, MAX_MEM_PAGES);
+        Ok(())
+    }
+
+    #[test]
+    fn test_compact_layout_pie_and_musl() -> Result<()> {
+        let cfg = MemoryLayoutConfig::compact();
+        let main_bytes = make_minimal_elf64(
+            goblin::elf::header::ET_DYN,
+            0x1000,
+            0,
+            0x10_0000,
+            Some(b"/lib/ld-musl-x86_64.so.1\0"),
+        );
+        let ld_bytes = make_minimal_elf64(goblin::elf::header::ET_DYN, 0x1000, 0, 0xD_0000, None);
+        let image = load_elf_and_sos_bytes_with_layout(
+            "/bin/busybox",
+            &main_bytes,
+            &[("/lib/ld-musl-x86_64.so.1", &ld_bytes)],
+            &cfg,
+        )?;
+        assert_eq!(image.at_base, 0x0080_0000);
+        assert_eq!(image.brk_start, 0x0140_0000);
+        assert_eq!(image.mmap_start, 0x01A0_0000);
+        assert_eq!(image.mmap_end, 0x0220_0000);
+        assert_eq!(image.stack_top, 0x023F_0000);
+        assert_eq!(image.dispatch_hash_addr, 0x0240_0000);
+        assert_eq!(image.initial_mem_pages, 640);
+        assert_eq!(image.max_mem_pages, 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn test_compact_layout_et_exec_dynamic_ld_bump() -> Result<()> {
+        let cfg = MemoryLayoutConfig::compact();
+        // 12 MiB ET_EXEC spanning [0x40_0000 .. 0x100_0000) -> exceeds compact ld_base (0x80_0000)
+        let main_bytes = make_minimal_elf64(
+            goblin::elf::header::ET_EXEC,
+            0x0040_0000,
+            0x0040_0000,
+            0x00C0_0000,
+            Some(b"/lib64/ld-linux-x86-64.so.2\0"),
+        );
+        let ld_bytes = make_minimal_elf64(goblin::elf::header::ET_DYN, 0x1000, 0, 0x4_0000, None);
+        let so_bytes = make_minimal_elf64(goblin::elf::header::ET_DYN, 0x1000, 0, 0x10_0000, None);
+        let image = load_elf_and_sos_bytes_with_layout(
+            "/usr/bin/app",
+            &main_bytes,
+            &[
+                ("/lib64/ld-linux-x86-64.so.2", &ld_bytes),
+                ("/lib/x86_64-linux-gnu/libc.so.6", &so_bytes),
+            ],
+            &cfg,
+        )?;
+        assert_eq!(image.at_base, 0x0100_0000);
+        assert_eq!(image.so_files[0].base_addr, 0x0104_0000);
+        assert_eq!(image.brk_start, 0x0140_0000);
+        assert_eq!(image.initial_mem_pages, 640);
+        assert_eq!(image.max_mem_pages, 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn test_compact_layout_expanded_so_and_limit_error() -> Result<()> {
+        let cfg = MemoryLayoutConfig::compact();
+        let main_bytes = make_minimal_elf64(
+            goblin::elf::header::ET_DYN,
+            0x1000,
+            0,
+            0x10_0000,
+            Some(b"/lib64/ld-linux-x86-64.so.2\0"),
+        );
+        let ld_bytes = make_minimal_elf64(goblin::elf::header::ET_DYN, 0x1000, 0, 0x4_0000, None);
+        // 12 MiB .so starting at 0x00A0_0000 -> ends at 0x0160_0000 (> 20 MiB brk_start)
+        let big_so = make_minimal_elf64(goblin::elf::header::ET_DYN, 0x1000, 0, 0x00C0_0000, None);
+        let image = load_elf_and_sos_bytes_with_layout(
+            "/usr/bin/py",
+            &main_bytes,
+            &[
+                ("/lib64/ld-linux-x86-64.so.2", &ld_bytes),
+                ("/usr/lib/libbig.so", &big_so),
+            ],
+            &cfg,
+        )?;
+        assert_eq!(image.brk_start, 0x0160_0000);
+        assert_eq!(image.mmap_start, 0x01A0_0000);
+        assert_eq!(image.mmap_end, 0x0220_0000);
+        assert_eq!(image.dispatch_hash_addr, 0x0240_0000);
+        assert_eq!(image.stack_top, 0x023F_0000);
+
+        // Oversized 108 MiB node-scale binary must fail cleanly in compact mode.
+        let huge_bytes = make_minimal_elf64(
+            goblin::elf::header::ET_EXEC,
+            0x0040_0000,
+            0x0040_0000,
+            0x0680_0000,
+            None,
+        );
+        let err = load_elf_and_sos_bytes_with_layout("/usr/local/bin/node", &huge_bytes, &[], &cfg)
+            .expect_err("108 MiB binary must fail compact layout");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("exceeds guest memory limit") || msg.contains("exceeds guest code/data limit"),
+            "unexpected error message: {}",
+            msg
+        );
         Ok(())
     }
 }

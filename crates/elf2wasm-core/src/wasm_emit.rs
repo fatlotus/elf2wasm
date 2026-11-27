@@ -1,7 +1,7 @@
 use crate::decoder::{
     decode_block_instructions_into, BlockTerminator, DecodedBlock, DecodedProgram, FastHashMap,
 };
-use crate::elf_loader::{ExecSegment, LoadedImage, INITIAL_MEM_PAGES};
+use crate::elf_loader::{ExecSegment, LoadedImage, INITIAL_MEM_PAGES, MAX_MEM_PAGES};
 use crate::lifter::{
     Lifter, DEFAULT_QUANTUM, GLOBAL_CF, GLOBAL_DF, GLOBAL_EXIT_CODE, GLOBAL_EXIT_FLAG,
     GLOBAL_FSBASE, GLOBAL_GSBASE, GLOBAL_MXCSR, GLOBAL_QUANTUM, GLOBAL_RAX, GLOBAL_RCX,
@@ -885,7 +885,27 @@ pub fn emit_wasm_with_prefix(
     let needed_bytes = (dispatch_hash_addr as usize)
         .checked_add(table_bytes_len)
         .ok_or_else(|| anyhow::anyhow!("Dispatch table exceeds 32-bit guest memory"))?;
-    let mem_pages = INITIAL_MEM_PAGES.max(((needed_bytes + 65535) / 65536) as u32);
+    let base_pages = if image.initial_mem_pages != 0 {
+        image.initial_mem_pages
+    } else {
+        INITIAL_MEM_PAGES
+    };
+    let max_pages = if image.max_mem_pages != 0 {
+        image.max_mem_pages
+    } else {
+        MAX_MEM_PAGES
+    };
+    let needed_pages = ((needed_bytes + 65535) / 65536) as u32;
+    let mem_pages = base_pages.max(needed_pages);
+    if mem_pages > max_pages {
+        anyhow::bail!(
+            "Guest linear memory requires {} pages ({} MiB), exceeding maximum {} pages ({} MiB)",
+            mem_pages,
+            mem_pages.div_ceil(16),
+            max_pages,
+            max_pages / 16
+        );
+    }
     let hash_mask = (table_slots - 1) as u32;
 
     // Pre-size single output buffer to avoid 512 MiB -> 1024 MiB Vec doubling
@@ -942,7 +962,7 @@ pub fn emit_wasm_with_prefix(
         let mut memories = MemorySection::new();
         memories.memory(MemoryType {
             minimum: mem_pages as u64,
-            maximum: Some(mem_pages.max(32768) as u64),
+            maximum: Some(max_pages as u64),
             memory64: false,
             shared: false,
             page_size_log2: None,
@@ -1319,6 +1339,8 @@ mod tests {
             mmap_end: crate::meta::DEFAULT_MMAP_END,
             stack_top: crate::meta::DEFAULT_STACK_TOP,
             dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
+            initial_mem_pages: INITIAL_MEM_PAGES,
+            max_mem_pages: MAX_MEM_PAGES,
         }
     }
 
@@ -1861,6 +1883,8 @@ mod tests {
             mmap_end: crate::meta::DEFAULT_MMAP_END,
             stack_top: crate::meta::DEFAULT_STACK_TOP,
             dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
+            initial_mem_pages: INITIAL_MEM_PAGES,
+            max_mem_pages: MAX_MEM_PAGES,
         };
         let prog = crate::decoder::discover_code(&image).unwrap();
         let wasm_bytes = emit_wasm(&image, &prog).unwrap();
@@ -1917,6 +1941,8 @@ mod tests {
             mmap_end: crate::meta::DEFAULT_MMAP_END,
             stack_top: crate::meta::DEFAULT_STACK_TOP,
             dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
+            initial_mem_pages: INITIAL_MEM_PAGES,
+            max_mem_pages: MAX_MEM_PAGES,
         };
         let mut prog = crate::decoder::discover_code(&image).unwrap();
         crate::decoder::split_indirect_targets(&image, &mut prog);
@@ -2068,6 +2094,8 @@ mod tests {
             mmap_end: crate::meta::DEFAULT_MMAP_END,
             stack_top: crate::meta::DEFAULT_STACK_TOP,
             dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
+            initial_mem_pages: INITIAL_MEM_PAGES,
+            max_mem_pages: MAX_MEM_PAGES,
         };
         let prog = crate::decoder::discover_code(&image).unwrap();
         let wasm_bytes = emit_wasm(&image, &prog).unwrap();
@@ -2183,6 +2211,8 @@ mod tests {
             mmap_end: crate::meta::DEFAULT_MMAP_END,
             stack_top: crate::meta::DEFAULT_STACK_TOP,
             dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
+            initial_mem_pages: INITIAL_MEM_PAGES,
+            max_mem_pages: MAX_MEM_PAGES,
         };
         let prog = crate::decoder::discover_code(&image).unwrap();
         let wasm_bytes = emit_wasm(&image, &prog).unwrap();
@@ -2342,6 +2372,8 @@ mod tests {
             mmap_end: crate::meta::DEFAULT_MMAP_END,
             stack_top: crate::meta::DEFAULT_STACK_TOP,
             dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
+            initial_mem_pages: INITIAL_MEM_PAGES,
+            max_mem_pages: MAX_MEM_PAGES,
         };
 
         let prog = crate::decoder::discover_code(&image).unwrap();
@@ -2538,6 +2570,8 @@ mod tests {
             mmap_end: crate::meta::DEFAULT_MMAP_END,
             stack_top: crate::meta::DEFAULT_STACK_TOP,
             dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
+            initial_mem_pages: INITIAL_MEM_PAGES,
+            max_mem_pages: MAX_MEM_PAGES,
         };
 
         let prog = crate::decoder::discover_code(&image).unwrap();
@@ -2699,6 +2733,8 @@ mod tests {
             mmap_end: crate::meta::DEFAULT_MMAP_END,
             stack_top: crate::meta::DEFAULT_STACK_TOP,
             dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
+            initial_mem_pages: INITIAL_MEM_PAGES,
+            max_mem_pages: MAX_MEM_PAGES,
         };
 
         let prog = crate::decoder::discover_code(&image).unwrap();
@@ -3271,5 +3307,33 @@ mod tests {
             .unwrap();
         let err = start.call(&mut store, ()).expect_err("vsyscall with 64-bit rsp must trap");
         assert!(format!("{err:?}").contains("unreachable"));
+    }
+
+    #[test]
+    fn test_compact_layout_emits_compact_memory_section() {
+        let cfg = crate::elf_loader::MemoryLayoutConfig::compact();
+        let mut image = make_synthetic_image(vec![0xC3]);
+        image.brk_start = cfg.brk_start;
+        image.mmap_start = cfg.mmap_start;
+        image.mmap_end = cfg.mmap_end;
+        image.stack_top = cfg.stack_top;
+        image.dispatch_hash_addr = cfg.dispatch_hash_addr;
+        image.initial_mem_pages = cfg.initial_mem_pages;
+        image.max_mem_pages = cfg.max_mem_pages;
+
+        let prog = discover_code(&image).unwrap();
+        let wasm = emit_wasm(&image, &prog).unwrap();
+        let engine = Engine::default();
+        let module = WasmModule::new(&engine, &wasm).unwrap();
+        let mut store = Store::new(&engine, ());
+        let inst = Instance::new(&mut store, &module, &[]).unwrap();
+        let mem = inst.get_memory(&mut store, "memory").unwrap();
+        assert_eq!(mem.size(&store), 640);
+        assert_eq!(mem.ty(&store).maximum(), Some(1024));
+
+        // Exceeding max_mem_pages must fail cleanly.
+        image.max_mem_pages = 32;
+        let err = emit_wasm(&image, &prog).expect_err("mem_pages > max_mem_pages must fail");
+        assert!(format!("{err:#}").contains("exceeding maximum"));
     }
 }

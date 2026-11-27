@@ -1970,9 +1970,6 @@ export class Elf2WasmSystem {
     if (options.delayStddevMs !== undefined || options.delaySeed !== undefined) {
       this.setDelayConfig(options.delayStddevMs ?? 0, options.delaySeed ?? 0);
     }
-    if (options.resetVirtualTime !== false) {
-      this.resetVirtualTime();
-    }
     if (options.uid !== undefined || options.gid !== undefined) {
       this.setUidGid(options.uid ?? 0, options.gid ?? 0);
     }
@@ -1989,6 +1986,9 @@ export class Elf2WasmSystem {
     // Apply initial cwd AFTER _initGuestStack (reset_for_new_run() resets cwd to "/")
     if (options.cwd) {
       this._applyInitialCwd(options.cwd);
+    }
+    if (options.resetVirtualTime !== false) {
+      this.resetVirtualTime();
     }
 
     // Pre-seed stdin after _initGuestStack

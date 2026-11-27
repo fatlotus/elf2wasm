@@ -1286,6 +1286,8 @@ mod tests {
             mmap_end: crate::meta::DEFAULT_MMAP_END,
             stack_top: crate::meta::DEFAULT_STACK_TOP,
             dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
+            initial_mem_pages: crate::elf_loader::INITIAL_MEM_PAGES,
+            max_mem_pages: crate::elf_loader::MAX_MEM_PAGES,
         };
         let prog = discover_code(&image)?;
         verify_program_invariants(&prog, &image);
@@ -1337,6 +1339,8 @@ mod tests {
             mmap_end: crate::meta::DEFAULT_MMAP_END,
             stack_top: crate::meta::DEFAULT_STACK_TOP,
             dispatch_hash_addr: crate::meta::DEFAULT_DISPATCH_HASH_ADDR,
+            initial_mem_pages: crate::elf_loader::INITIAL_MEM_PAGES,
+            max_mem_pages: crate::elf_loader::MAX_MEM_PAGES,
         }
     }
 

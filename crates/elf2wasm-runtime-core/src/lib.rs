@@ -2446,4 +2446,59 @@ mod tests {
         popped.sort();
         assert_eq!(popped, (2001..=2008).collect::<Vec<_>>());
     }
+
+    #[test]
+    fn test_compact_meta_layout_stack_brk_mmap_and_scratch() {
+        let cfg = elf2wasm_core::elf_loader::MemoryLayoutConfig::compact();
+        let meta = elf2wasm_core::meta::WasmMeta {
+            entry_rip: 0x0010_1000,
+            at_phdr: 0x0010_0040,
+            at_phent: 56,
+            at_phnum: 1,
+            at_entry: 0x0010_1000,
+            at_base: 0,
+            elf_path: "/bin/test".to_string(),
+            so_files: Vec::new(),
+            max_code_addr: 0x0010_2000,
+            symbols: Vec::new(),
+            brk_start: cfg.brk_start,
+            mmap_start: cfg.mmap_start,
+            mmap_end: cfg.mmap_end,
+            stack_top: cfg.stack_top,
+            dispatch_hash_addr: cfg.dispatch_hash_addr,
+        };
+        let mut ctx = MockCtx::new((cfg.initial_mem_pages as usize) * 65536);
+        let mut state = HostState::new(VirtualFs::new_in_memory(&[]));
+        state.reset_for_new_run();
+        state.apply_meta_layout(&meta);
+
+        assert_eq!(state.brk_start, 0x0140_0000);
+        assert_eq!(state.mmap_start, 0x01A0_0000);
+        assert_eq!(state.mmap_end, 0x0220_0000);
+        assert_eq!(state.scheduler.scratch_addr, 0x021F_F000);
+
+        let rsp = crate::stack::setup_guest_stack_ctx(
+            &mut ctx,
+            &meta,
+            &["/bin/test".to_string()],
+            &["PATH=/bin".to_string()],
+        )
+        .unwrap();
+        assert!(rsp >= meta.mmap_end && rsp < meta.stack_top);
+
+        // SYS_brk (12): query & extend within [0x0140_0000 .. 0x01A0_0000)
+        let cur_brk = handle_syscall(&mut ctx, &mut state, 12, 0, 0, 0, 0, 0, 0);
+        assert_eq!(cur_brk as u32, 0x0140_0000);
+        let new_brk = handle_syscall(&mut ctx, &mut state, 12, 0x0141_0000, 0, 0, 0, 0, 0);
+        assert_eq!(new_brk as u32, 0x0141_0000);
+
+        // SYS_mmap (9): anonymous mapping inside [0x01A0_0000 .. 0x021F_F000)
+        let addr = handle_syscall(&mut ctx, &mut state, 9, 0, 0x10000, 3, 0x22, -1, 0);
+        assert!(addr >= 0x01A0_0000 && addr < 0x021F_F000);
+        // SYS_munmap (11)
+        assert_eq!(
+            handle_syscall(&mut ctx, &mut state, 11, addr, 0x10000, 0, 0, 0, 0),
+            0
+        );
+    }
 }
