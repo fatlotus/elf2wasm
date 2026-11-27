@@ -18,7 +18,7 @@ export async function getEffectiveColors(browser, selector) {
       const color = cs.color;
       let bg = cs.backgroundColor;
       let cur = el;
-      const isTransparent = (c) => !c || c === "transparent" || /^rgba\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)$/.test(c);
+      const isTransparent = (c) => !c || c === "transparent" || /^rgba\\(\\s*\\d+\\s*,\\s*\\d+\\s*,\\s*\\d+\\s*,\\s*0(?:\\.0+)?\\s*\\)$/.test(c) || /^color\\([^)]*\\/\\s*0(?:\\.0+)?\\s*\\)$/.test(c);
       while (cur && isTransparent(bg)) {
         cur = cur.parentElement;
         if (cur) bg = window.getComputedStyle(cur).backgroundColor;
@@ -356,7 +356,7 @@ export async function inspectLayerControls(browser) {
       );
       const downloadButtons = Array.from(document.querySelectorAll("button, a")).filter((el) => {
         const hay = [el.textContent || "", el.getAttribute("aria-label") || "", el.getAttribute("title") || "", el.dataset?.action || ""].join(" ");
-        return /download|tar\.gz|export/i.test(hay);
+        return /download|tar\\.gz|export/i.test(hay);
       });
       return {
         layerCardCount: layerCards.length,

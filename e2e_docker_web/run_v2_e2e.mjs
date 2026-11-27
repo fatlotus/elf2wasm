@@ -26,6 +26,7 @@ import {
   postEvalJson,
   postEvalTarGz,
 } from "./helpers/eval_client.mjs";
+import { getEffectiveColors } from "./helpers/v2_ui_helpers.mjs";
 
 function printHelp() {
   console.log(`Usage: node e2e_docker_web/run_v2_e2e.mjs [options]
@@ -218,6 +219,7 @@ async function runV2SelfTest(opts = {}) {
 </style>
 </head>
 <body>
+  <div id="transparent-child" style="background: transparent; color: #111111;">hi</div>
   <button id="dl-btn" type="button">Download</button>
   <script>
     document.getElementById("dl-btn").addEventListener("click", () => {
@@ -269,6 +271,17 @@ async function runV2SelfTest(opts = {}) {
       const lightStyles = await browser.getComputedStyles("body", ["backgroundColor", "color"]);
       assert.ok(relativeLuminance(lightStyles.backgroundColor) > 0.9, `Light bg expected, got ${lightStyles.backgroundColor}`);
       assert.ok(contrastRatio(lightStyles.backgroundColor, lightStyles.color) >= 10);
+
+      // Verify getEffectiveColors walks up from transparent child to opaque Light body background
+      const transparentChildColors = await getEffectiveColors(browser, "#transparent-child");
+      assert.ok(
+        transparentChildColors && transparentChildColors.bgLuminance > 0.9,
+        `Expected transparent child to inherit Light body bg (L > 0.9), got ${JSON.stringify(transparentChildColors)}`
+      );
+      assert.ok(
+        transparentChildColors.contrast >= 10,
+        `Expected transparent child contrast >= 10, got ${transparentChildColors.contrast}`
+      );
 
       // Flip to Dark scheme dynamically
       await browser.setColorScheme("dark");

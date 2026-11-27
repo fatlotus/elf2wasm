@@ -448,6 +448,7 @@ export async function launchCdpBrowser(opts = {}) {
     // Download tracking state
     let activeDownloadDir = null;
     const downloadMetaByGuid = new Map();
+    const completedGuids = new Set();
     const completedDownloads = [];
     const downloadWaiters = [];
     let downloadListenersInstalled = false;
@@ -489,6 +490,8 @@ export async function launchCdpBrowser(opts = {}) {
     function handleDownloadProgress(params) {
       const guid = params.guid || "";
       if (params.state === "completed") {
+        if (guid && completedGuids.has(guid)) return;
+        if (guid) completedGuids.add(guid);
         const meta = downloadMetaByGuid.get(guid) || { guid, suggestedFilename: "" };
         const dir = activeDownloadDir;
         let filePath = dir ? resolveDownloadFile(dir, guid, meta.suggestedFilename) : null;
@@ -526,6 +529,7 @@ export async function launchCdpBrowser(opts = {}) {
         fs.mkdirSync(dir, { recursive: true });
       }
       activeDownloadDir = dir;
+      completedGuids.clear();
       completedDownloads.length = 0;
 
       if (!downloadListenersInstalled) {
