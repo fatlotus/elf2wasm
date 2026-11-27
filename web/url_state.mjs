@@ -3,6 +3,13 @@
  * elf2wasm Web UI deep-linking.
  */
 
+import {
+  DEFAULT_MOUNT_PATH,
+  parseDockerfile,
+  serializeDockerfile,
+  expandSweepValues,
+} from "./dockerfile.mjs";
+
 export const DEFAULT_UI_STATE = Object.freeze({
   image: "alpine:latest",
   build: "",
@@ -25,8 +32,17 @@ export const MAX_STDDEV_MS = 3_600_000;
 export const MAX_SEED = Number.MAX_SAFE_INTEGER;
 export const MAX_SWEEP_RUNS = 1000;
 
+export const VALID_EXECUTOR_MODES = Object.freeze(["local", "remote", "mixed"]);
+export const VALID_THEMES = Object.freeze(["system", "light", "dark"]);
+
+const DEFAULT_DOCKERFILE = "FROM alpine:latest";
+
 const MANAGED_QUERY_KEYS = Object.freeze([
   "preset",
+  "dockerfile",
+  "executor",
+  "theme",
+  "selectedSweepRun",
   "image",
   "build",
   "cmd",
@@ -44,6 +60,9 @@ const MANAGED_QUERY_KEYS = Object.freeze([
   "runs",
   "stddevStart",
   "stddevStep",
+  "sweepStart",
+  "sweepStep",
+  "sweepCount",
   "selectedRun",
 ]);
 
@@ -94,7 +113,7 @@ function parseBoolFlag(raw) {
 }
 
 function parseSelectedRun(raw, runs) {
-  if (raw === null || raw === undefined) return null;
+  if (raw === null || raw === undefined || runs < 1) return null;
   if (typeof raw === "number") {
     if (!Number.isFinite(raw)) return null;
     const idx = Math.floor(raw);
@@ -106,6 +125,220 @@ function parseSelectedRun(raw, runs) {
   if (!Number.isFinite(n)) return null;
   const idx = Math.floor(n);
   return idx >= 1 && idx <= runs ? idx : null;
+}
+
+function normalizeTheme(raw) {
+  const v = cleanSingleLine(raw).toLowerCase();
+  return VALID_THEMES.includes(v) ? v : "system";
+}
+
+function normalizeExecutorMode(raw, fallback = null) {
+  const v = cleanSingleLine(raw).toLowerCase();
+  if (VALID_EXECUTOR_MODES.includes(v)) return v;
+  return fallback;
+}
+
+/**
+ * Infer overall executor mode (`"local" | "remote" | "mixed"`) from a `Layer[]` stack.
+ *
+ * @param {object[]} layers
+ * @returns {"local"|"remote"|"mixed"}
+ */
+export function inferExecutorMode(layers) {
+  if (!Array.isArray(layers) || layers.length === 0) return "local";
+  let hasLocal = false;
+  let hasRemote = false;
+  for (const layer of layers) {
+    if (!layer || typeof layer !== "object") continue;
+    if (layer.type !== "from" && layer.type !== "git" && layer.type !== "run") continue;
+    if (layer.executor === "remote") hasRemote = true;
+    else hasLocal = true;
+  }
+  if (hasLocal && hasRemote) return "mixed";
+  if (hasRemote) return "remote";
+  return "local";
+}
+
+/**
+ * Convert a legacy flat UI state object into an ordered `Layer[]` stack.
+ *
+ * @param {object} state
+ * @returns {object[]}
+ */
+export function legacyStateToLayers(state) {
+  const s = state && typeof state === "object" ? state : DEFAULT_UI_STATE;
+  const layers = [];
+  let nextNum = 1;
+  const makeId = () => `layer-${nextNum++}`;
+
+  const image = cleanSingleLine(s.image) || DEFAULT_UI_STATE.image;
+  layers.push({ id: makeId(), type: "from", image, executor: "local" });
+
+  const repo = cleanSingleLine(s.repo);
+  if (repo) {
+    const ref = cleanSingleLine(s.ref);
+    const mountPath = cleanSingleLine(s.mount ?? s.mountPath) || DEFAULT_MOUNT_PATH;
+    layers.push({
+      id: makeId(),
+      type: "git",
+      repo,
+      ...(ref ? { ref } : {}),
+      mountPath,
+      executor: "local",
+    });
+  }
+
+  const cwd = cleanSingleLine(s.cwd);
+  if (cwd) {
+    layers.push({ id: makeId(), type: "workdir", path: cwd });
+  }
+
+  const envLines = normalizeEnvList(s.env);
+  for (const line of envLines) {
+    const eq = line.indexOf("=");
+    if (eq > 0) {
+      layers.push({
+        id: makeId(),
+        type: "env",
+        key: line.slice(0, eq),
+        value: line.slice(eq + 1),
+      });
+    }
+  }
+
+  const build = cleanSingleLine(s.build);
+  if (build) {
+    layers.push({ id: makeId(), type: "run", cmd: build, executor: "local" });
+  }
+
+  if (parseBoolFlag(s.sweep)) {
+    const count = parseNonNegInt(s.runs, DEFAULT_UI_STATE.runs, { min: 1, max: MAX_SWEEP_RUNS });
+    const start = parseNonNegNumber(s.stddevStart, DEFAULT_UI_STATE.stddevStart);
+    const step = parseNonNegNumber(s.stddevStep, DEFAULT_UI_STATE.stddevStep);
+    layers.push({
+      id: makeId(),
+      type: "sweep",
+      param: "delay",
+      mode: "range",
+      start,
+      step,
+      count,
+    });
+  }
+
+  const cmd = cleanSingleLine(s.cmd);
+  if (cmd) {
+    layers.push({ id: makeId(), type: "run", cmd, executor: "local" });
+  }
+
+  return layers;
+}
+
+/**
+ * Best-effort projection of a `Layer[]` stack back into legacy flat UI state fields.
+ *
+ * @param {object[]} layers
+ * @returns {object}
+ */
+function projectLayersToLegacyState(layers) {
+  const state = {
+    image: DEFAULT_UI_STATE.image,
+    build: DEFAULT_UI_STATE.build,
+    cmd: DEFAULT_UI_STATE.cmd,
+    repo: DEFAULT_UI_STATE.repo,
+    ref: DEFAULT_UI_STATE.ref,
+    mount: DEFAULT_UI_STATE.mount,
+    cwd: DEFAULT_UI_STATE.cwd,
+    env: [],
+    stddev: DEFAULT_UI_STATE.stddev,
+    seed: DEFAULT_UI_STATE.seed,
+    sweep: DEFAULT_UI_STATE.sweep,
+    runs: DEFAULT_UI_STATE.runs,
+    stddevStart: DEFAULT_UI_STATE.stddevStart,
+    stddevStep: DEFAULT_UI_STATE.stddevStep,
+    selectedRun: DEFAULT_UI_STATE.selectedRun,
+  };
+
+  if (!Array.isArray(layers) || layers.length === 0) return state;
+
+  let sawFrom = false;
+  let sawGit = false;
+  let sawWorkdir = false;
+  let sawSweep = false;
+  const runsBeforeSweep = [];
+  const runsAfterSweep = [];
+
+  for (const layer of layers) {
+    if (!layer || typeof layer !== "object") continue;
+    switch (layer.type) {
+      case "from":
+        if (!sawFrom && layer.image) {
+          state.image = cleanSingleLine(layer.image) || DEFAULT_UI_STATE.image;
+          sawFrom = true;
+        }
+        break;
+      case "git":
+        if (!sawGit && layer.repo) {
+          state.repo = cleanSingleLine(layer.repo);
+          state.ref = cleanSingleLine(layer.ref);
+          state.mount = cleanSingleLine(layer.mountPath) || DEFAULT_UI_STATE.mount;
+          sawGit = true;
+        }
+        break;
+      case "workdir":
+        if (!sawWorkdir && layer.path) {
+          state.cwd = cleanSingleLine(layer.path);
+          sawWorkdir = true;
+        }
+        break;
+      case "env":
+        if (layer.key) {
+          state.env.push(`${layer.key}=${layer.value ?? ""}`);
+        }
+        break;
+      case "sweep":
+        if (!sawSweep) {
+          sawSweep = true;
+          state.sweep = true;
+          const expanded = expandSweepValues(layer);
+          if (layer.mode === "range") {
+            state.runs = parseNonNegInt(layer.count, DEFAULT_UI_STATE.runs, {
+              min: 1,
+              max: MAX_SWEEP_RUNS,
+            });
+            if (layer.param === "delay") {
+              state.stddevStart = parseNonNegNumber(layer.start, DEFAULT_UI_STATE.stddevStart);
+              state.stddevStep = parseNonNegNumber(layer.step, DEFAULT_UI_STATE.stddevStep);
+            }
+          } else if (expanded.length > 0) {
+            state.runs = Math.min(MAX_SWEEP_RUNS, expanded.length);
+          }
+        }
+        break;
+      case "run":
+        if (layer.cmd) {
+          if (sawSweep) runsAfterSweep.push(layer.cmd);
+          else runsBeforeSweep.push(layer.cmd);
+        }
+        break;
+    }
+  }
+
+  if (sawSweep) {
+    if (runsBeforeSweep.length > 0) {
+      state.build = runsBeforeSweep.join(" && ");
+    }
+    if (runsAfterSweep.length > 0) {
+      state.cmd = runsAfterSweep[runsAfterSweep.length - 1];
+    }
+  } else if (runsBeforeSweep.length === 1) {
+    state.cmd = runsBeforeSweep[0];
+  } else if (runsBeforeSweep.length > 1) {
+    state.build = runsBeforeSweep.slice(0, -1).join(" && ");
+    state.cmd = runsBeforeSweep[runsBeforeSweep.length - 1];
+  }
+
+  return state;
 }
 
 /**
@@ -158,10 +391,23 @@ function normalizeProjectFields(raw) {
   };
 }
 
+function canonicalDockerfileFromSource(src) {
+  if (!src || typeof src !== "object") return null;
+  if (Array.isArray(src.layers)) {
+    return serializeDockerfile(parseDockerfile(serializeDockerfile(src.layers)).layers);
+  }
+  if (typeof src.dockerfile === "string") {
+    return serializeDockerfile(parseDockerfile(src.dockerfile).layers);
+  }
+  return null;
+}
+
 /**
- * Return the preset ID whose project fields exactly match `state`, or `null` if none match.
- * Delay and sweep execution parameters are intentionally excluded from preset matching so
- * toggling Sweep Mode or setting delay/seed keeps the active project preset highlighted.
+ * Return the preset ID whose project fields (or canonical Dockerfile) exactly
+ * match `state`, or `null` if none match.
+ * Delay and sweep execution parameters are intentionally excluded from legacy
+ * preset matching so toggling Sweep Mode or setting delay/seed keeps the active
+ * project preset highlighted.
  *
  * @param {object} state
  * @param {Record<string, object> | null | undefined} presets
@@ -171,9 +417,21 @@ export function matchProjectPreset(state, presets) {
   if (!presets || typeof presets !== "object") {
     return null;
   }
+  const stateCanonicalDf = canonicalDockerfileFromSource(state);
   const normalized = normalizeProjectFields(state);
+
   for (const [id, preset] of Object.entries(presets)) {
     if (!preset || typeof preset !== "object") continue;
+
+    const presetCanonicalDf = canonicalDockerfileFromSource(preset);
+    if (presetCanonicalDf !== null) {
+      const targetDf = stateCanonicalDf ?? serializeDockerfile(legacyStateToLayers(state));
+      if (targetDf === presetCanonicalDf) {
+        return id;
+      }
+      continue;
+    }
+
     const p = normalizeProjectFields(preset);
     if (
       normalized.image !== p.image ||
@@ -202,15 +460,53 @@ export function matchProjectPreset(state, presets) {
 }
 
 /**
- * Parse a URL query string (`location.search`) into normalized UI state and
- * optional active preset ID.
+ * Parse a URL query string (`location.search`) into normalized UI state,
+ * optional active preset ID, and Dockerfile layer stack metadata.
  *
  * @param {string} search
  * @param {Record<string, object> | null} [presets]
- * @returns {{ state: object, activePresetId: string | null }}
+ * @returns {{ state: object, activePresetId: string | null, layers: object[], dockerfile: string, executorMode: "local"|"remote"|"mixed", theme: "system"|"light"|"dark", selectedSweepRun: number | null }}
  */
 export function parseStateFromSearch(search, presets = null) {
   const params = new URLSearchParams(typeof search === "string" ? search : "");
+  const theme = normalizeTheme(params.get("theme"));
+
+  // Dockerfile-mode URL hydration
+  if (params.has("dockerfile")) {
+    const rawDf = params.get("dockerfile") ?? "";
+    const { layers } = parseDockerfile(rawDf);
+    const dockerfile = serializeDockerfile(layers);
+    const inferredExecutor = inferExecutorMode(layers);
+    const executorMode = normalizeExecutorMode(params.get("executor"), inferredExecutor);
+    const state = projectLayersToLegacyState(layers);
+
+    const sweepLayer = layers.find((l) => l.type === "sweep") || null;
+    const sweepCount = sweepLayer ? expandSweepValues(sweepLayer).length : 0;
+    const rawSelected =
+      params.get("selectedSweepRun") ??
+      params.get("selectedRun") ??
+      (params.has("run") && /^\d+$/.test(cleanSingleLine(params.get("run")))
+        ? params.get("run")
+        : null);
+    const selectedSweepRun = sweepLayer ? parseSelectedRun(rawSelected, sweepCount) : null;
+    state.selectedRun = selectedSweepRun;
+
+    const activePresetId =
+      matchProjectPreset({ layers, dockerfile, ...state }, presets) ??
+      matchProjectPreset(state, presets);
+
+    return {
+      state,
+      activePresetId,
+      layers,
+      dockerfile,
+      executorMode,
+      theme,
+      selectedSweepRun,
+    };
+  }
+
+  // Legacy flat query-parameter hydration (with optional dockerfile-based preset)
   const state = {
     image: DEFAULT_UI_STATE.image,
     build: DEFAULT_UI_STATE.build,
@@ -229,50 +525,68 @@ export function parseStateFromSearch(search, presets = null) {
     selectedRun: DEFAULT_UI_STATE.selectedRun,
   };
 
+  let presetLayers = null;
   if (params.has("preset") && presets && typeof presets === "object") {
     const presetId = cleanSingleLine(params.get("preset"));
     if (presetId && Object.prototype.hasOwnProperty.call(presets, presetId)) {
       const preset = presets[presetId];
       if (preset && typeof preset === "object") {
-        const normalizedPreset = normalizeProjectFields(preset);
-        state.image = normalizedPreset.image;
-        state.build = normalizedPreset.build;
-        state.cmd = normalizedPreset.cmd;
-        state.repo = normalizedPreset.repo;
-        state.ref = normalizedPreset.ref;
-        state.mount = normalizedPreset.mount;
-        state.cwd = normalizedPreset.cwd;
-        state.env = normalizedPreset.env;
+        const presetDf = canonicalDockerfileFromSource(preset);
+        if (presetDf !== null) {
+          presetLayers = parseDockerfile(presetDf).layers;
+          Object.assign(state, projectLayersToLegacyState(presetLayers));
+        } else {
+          const normalizedPreset = normalizeProjectFields(preset);
+          state.image = normalizedPreset.image;
+          state.build = normalizedPreset.build;
+          state.cmd = normalizedPreset.cmd;
+          state.repo = normalizedPreset.repo;
+          state.ref = normalizedPreset.ref;
+          state.mount = normalizedPreset.mount;
+          state.cwd = normalizedPreset.cwd;
+          state.env = normalizedPreset.env;
+        }
       }
     }
   }
 
+  let hasLegacyFieldOverride = false;
   if (params.has("image")) {
     state.image = cleanSingleLine(params.get("image")) || DEFAULT_UI_STATE.image;
+    hasLegacyFieldOverride = true;
   }
   if (params.has("build")) {
     state.build = cleanSingleLine(params.get("build"));
+    hasLegacyFieldOverride = true;
   }
   if (params.has("cmd")) {
     state.cmd = cleanSingleLine(params.get("cmd"));
+    hasLegacyFieldOverride = true;
   } else if (params.has("run")) {
     state.cmd = cleanSingleLine(params.get("run"));
+    hasLegacyFieldOverride = true;
   }
   if (params.has("repo")) {
     state.repo = cleanSingleLine(params.get("repo"));
+    hasLegacyFieldOverride = true;
   }
   if (params.has("ref")) {
     state.ref = cleanSingleLine(params.get("ref"));
+    hasLegacyFieldOverride = true;
   } else if (params.has("repoRef")) {
     state.ref = cleanSingleLine(params.get("repoRef"));
+    hasLegacyFieldOverride = true;
   }
   if (params.has("mount")) {
     state.mount = cleanSingleLine(params.get("mount")) || DEFAULT_UI_STATE.mount;
+    hasLegacyFieldOverride = true;
   } else if (params.has("repoMount")) {
     state.mount = cleanSingleLine(params.get("repoMount")) || DEFAULT_UI_STATE.mount;
+    hasLegacyFieldOverride = true;
   }
   if (params.has("cwd")) {
     state.cwd = cleanSingleLine(params.get("cwd"));
+    hasLegacyFieldOverride = true;
   }
   if (params.has("env")) {
     const envLines = [];
@@ -282,6 +596,7 @@ export function parseStateFromSearch(search, presets = null) {
       }
     }
     state.env = envLines;
+    hasLegacyFieldOverride = true;
   }
 
   if (params.has("stddev")) {
@@ -298,10 +613,20 @@ export function parseStateFromSearch(search, presets = null) {
       min: 1,
       max: MAX_SWEEP_RUNS,
     });
+  } else if (params.has("sweepCount")) {
+    state.runs = parseNonNegInt(params.get("sweepCount"), DEFAULT_UI_STATE.runs, {
+      min: 1,
+      max: MAX_SWEEP_RUNS,
+    });
   }
   if (params.has("stddevStart")) {
     state.stddevStart = parseNonNegNumber(
       params.get("stddevStart"),
+      DEFAULT_UI_STATE.stddevStart
+    );
+  } else if (params.has("sweepStart")) {
+    state.stddevStart = parseNonNegNumber(
+      params.get("sweepStart"),
       DEFAULT_UI_STATE.stddevStart
     );
   }
@@ -310,20 +635,47 @@ export function parseStateFromSearch(search, presets = null) {
       params.get("stddevStep"),
       DEFAULT_UI_STATE.stddevStep
     );
+  } else if (params.has("sweepStep")) {
+    state.stddevStep = parseNonNegNumber(
+      params.get("sweepStep"),
+      DEFAULT_UI_STATE.stddevStep
+    );
   }
-  if (state.sweep && params.has("selectedRun")) {
-    state.selectedRun = parseSelectedRun(params.get("selectedRun"), state.runs);
+  if (state.sweep && (params.has("selectedRun") || params.has("selectedSweepRun"))) {
+    state.selectedRun = parseSelectedRun(
+      params.get("selectedRun") ?? params.get("selectedSweepRun"),
+      state.runs
+    );
   } else {
     state.selectedRun = null;
   }
 
-  const activePresetId = matchProjectPreset(state, presets);
-  return { state, activePresetId };
+  const layers =
+    presetLayers && !hasLegacyFieldOverride ? presetLayers : legacyStateToLayers(state);
+  const dockerfile = serializeDockerfile(layers);
+  const executorMode = normalizeExecutorMode(params.get("executor"), inferExecutorMode(layers));
+  const selectedSweepRun = state.selectedRun;
+
+  const activePresetId =
+    presetLayers && !hasLegacyFieldOverride
+      ? matchProjectPreset({ layers, dockerfile, ...state }, presets)
+      : matchProjectPreset(state, presets);
+
+  return {
+    state,
+    activePresetId,
+    layers,
+    dockerfile,
+    executorMode,
+    theme,
+    selectedSweepRun,
+  };
 }
 
 /**
- * Serialize UI state into a canonical `?query` string (or `""` if all values
- * are defaults and no unmanaged query parameters remain).
+ * Serialize UI state (either Dockerfile/Layer[] mode or legacy flat state) into
+ * a canonical `?query` string (or `""` if all values are defaults and no
+ * unmanaged query parameters remain).
  *
  * @param {object} state
  * @param {{ existingSearch?: string }} [options]
@@ -335,6 +687,44 @@ export function serializeStateToSearch(state, { existingSearch = "" } = {}) {
     params.delete(key);
   }
 
+  const theme = normalizeTheme(state?.theme);
+
+  // Dockerfile / Layer[] mode
+  if (Array.isArray(state?.layers) || typeof state?.dockerfile === "string") {
+    const rawDf = Array.isArray(state.layers)
+      ? serializeDockerfile(state.layers)
+      : String(state.dockerfile ?? "");
+    const { layers } = parseDockerfile(rawDf);
+    const canonicalDf = serializeDockerfile(layers);
+
+    if (canonicalDf && canonicalDf !== DEFAULT_DOCKERFILE) {
+      params.append("dockerfile", canonicalDf);
+    }
+
+    const explicitExec = normalizeExecutorMode(state?.executorMode ?? state?.executor, null);
+    const effectiveExec = explicitExec ?? inferExecutorMode(layers);
+    if (effectiveExec === "remote" || effectiveExec === "mixed") {
+      params.append("executor", effectiveExec);
+    }
+
+    if (theme === "light" || theme === "dark") {
+      params.append("theme", theme);
+    }
+
+    const sweepLayer = layers.find((l) => l.type === "sweep") || null;
+    if (sweepLayer) {
+      const count = expandSweepValues(sweepLayer).length;
+      const sel = parseSelectedRun(state?.selectedSweepRun ?? state?.selectedRun, count);
+      if (sel !== null) {
+        params.append("selectedRun", String(sel));
+      }
+    }
+
+    const serialized = params.toString();
+    return serialized ? `?${serialized}` : "";
+  }
+
+  // Legacy flat state mode
   const image = cleanSingleLine(state?.image);
   const build = cleanSingleLine(state?.build);
   const cmd = cleanSingleLine(state?.cmd);
@@ -399,6 +789,14 @@ export function serializeStateToSearch(state, { existingSearch = "" } = {}) {
     if (selectedRun !== null) {
       params.append("selectedRun", String(selectedRun));
     }
+  }
+
+  const legacyExec = normalizeExecutorMode(state?.executorMode ?? state?.executor, null);
+  if (legacyExec === "remote" || legacyExec === "mixed") {
+    params.append("executor", legacyExec);
+  }
+  if (theme === "light" || theme === "dark") {
+    params.append("theme", theme);
   }
 
   const serialized = params.toString();
@@ -474,3 +872,4 @@ export function buildRunSearch(state, runParams = {}, options = {}) {
   params.set("seed", String(seed));
   return `?${params.toString()}`;
 }
+

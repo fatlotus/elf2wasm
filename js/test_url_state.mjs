@@ -6,6 +6,10 @@ import {
   MAX_STDDEV_MS,
   MAX_SEED,
   MAX_SWEEP_RUNS,
+  VALID_EXECUTOR_MODES,
+  VALID_THEMES,
+  legacyStateToLayers,
+  inferExecutorMode,
   parseEnvLines,
   matchProjectPreset,
   parseStateFromSearch,
@@ -602,3 +606,157 @@ describe("web/url_state.mjs: Contract 13 build/run split, delay injection & swee
     });
   });
 });
+
+describe("web/url_state.mjs: M4 Dockerfile layer stack, executorMode, theme & selectedSweepRun", () => {
+  it("exports VALID_EXECUTOR_MODES, VALID_THEMES, inferExecutorMode, and legacyStateToLayers", () => {
+    assert.deepEqual(VALID_EXECUTOR_MODES, ["local", "remote", "mixed"]);
+    assert.deepEqual(VALID_THEMES, ["system", "light", "dark"]);
+
+    assert.equal(inferExecutorMode([]), "local");
+    assert.equal(
+      inferExecutorMode([
+        { type: "from", image: "alpine:latest", executor: "local" },
+        { type: "run", cmd: "echo hi", executor: "local" },
+      ]),
+      "local"
+    );
+    assert.equal(
+      inferExecutorMode([
+        { type: "from", image: "alpine:latest", executor: "remote" },
+        { type: "run", cmd: "echo hi", executor: "remote" },
+      ]),
+      "remote"
+    );
+    assert.equal(
+      inferExecutorMode([
+        { type: "from", image: "alpine:latest", executor: "local" },
+        { type: "run", cmd: "echo hi", executor: "remote" },
+      ]),
+      "mixed"
+    );
+
+    const layers = legacyStateToLayers({
+      ...DEFAULT_UI_STATE,
+      image: "python:3.12-slim",
+      repo: "pallets/flask",
+      ref: "3.1.0",
+      mount: "/workspace",
+      cwd: "/workspace",
+      env: ["PYTHONUNBUFFERED=1"],
+      build: "pip --version",
+      sweep: true,
+      runs: 5,
+      stddevStart: 0.5,
+      stddevStep: 0.5,
+      cmd: "pytest",
+    });
+    assert.equal(layers.length, 7);
+    assert.equal(layers[0].type, "from");
+    assert.equal(layers[1].type, "git");
+    assert.equal(layers[2].type, "workdir");
+    assert.equal(layers[3].type, "env");
+    assert.equal(layers[4].type, "run");
+    assert.equal(layers[4].cmd, "pip --version");
+    assert.equal(layers[5].type, "sweep");
+    assert.equal(layers[5].count, 5);
+    assert.equal(layers[6].type, "run");
+    assert.equal(layers[6].cmd, "pytest");
+  });
+
+  it("round-trips Dockerfile layer stack, executorMode, theme, selectedSweepRun, and preserves unmanaged params", () => {
+    const layers = [
+      { id: "layer-1", type: "from", image: "node:22-slim", executor: "local" },
+      { id: "layer-2", type: "git", repo: "expressjs/express", ref: "5.0.0", mountPath: "/workspace", executor: "local" },
+      { id: "layer-3", type: "workdir", path: "/workspace" },
+      { id: "layer-4", type: "env", key: "NODE_ENV", value: "test" },
+      { id: "layer-5", type: "sweep", param: "env", envKey: "MODE", mode: "list", values: ["a", "b", "c"] },
+      { id: "layer-6", type: "run", cmd: "node -e 'console.log(process.env.MODE)'", executor: "remote" },
+    ];
+
+    const search = serializeStateToSearch(
+      {
+        layers,
+        theme: "dark",
+        selectedSweepRun: 2,
+      },
+      { existingSearch: "?utm_source=share&image=stale&sweep=1&runs=99" }
+    );
+
+    const params = new URLSearchParams(search);
+    assert.equal(params.get("utm_source"), "share");
+    assert.equal(params.has("image"), false);
+    assert.equal(params.has("sweep"), false);
+    assert.equal(params.has("runs"), false);
+    assert.ok(params.has("dockerfile"));
+    assert.equal(params.get("executor"), "mixed");
+    assert.equal(params.get("theme"), "dark");
+    assert.equal(params.get("selectedRun"), "2");
+
+    const parsed = parseStateFromSearch(search);
+    assert.deepEqual(parsed.layers, layers);
+    assert.equal(parsed.executorMode, "mixed");
+    assert.equal(parsed.theme, "dark");
+    assert.equal(parsed.selectedSweepRun, 2);
+    assert.equal(parsed.state.image, "node:22-slim");
+    assert.equal(parsed.state.repo, "expressjs/express");
+    assert.equal(parsed.state.sweep, true);
+    assert.equal(parsed.state.selectedRun, 2);
+  });
+
+  it("omits default single local FROM alpine:latest, system theme, and local executor", () => {
+    assert.equal(
+      serializeStateToSearch({
+        layers: [{ id: "layer-1", type: "from", image: "alpine:latest", executor: "local" }],
+        executorMode: "local",
+        theme: "system",
+      }),
+      ""
+    );
+    assert.equal(
+      serializeStateToSearch({
+        dockerfile: "FROM alpine:latest",
+        theme: "light",
+      }),
+      "?theme=light"
+    );
+  });
+
+  it("migrates legacy flat URLs (including sweepStart/sweepStep/sweepCount aliases) into layers and dockerfile", () => {
+    const res = parseStateFromSearch(
+      "?image=alpine:3.20&build=echo+build&cmd=echo+run&sweep=1&sweepStart=2&sweepStep=3&sweepCount=4&selectedSweepRun=3&theme=light&executor=remote"
+    );
+    assert.equal(res.state.runs, 4);
+    assert.equal(res.state.stddevStart, 2);
+    assert.equal(res.state.stddevStep, 3);
+    assert.equal(res.state.selectedRun, 3);
+    assert.equal(res.selectedSweepRun, 3);
+    assert.equal(res.theme, "light");
+    assert.equal(res.executorMode, "remote");
+    assert.equal(res.layers.length, 4);
+    assert.equal(res.layers[0].image, "alpine:3.20");
+    assert.equal(res.layers[2].type, "sweep");
+    assert.equal(res.layers[2].start, 2);
+    assert.equal(res.layers[2].step, 3);
+    assert.equal(res.layers[2].count, 4);
+    assert.match(res.dockerfile, /FROM alpine:3\.20/);
+    assert.match(res.dockerfile, /# elf2wasm:sweep param=delay mode=range start=2 step=3 count=4/);
+  });
+
+  it("matches Dockerfile-based presets via canonical serialization", () => {
+    const dfPresets = {
+      express: {
+        dockerfile: "FROM node:22-slim\nRUN git clone https://github.com/expressjs/express.git\nWORKDIR /workspace\nRUN node -v",
+      },
+    };
+    const parsed = parseStateFromSearch("?preset=express", dfPresets);
+    assert.equal(parsed.activePresetId, "express");
+    assert.equal(parsed.layers.length, 4);
+    assert.equal(parsed.state.image, "node:22-slim");
+    assert.equal(parsed.state.repo, "expressjs/express");
+
+    const serialized = serializeStateToSearch({ layers: parsed.layers });
+    const reparsed = parseStateFromSearch(serialized, dfPresets);
+    assert.equal(reparsed.activePresetId, "express");
+  });
+});
+
