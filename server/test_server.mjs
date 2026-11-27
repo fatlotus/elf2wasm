@@ -40,6 +40,7 @@ import {
   createGitRedirectTarget,
   createMockGitServer,
 } from "./mock_git_server.mjs";
+import { Elf2WasmSystem } from "../js/elf2wasm_shim.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1860,6 +1861,497 @@ describe("M13 Phase 2: Backend Git Proxy Adversarial Regressions (BUG-A1, A3, A4
     }
   });
 });
+
+// ============================================================================
+// M3: Local Dev Server POST /api/eval Parity & Local V8 vs Remote wasmi Parity
+// ============================================================================
+
+function buildSyntheticElf64Server(codeBytes, dataBytes = new Uint8Array(0)) {
+  const BASE_VADDR = 0x400000;
+  const HEADER_SIZE = 64 + 56;
+  const codeAligned = Math.ceil(codeBytes.length / 16) * 16;
+  const totalLen = HEADER_SIZE + codeAligned + dataBytes.length;
+
+  const buf = new Uint8Array(totalLen);
+  const view = new DataView(buf.buffer);
+
+  buf.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0], 0);
+  view.setUint16(16, 2, true);
+  view.setUint16(18, 62, true);
+  view.setUint32(20, 1, true);
+  view.setBigUint64(24, BigInt(BASE_VADDR + HEADER_SIZE), true);
+  view.setBigUint64(32, 64n, true);
+  view.setUint16(52, 64, true);
+  view.setUint16(54, 56, true);
+  view.setUint16(56, 1, true);
+
+  view.setUint32(64, 1, true);
+  view.setUint32(68, 5, true);
+  view.setBigUint64(72, 0n, true);
+  view.setBigUint64(80, BigInt(BASE_VADDR), true);
+  view.setBigUint64(88, BigInt(BASE_VADDR), true);
+  view.setBigUint64(96, BigInt(totalLen), true);
+  view.setBigUint64(104, BigInt(totalLen), true);
+  view.setBigUint64(112, 0x1000n, true);
+
+  buf.set(codeBytes, HEADER_SIZE);
+  buf.set(dataBytes, HEADER_SIZE + codeAligned);
+  return { elfBytes: buf, dataBaseVaddr: BASE_VADDR + HEADER_SIZE + codeAligned };
+}
+
+function pushImm32Server(arr, val) {
+  arr.push(val & 0xff, (val >>> 8) & 0xff, (val >>> 16) & 0xff, (val >>> 24) & 0xff);
+}
+
+function makeMultiWriteElf({ stdoutText = "", stderrText = "", files = [], exitCode = 0 }) {
+  const enc = new TextEncoder();
+  const stdoutBytes = enc.encode(stdoutText);
+  const stderrBytes = enc.encode(stderrText);
+  const fileSpecs = files.map((f) => ({
+    pathBytes: enc.encode(f.path + "\0"),
+    contentBytes: enc.encode(f.content),
+  }));
+
+  let totalData = stdoutBytes.length + stderrBytes.length;
+  for (const fs of fileSpecs) totalData += fs.pathBytes.length + fs.contentBytes.length;
+  const data = new Uint8Array(totalData);
+  let off = 0;
+  const stdoutOff = off;
+  data.set(stdoutBytes, off); off += stdoutBytes.length;
+  const stderrOff = off;
+  data.set(stderrBytes, off); off += stderrBytes.length;
+  const fileOffsets = fileSpecs.map((fs) => {
+    const pOff = off; data.set(fs.pathBytes, off); off += fs.pathBytes.length;
+    const cOff = off; data.set(fs.contentBytes, off); off += fs.contentBytes.length;
+    return { pOff, cOff, cLen: fs.contentBytes.length };
+  });
+
+  const emitCode = (dataBase) => {
+    const code = [];
+    if (stdoutBytes.length > 0) {
+      code.push(0xb8); pushImm32Server(code, 1);
+      code.push(0xbf); pushImm32Server(code, 1);
+      code.push(0xbe); pushImm32Server(code, dataBase + stdoutOff);
+      code.push(0xba); pushImm32Server(code, stdoutBytes.length);
+      code.push(0x0f, 0x05);
+    }
+    if (stderrBytes.length > 0) {
+      code.push(0xb8); pushImm32Server(code, 1);
+      code.push(0xbf); pushImm32Server(code, 2);
+      code.push(0xbe); pushImm32Server(code, dataBase + stderrOff);
+      code.push(0xba); pushImm32Server(code, stderrBytes.length);
+      code.push(0x0f, 0x05);
+    }
+    for (const fo of fileOffsets) {
+      code.push(0xb8); pushImm32Server(code, 257);
+      code.push(0x48, 0xc7, 0xc7); pushImm32Server(code, -100);
+      code.push(0xbe); pushImm32Server(code, dataBase + fo.pOff);
+      code.push(0xba); pushImm32Server(code, 0x241);
+      code.push(0x41, 0xba); pushImm32Server(code, 0o644);
+      code.push(0x0f, 0x05);
+      code.push(0x49, 0x89, 0xc4);
+      code.push(0xb8); pushImm32Server(code, 1);
+      code.push(0x4c, 0x89, 0xe7);
+      code.push(0xbe); pushImm32Server(code, dataBase + fo.cOff);
+      code.push(0xba); pushImm32Server(code, fo.cLen);
+      code.push(0x0f, 0x05);
+      code.push(0xb8); pushImm32Server(code, 3);
+      code.push(0x4c, 0x89, 0xe7);
+      code.push(0x0f, 0x05);
+    }
+    code.push(0xb8); pushImm32Server(code, 231);
+    code.push(0xbf); pushImm32Server(code, exitCode);
+    code.push(0x0f, 0x05);
+    return new Uint8Array(code);
+  };
+
+  const pass1 = emitCode(0x400100);
+  const { dataBaseVaddr } = buildSyntheticElf64Server(pass1, data);
+  return buildSyntheticElf64Server(emitCode(dataBaseVaddr), data).elfBytes;
+}
+
+function makeReadFileElfServer(filePath) {
+  const pathBytes = new TextEncoder().encode(filePath + "\0");
+  const emitCode = (dataBase) => {
+    const code = [];
+    code.push(0x48, 0x81, 0xec); pushImm32Server(code, 256);
+    code.push(0xb8); pushImm32Server(code, 257);
+    code.push(0x48, 0xc7, 0xc7); pushImm32Server(code, -100);
+    code.push(0xbe); pushImm32Server(code, dataBase);
+    code.push(0x31, 0xd2, 0x45, 0x31, 0xd2, 0x0f, 0x05);
+    // If openat failed (rax < 0), jump to exit_group(0)
+    // test rax, rax (48 85 c0); js +47 (78 2f)
+    const body = [];
+    body.push(0x49, 0x89, 0xc4);
+    body.push(0x31, 0xc0, 0x4c, 0x89, 0xe7, 0x48, 0x89, 0xe6);
+    body.push(0xba); pushImm32Server(body, 256);
+    body.push(0x0f, 0x05);
+    body.push(0x48, 0x89, 0xc2);
+    body.push(0xb8); pushImm32Server(body, 1);
+    body.push(0xbf); pushImm32Server(body, 1);
+    body.push(0x48, 0x89, 0xe6, 0x0f, 0x05);
+    body.push(0xb8); pushImm32Server(body, 3);
+    body.push(0x4c, 0x89, 0xe7, 0x0f, 0x05);
+    code.push(0x48, 0x85, 0xc0, 0x78, body.length);
+    code.push(...body);
+    code.push(0xb8); pushImm32Server(code, 231);
+    code.push(0x31, 0xff, 0x0f, 0x05);
+    return new Uint8Array(code);
+  };
+  const pass1 = emitCode(0x400100);
+  const { dataBaseVaddr } = buildSyntheticElf64Server(pass1, pathBytes);
+  return buildSyntheticElf64Server(emitCode(dataBaseVaddr), pathBytes).elfBytes;
+}
+
+function makeGetrandomElfServer() {
+  const code = [];
+  code.push(0x48, 0x83, 0xec, 0x20);
+  code.push(0xb8); pushImm32Server(code, 318);
+  code.push(0x48, 0x89, 0xe7);
+  code.push(0xbe); pushImm32Server(code, 8);
+  code.push(0x31, 0xd2, 0x0f, 0x05);
+  code.push(0xb9); pushImm32Server(code, 8);
+  code.push(0x8a, 0x44, 0x0c, 0xff, 0x24, 0x0f, 0x04, 0x61, 0x88, 0x44, 0x0c, 0xff, 0xff, 0xc9, 0x75, 0xf0);
+  code.push(0xb8); pushImm32Server(code, 1);
+  code.push(0xbf); pushImm32Server(code, 1);
+  code.push(0x48, 0x89, 0xe6);
+  code.push(0xba); pushImm32Server(code, 8);
+  code.push(0x0f, 0x05);
+  code.push(0xb8); pushImm32Server(code, 231);
+  code.push(0x31, 0xff, 0x0f, 0x05);
+  return buildSyntheticElf64Server(new Uint8Array(code)).elfBytes;
+}
+
+describe("M3: POST /api/eval Local Dev Server Parity", () => {
+  let mockReg;
+  let mockGit;
+  let srv;
+
+  const writerElf = makeMultiWriteElf({
+    stdoutText: "parity-stdout\n",
+    stderrText: "parity-stderr\n",
+    files: [
+      { path: "/workspace/build/app.out", content: "compiled-binary\n" },
+      { path: "/tmp/scratch.txt", content: "ephemeral\n" },
+    ],
+    exitCode: 0,
+  });
+  const readerOutElf = makeReadFileElfServer("/workspace/build/app.out");
+  const readerGitElf = makeReadFileElfServer("/workspace/hello.txt");
+  const randElf = makeGetrandomElfServer();
+  const loopElf = buildSyntheticElf64Server(new Uint8Array([0xeb, 0xfe])).elfBytes;
+
+  before(async () => {
+    mockReg = createMockRegistry();
+    const layer = createTarGzLayer([
+      { path: "bin/", type: "dir", mode: 0o755 },
+      { path: "workspace/", type: "dir", mode: 0o755 },
+      { path: "workspace/build/", type: "dir", mode: 0o755 },
+      { path: "tmp/", type: "dir", mode: 0o755 },
+      { path: "bin/writer", content: Buffer.from(writerElf), mode: 0o755 },
+      { path: "bin/reader", content: Buffer.from(readerOutElf), mode: 0o755 },
+      { path: "bin/readgit", content: Buffer.from(readerGitElf), mode: 0o755 },
+      { path: "bin/rand", content: Buffer.from(randElf), mode: 0o755 },
+      { path: "bin/spin", content: Buffer.from(loopElf), mode: 0o755 },
+    ]);
+    mockReg.addImage("test/evalimg", "v1", {
+      layers: [{ tarGzBytes: layer.gzipBytes }],
+      config: { workingDir: "/workspace", cmd: ["/bin/writer"] },
+    });
+    await mockReg.start();
+
+    mockGit = createMockGitServer();
+    mockGit.addRepo("org/evalrepo", "main", [{ path: "hello.txt", content: "from-mock-git\n" }]);
+    await mockGit.start();
+
+    srv = createServer({ port: 0, host: "127.0.0.1", allowLocalRegistries: true });
+    await srv.start();
+  });
+
+  after(async () => {
+    await srv.stop();
+    await mockGit.stop();
+    await mockReg.stop();
+  });
+
+  test("server/eval_core.mjs and worker/src/handler.mjs have zero node:* imports (pure ESM)", async () => {
+    for (const rel of ["server/eval_core.mjs", "worker/src/handler.mjs"]) {
+      const src = await fsp.readFile(path.join(REPO_ROOT, rel), "utf8");
+      const codeOnly = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+      assert.equal(
+        /from\s+["']node:/.test(codeOnly),
+        false,
+        `${rel} must not contain any node:* imports`
+      );
+      assert.equal(
+        /WebAssembly\.compile\s*\(/.test(codeOnly),
+        false,
+        `${rel} must not call dynamic WebAssembly.compile()`
+      );
+    }
+  });
+
+  test("Evaluates baseImage from mock registry, overlays mock gitRepo, and chains inputLayerDiffs", async () => {
+    const imageRef = `${mockReg.host}/test/evalimg:v1`;
+
+    // 1. Run default Cmd (/bin/writer) from mock registry image
+    const r1 = await fetch(`${srv.url}/api/eval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ baseImage: imageRef }),
+    });
+    assert.equal(r1.status, 200);
+    assertIsolationHeaders(r1.headers, "POST /api/eval");
+    const j1 = await r1.json();
+    assert.equal(j1.ok, true);
+    assert.equal(j1.executor, "remote-wasmi");
+    assert.equal(j1.exitCode, 0);
+    assert.equal(j1.stdout, "parity-stdout\n");
+    assert.equal(j1.stderr, "parity-stderr\n");
+    assert.equal(j1.timedOut, false);
+    assert.equal(j1.error, null);
+    assert.ok(j1.outputDiffTarGzBase64 && j1.outputDiffTarGzBase64.length > 0);
+
+    // 2. Chain j1's outputDiffTarGzBase64 into a second eval running /bin/reader
+    const r2 = await fetch(`${srv.url}/api/eval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        baseImage: imageRef,
+        inputLayerDiffs: [j1.outputDiffTarGzBase64],
+        cmd: ["/bin/reader"],
+      }),
+    });
+    assert.equal(r2.status, 200);
+    const j2 = await r2.json();
+    assert.equal(j2.ok, true);
+    assert.equal(j2.stdout, "compiled-binary\n");
+
+    // 3. Overlay mock gitRepo at /workspace and read /workspace/hello.txt
+    const r3 = await fetch(`${srv.url}/api/eval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        baseImage: imageRef,
+        gitRepo: { repo: `${mockGit.url}/org/evalrepo`, ref: "main", mountPath: "/workspace" },
+        cmd: ["/bin/readgit"],
+      }),
+    });
+    assert.equal(r3.status, 200);
+    const j3 = await r3.json();
+    assert.equal(j3.ok, true);
+    assert.equal(j3.stdout, "from-mock-git\n");
+  });
+
+  test("Supports direct .tar.gz download (Accept & ?format=tar.gz) and downloadPath filtering", async () => {
+    const imageRef = `${mockReg.host}/test/evalimg:v1`;
+
+    // Filtered JSON response with downloadPath: "/workspace/build"
+    const jsonRes = await fetch(`${srv.url}/api/eval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ baseImage: imageRef, downloadPath: "/workspace/build" }),
+    });
+    assert.equal(jsonRes.status, 200);
+    const jsonBody = await jsonRes.json();
+    assert.ok(jsonBody.modifiedFiles.some((f) => f.path === "/workspace/build/app.out"));
+    assert.equal(
+      jsonBody.modifiedFiles.some((f) => f.path === "/tmp/scratch.txt"),
+      false,
+      "downloadPath must filter out /tmp/scratch.txt"
+    );
+
+    // Direct .tar.gz via Accept: application/gzip and ?format=tar.gz
+    for (const [url, headers] of [
+      [`${srv.url}/api/eval`, { "Content-Type": "application/json", Accept: "application/gzip" }],
+      [`${srv.url}/api/eval?format=tar.gz`, { "Content-Type": "application/json" }],
+    ]) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ baseImage: imageRef, downloadPath: "/workspace/build" }),
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get("content-type"), "application/gzip");
+      assert.equal(
+        res.headers.get("content-disposition"),
+        'attachment; filename="layer-output.tar.gz"'
+      );
+      assert.equal(res.headers.get("x-eval-exit-code"), "0");
+      assert.match(res.headers.get("x-eval-virtual-time-ns") || "", /^\d+$/);
+      assert.equal(res.headers.get("cache-control"), "no-store");
+
+      const gz = Buffer.from(await res.arrayBuffer());
+      const tarStr = zlib.gunzipSync(gz).toString("utf8");
+      assert.ok(tarStr.includes("workspace/build/app.out"));
+      assert.equal(tarStr.includes("tmp/scratch.txt"), false);
+    }
+  });
+
+  test("Local V8 (Elf2WasmSystem) vs Remote wasmi (POST /api/eval) output parity", async () => {
+    const wasmDir = path.join(REPO_ROOT, "target", "wasm32-unknown-unknown", "release");
+    const compilerBytes = await fsp.readFile(path.join(wasmDir, "elf2wasm_compiler_wasm.wasm"));
+    const runtimeBytes = await fsp.readFile(path.join(wasmDir, "elf2wasm_runtime_wasm.wasm"));
+    const [compilerMod, runtimeMod] = await Promise.all([
+      WebAssembly.compile(compilerBytes),
+      WebAssembly.compile(runtimeBytes),
+    ]);
+
+    // 1. Run locally via V8 Elf2WasmSystem
+    const localSys = await Elf2WasmSystem.create({
+      compilerWasm: compilerMod,
+      runtimeWasm: runtimeMod,
+    });
+    localSys.writeVfsDir("/bin", 0o755);
+    localSys.writeVfsDir("/workspace", 0o755);
+    localSys.writeVfsDir("/workspace/build", 0o755);
+    localSys.writeVfsDir("/tmp", 0o755);
+    localSys.writeVfsFile("/bin/writer", writerElf, 0o755);
+    const snapId = localSys.snapshotVfs();
+
+    const localRes = await localSys.runFromVfs("/bin/writer", ["/bin/writer"], {
+      cwd: "/workspace",
+      delayStddevMs: 0,
+      delaySeed: 0,
+    });
+    const dec = new TextDecoder();
+    const localStdout = dec.decode(localSys.drainStdout());
+    const localStderr = dec.decode(localSys.drainStderr());
+    const localDiff = localSys.listVfsDiff({ baseSnapshotId: snapId });
+
+    // 2. Run remotely via POST /api/eval (wasmi)
+    const remoteHttpRes = await fetch(`${srv.url}/api/eval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        baseImage: `${mockReg.host}/test/evalimg:v1`,
+        cmd: ["/bin/writer"],
+        cwd: "/workspace",
+        delayStddevMs: 0,
+        delaySeed: 0,
+      }),
+    });
+    assert.equal(remoteHttpRes.status, 200);
+    const remoteRes = await remoteHttpRes.json();
+
+    assert.equal(remoteRes.exitCode, localRes.exitCode, "exitCode parity");
+    assert.equal(remoteRes.stdout, localStdout, "stdout parity");
+    assert.equal(remoteRes.stderr, localStderr, "stderr parity");
+    assert.equal(remoteRes.virtualTimeNs, String(localRes.virtualTimeNs), "virtualTimeNs parity");
+    assert.deepEqual(remoteRes.modifiedFiles, localDiff, "modifiedFiles parity");
+  });
+
+  test("Determinism (delaySeed), request isolation, and error codes (400/405/408/413/502/507)", async () => {
+    const imageRef = `${mockReg.host}/test/evalimg:v1`;
+
+    // Determinism with delaySeed
+    const runSeed = async (delaySeed) => {
+      const r = await fetch(`${srv.url}/api/eval`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          baseImage: imageRef,
+          cmd: ["/bin/rand"],
+          delayStddevMs: 5,
+          delaySeed,
+          returnOutputDiff: false,
+        }),
+      });
+      assert.equal(r.status, 200);
+      return r.json();
+    };
+    const s1 = await runSeed(777);
+    const s2 = await runSeed(777);
+    const s3 = await runSeed(888);
+    assert.equal(s1.stdout, s2.stdout);
+    assert.notEqual(s1.stdout, s3.stdout);
+
+    // Isolation: after /bin/writer writes /workspace/build/app.out, a fresh request without
+    // inputLayerDiffs running /bin/reader must NOT see that file!
+    await fetch(`${srv.url}/api/eval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ baseImage: imageRef, cmd: ["/bin/writer"] }),
+    });
+    const isolatedRes = await fetch(`${srv.url}/api/eval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ baseImage: imageRef, cmd: ["/bin/reader"] }),
+    });
+    assert.equal(isolatedRes.status, 200);
+    const isolatedJson = await isolatedRes.json();
+    assert.equal(isolatedJson.stdout, "", "VFS writes must not leak across requests");
+
+    // OPTIONS -> 204, GET -> 405
+    const optRes = await fetch(`${srv.url}/api/eval`, { method: "OPTIONS" });
+    assert.equal(optRes.status, 204);
+    const getRes = await fetch(`${srv.url}/api/eval`, { method: "GET" });
+    assert.equal(getRes.status, 405);
+
+    // 400 INVALID_REQUEST
+    const badRes = await fetch(`${srv.url}/api/eval`, { method: "POST", body: "not-json" });
+    assert.equal(badRes.status, 400);
+    assert.equal((await badRes.json()).code, "INVALID_REQUEST");
+
+    // 408 FUEL_EXHAUSTED
+    const fuelRes = await fetch(`${srv.url}/api/eval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ baseImage: imageRef, cmd: ["/bin/spin"], maxFuel: 5000 }),
+    });
+    assert.equal(fuelRes.status, 408);
+    assert.equal((await fuelRes.json()).code, "FUEL_EXHAUSTED");
+
+    // 507 MEMORY_LIMIT
+    const memRes = await fetch(`${srv.url}/api/eval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ baseImage: imageRef, cmd: ["/bin/writer"], maxMemoryBytes: 65536 }),
+    });
+    assert.equal(memRes.status, 507);
+    assert.equal((await memRes.json()).code, "MEMORY_LIMIT");
+
+    // 502 UPSTREAM_ERROR (missing image)
+    const upRes = await fetch(`${srv.url}/api/eval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ baseImage: `${mockReg.host}/test/missing:v1`, cmd: ["/bin/writer"] }),
+    });
+    assert.equal(upRes.status, 502);
+    assert.equal((await upRes.json()).code, "UPSTREAM_ERROR");
+
+    // 413 payload too large + missing wasmDir clean startup -> 502 only on /api/eval
+    const smallSrv = createServer({
+      port: 0,
+      host: "127.0.0.1",
+      maxEvalBodyBytes: 256,
+      wasmDir: path.join(os.tmpdir(), `nonexistent-wasm-dir-${Date.now()}`),
+    });
+    await smallSrv.start();
+    try {
+      const healthRes = await fetch(`${smallSrv.url}/api/health`);
+      assert.equal(healthRes.status, 200);
+
+      const r413 = await fetch(`${smallSrv.url}/api/eval`, {
+        method: "POST",
+        body: "a".repeat(512),
+      });
+      assert.equal(r413.status, 413);
+      assert.equal((await r413.json()).code, "INVALID_REQUEST");
+
+      const r502 = await fetch(`${smallSrv.url}/api/eval`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cmd: ["/bin/echo"] }),
+      });
+      assert.equal(r502.status, 502);
+      assert.equal((await r502.json()).code, "UPSTREAM_ERROR");
+    } finally {
+      await smallSrv.stop();
+    }
+  });
+});
+
 
 
 

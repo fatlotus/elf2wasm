@@ -5,6 +5,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRegistryProxy } from "./registry_proxy.mjs";
 import { createGitProxy } from "./git_proxy.mjs";
+import {
+  DEFAULT_MAX_EVAL_BODY_BYTES,
+  EvalError,
+  createWorkerEvalRuntime,
+  wantsGzipResponse,
+  formatEvalJsonResponse,
+  buildGzipEvalHeaders,
+} from "./eval_core.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -55,6 +63,64 @@ function sendJson(res, statusCode, payload, method = "GET", extraHeaders = null)
   } else {
     res.end(body);
   }
+}
+
+function readBoundedNodeRequest(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const rawContentLength = req.headers["content-length"];
+    if (typeof rawContentLength === "string" && /^\d+$/.test(rawContentLength.trim())) {
+      const declared = Number(rawContentLength.trim());
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        req.resume();
+        reject(
+          new EvalError(
+            413,
+            "INVALID_REQUEST",
+            `Request body exceeds maximum size of ${maxBytes} bytes`
+          )
+        );
+        return;
+      }
+    }
+
+    const chunks = [];
+    let total = 0;
+    let settled = false;
+
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+
+    req.on("data", (chunk) => {
+      if (settled) return;
+      total += chunk.byteLength;
+      if (total > maxBytes) {
+        req.pause();
+        fail(
+          new EvalError(
+            413,
+            "INVALID_REQUEST",
+            `Request body exceeds maximum size of ${maxBytes} bytes`
+          )
+        );
+        return;
+      }
+      chunks.push(chunk);
+    });
+
+    req.on("end", () => {
+      if (settled) return;
+      settled = true;
+      const buf = Buffer.concat(chunks, total);
+      resolve(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+    });
+
+    req.on("error", (err) => {
+      fail(new EvalError(400, "INVALID_REQUEST", `Failed to read request body: ${err.message}`));
+    });
+  });
 }
 
 /**
@@ -248,6 +314,124 @@ export function createServer(options = {}) {
   const gitProxyHandler =
     options.gitProxyHandler ?? ((req, res) => gitProxy.handleRequest(req, res));
 
+  const maxEvalBodyBytes = options.maxEvalBodyBytes ?? DEFAULT_MAX_EVAL_BODY_BYTES;
+  let evalRuntimePromise = options.workerWasmModule
+    ? Promise.resolve(createWorkerEvalRuntime(options.workerWasmModule))
+    : null;
+
+  function getEvalRuntime() {
+    if (!evalRuntimePromise) {
+      evalRuntimePromise = (async () => {
+        const workerWasmPath = path.join(wasmDir, "elf2wasm_worker_wasm.wasm");
+        let wasmBytes;
+        try {
+          wasmBytes = await fsp.readFile(workerWasmPath);
+        } catch {
+          throw new EvalError(
+            502,
+            "UPSTREAM_ERROR",
+            `Worker WASM artifact not found at ${workerWasmPath}`
+          );
+        }
+        const mod = await WebAssembly.compile(wasmBytes);
+        return createWorkerEvalRuntime(mod);
+      })().catch((err) => {
+        evalRuntimePromise = null;
+        throw err;
+      });
+    }
+    return evalRuntimePromise;
+  }
+
+  async function handleEvalRequest(req, res, rawUrl, method) {
+    if (method === "OPTIONS") {
+      res.setHeader("Allow", "POST, OPTIONS");
+      res.setHeader("Cache-Control", "no-store");
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    if (method !== "POST") {
+      sendJson(
+        res,
+        405,
+        { ok: false, error: "Method Not Allowed", code: "INVALID_REQUEST" },
+        method,
+        { Allow: "POST, OPTIONS" }
+      );
+      return;
+    }
+
+    try {
+      const bodyBytes = await readBoundedNodeRequest(req, maxEvalBodyBytes);
+      const wantGzip = wantsGzipResponse(rawUrl, req.headers.accept || "");
+      const evalRuntime = await getEvalRuntime();
+
+      const selfOrigin = handle.url;
+
+      const fetchOciResource = async ({ registry, repository, kind, target, accept }) => {
+        const ociUrl = `${selfOrigin}/api/v2/${registry}/${repository}/${kind}/${target}`;
+        const r = await fetch(ociUrl, {
+          method: "GET",
+          headers: accept ? { Accept: accept } : {},
+        });
+        const bytes = new Uint8Array(await r.arrayBuffer());
+        return { status: r.status, headers: r.headers, bytes };
+      };
+
+      const fetchGitArchive = async ({ repo, ref }) => {
+        const params = new URLSearchParams({ repo });
+        if (ref) params.set("ref", ref);
+        const r = await fetch(`${selfOrigin}/api/git/archive?${params.toString()}`, {
+          method: "GET",
+        });
+        const bytes = new Uint8Array(await r.arrayBuffer());
+        return { status: r.status, headers: r.headers, bytes };
+      };
+
+      const result = await evalRuntime.evaluateLayer(bodyBytes, {
+        fetchOciResource,
+        fetchGitArchive,
+        wantGzip,
+      });
+
+      if (wantGzip) {
+        const gzipHeaders = buildGzipEvalHeaders(result);
+        for (const [k, v] of Object.entries(gzipHeaders)) {
+          res.setHeader(k, v);
+        }
+        const payload = result.outputDiffTarGzBytes ?? new Uint8Array(0);
+        res.setHeader("Content-Length", payload.byteLength);
+        res.writeHead(200);
+        res.end(Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength));
+        return;
+      }
+
+      sendJson(res, 200, formatEvalJsonResponse(result), method);
+    } catch (err) {
+      if (err instanceof EvalError) {
+        sendJson(
+          res,
+          err.statusCode,
+          { ok: false, error: err.message, code: err.code },
+          method
+        );
+        return;
+      }
+      sendJson(
+        res,
+        502,
+        {
+          ok: false,
+          error: `Remote evaluation error: ${err?.message || "unknown error"}`,
+          code: "UPSTREAM_ERROR",
+        },
+        method
+      );
+    }
+  }
+
   const server = http.createServer(async (req, res) => {
     setSecurityHeaders(res);
 
@@ -263,6 +447,12 @@ export function createServer(options = {}) {
           return;
         }
         sendJson(res, 200, { ok: true, mode: "client-side-wasm" }, method);
+        return;
+      }
+
+      // Remote WASM-interpreter layer evaluation route
+      if (rawPath === "/api/eval") {
+        await handleEvalRequest(req, res, rawUrl, method);
         return;
       }
 
