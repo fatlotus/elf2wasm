@@ -51,7 +51,7 @@ jobs:
       - name: Build Rust/WASM release artifacts
         run: >
           cargo build --release --target wasm32-unknown-unknown
-          -p elf2wasm-compiler-wasm -p elf2wasm-runtime-wasm
+          -p elf2wasm-compiler-wasm -p elf2wasm-runtime-wasm -p elf2wasm-worker-wasm
 
       - name: Install Worker dependencies
         working-directory: worker

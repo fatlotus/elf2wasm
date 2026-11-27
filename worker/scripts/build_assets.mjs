@@ -12,6 +12,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 export const CLOUDFLARE_ASSET_MAX_BYTES = 25 * 1024 * 1024; // 25 MiB per-file limit
+export const CLOUDFLARE_WORKER_WASM_MAX_BYTES = 10 * 1024 * 1024; // 10 MiB raw Worker WASM sanity cap
 
 export const BROWSER_JS_FILES = [
   "container_worker.mjs",
@@ -25,6 +26,8 @@ export const WASM_FILES = [
   "elf2wasm_compiler_wasm.wasm",
   "elf2wasm_runtime_wasm.wasm",
 ];
+
+export const WORKER_WASM_FILE = "elf2wasm_worker_wasm.wasm";
 
 export const STATIC_HEADERS_CONTENT = [
   "/*",
@@ -42,6 +45,7 @@ function formatMiB(bytes) {
 export async function buildAssets(options = {}) {
   const repoRoot = options.repoRoot ?? path.resolve(__dirname, "..", "..");
   const distDir = options.distDir ?? path.resolve(repoRoot, "worker", "dist");
+  const workerSrcDir = options.workerSrcDir ?? path.resolve(repoRoot, "worker", "src");
   const webDir = options.webDir ?? path.resolve(repoRoot, "web");
   const jsDir = options.jsDir ?? path.resolve(repoRoot, "js");
   const wasmDir =
@@ -55,6 +59,7 @@ export async function buildAssets(options = {}) {
   await fs.mkdir(path.join(distDir, "web"), { recursive: true });
   await fs.mkdir(path.join(distDir, "js"), { recursive: true });
   await fs.mkdir(path.join(distDir, "wasm"), { recursive: true });
+  await fs.mkdir(workerSrcDir, { recursive: true });
 
   const stagedFiles = [];
 
@@ -82,7 +87,7 @@ export async function buildAssets(options = {}) {
     stagedFiles.push(`js/${fileName}`);
   }
 
-  // 4. Copy & validate WASM artifacts -> dist/wasm/
+  // 4. Copy & validate browser WASM artifacts -> dist/wasm/
   const wasmSizes = {};
   for (const fileName of WASM_FILES) {
     const src = path.join(wasmDir, fileName);
@@ -93,7 +98,7 @@ export async function buildAssets(options = {}) {
       throw new Error(
         `Missing required WASM artifact: ${src}. ` +
           "Build it first with: cargo build --release --target wasm32-unknown-unknown " +
-          "-p elf2wasm-compiler-wasm -p elf2wasm-runtime-wasm"
+          "-p elf2wasm-compiler-wasm -p elf2wasm-runtime-wasm -p elf2wasm-worker-wasm"
       );
     }
     if (!stat.isFile() || stat.size === 0) {
@@ -112,12 +117,40 @@ export async function buildAssets(options = {}) {
     logger.log(`[build_assets] staged wasm/${fileName} (${stat.size} bytes / ${formatMiB(stat.size)})`);
   }
 
-  // 5. Write _headers for COOP/COEP/CORP/nosniff on all static assets
+  // 5. Copy & validate Worker interpreter WASM -> worker/src/ (bundled into Worker, NOT public dist/wasm/)
+  const workerWasmSrc = path.join(wasmDir, WORKER_WASM_FILE);
+  let workerWasmStat;
+  try {
+    workerWasmStat = await fs.stat(workerWasmSrc);
+  } catch {
+    throw new Error(
+      `Missing required WASM artifact: ${workerWasmSrc}. ` +
+        "Build it first with: cargo build --release --target wasm32-unknown-unknown " +
+        "-p elf2wasm-compiler-wasm -p elf2wasm-runtime-wasm -p elf2wasm-worker-wasm"
+    );
+  }
+  if (!workerWasmStat.isFile() || workerWasmStat.size === 0) {
+    throw new Error(`Invalid WASM artifact (empty or not a file): ${workerWasmSrc}`);
+  }
+  if (workerWasmStat.size >= CLOUDFLARE_WORKER_WASM_MAX_BYTES) {
+    throw new Error(
+      `Worker WASM artifact ${WORKER_WASM_FILE} is ${workerWasmStat.size} bytes (${formatMiB(workerWasmStat.size)}), ` +
+        `which exceeds the ${formatMiB(CLOUDFLARE_WORKER_WASM_MAX_BYTES)} cap.`
+    );
+  }
+  const workerWasmDst = path.join(workerSrcDir, WORKER_WASM_FILE);
+  await fs.copyFile(workerWasmSrc, workerWasmDst);
+  wasmSizes[WORKER_WASM_FILE] = workerWasmStat.size;
+  logger.log(
+    `[build_assets] staged worker/src/${WORKER_WASM_FILE} (${workerWasmStat.size} bytes / ${formatMiB(workerWasmStat.size)})`
+  );
+
+  // 6. Write _headers for COOP/COEP/CORP/nosniff on all static assets
   await fs.writeFile(path.join(distDir, "_headers"), STATIC_HEADERS_CONTENT, "utf8");
   stagedFiles.push("_headers");
 
-  logger.log(`[build_assets] staged ${stagedFiles.length} files into ${distDir}`);
-  return { distDir, stagedFiles, wasmSizes };
+  logger.log(`[build_assets] staged ${stagedFiles.length} static files into ${distDir}`);
+  return { distDir, workerSrcDir, workerWasmPath: workerWasmDst, stagedFiles, wasmSizes };
 }
 
 const isMain =

@@ -4,7 +4,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { createWorkerHandler } from "../src/index.mjs";
+import zlib from "node:zlib";
+import { createWorkerHandler } from "../src/handler.mjs";
 import {
   DEFAULT_MANIFEST_ACCEPT,
   MAX_TOKEN_RESPONSE_BYTES,
@@ -17,6 +18,7 @@ import {
   buildAssets,
   BROWSER_JS_FILES,
   WASM_FILES,
+  WORKER_WASM_FILE,
   STATIC_HEADERS_CONTENT,
 } from "../scripts/build_assets.mjs";
 
@@ -730,22 +732,24 @@ describe("Cloudflare Worker: Static Assets Fallback (env.ASSETS)", () => {
 });
 
 describe("Static Assets Staging Script (worker/scripts/build_assets.mjs)", () => {
-  it("stages index.html, web/*, runtime js/*.mjs, wasm/*.wasm, and _headers", async () => {
+  it("stages index.html, web/*, runtime js/*.mjs, wasm/*.wasm, worker/src/elf2wasm_worker_wasm.wasm, and _headers", async () => {
     const scratchRoot = path.join(REPO_ROOT, "worker", ".wrangler", `test-stage-${Date.now()}`);
     const fakeWasmDir = path.join(scratchRoot, "wasm-src");
     const testDistDir = path.join(scratchRoot, "dist");
+    const testWorkerSrcDir = path.join(scratchRoot, "worker-src");
     const silentLogger = { log() {} };
 
     try {
       await fs.mkdir(fakeWasmDir, { recursive: true });
       const wasmMagic = Uint8Array.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
-      for (const name of WASM_FILES) {
+      for (const name of [...WASM_FILES, WORKER_WASM_FILE]) {
         await fs.writeFile(path.join(fakeWasmDir, name), wasmMagic);
       }
 
       const result = await buildAssets({
         repoRoot: REPO_ROOT,
         distDir: testDistDir,
+        workerSrcDir: testWorkerSrcDir,
         wasmDir: fakeWasmDir,
         logger: silentLogger,
       });
@@ -776,12 +780,18 @@ describe("Static Assets Staging Script (worker/scripts/build_assets.mjs)", () =>
       await assert.rejects(() => fs.access(path.join(testDistDir, "js", "test_docker_sdk.mjs")));
       await assert.rejects(() => fs.access(path.join(testDistDir, "js", "test_url_state.mjs")));
 
-      // Verify WASM files staged with exact bytes
+      // Verify browser WASM files staged in dist/wasm/ with exact bytes
       for (const wasmFile of WASM_FILES) {
         const bytes = await fs.readFile(path.join(testDistDir, "wasm", wasmFile));
         assert.deepEqual(Array.from(bytes), Array.from(wasmMagic));
         assert.equal(result.wasmSizes[wasmFile], wasmMagic.byteLength);
       }
+
+      // Verify Worker WASM staged in workerSrcDir and NOT in public dist/wasm/
+      const workerWasmBytes = await fs.readFile(path.join(testWorkerSrcDir, WORKER_WASM_FILE));
+      assert.deepEqual(Array.from(workerWasmBytes), Array.from(wasmMagic));
+      assert.equal(result.wasmSizes[WORKER_WASM_FILE], wasmMagic.byteLength);
+      await assert.rejects(() => fs.access(path.join(testDistDir, "wasm", WORKER_WASM_FILE)));
 
       // Verify _headers
       const headersContent = await fs.readFile(path.join(testDistDir, "_headers"), "utf8");
@@ -1885,6 +1895,640 @@ describe("Cloudflare Worker: M13 Phase 2 Adversarial Regressions (BUG-A1, A2, A3
     }
   });
 });
+
+// ============================================================================
+// Pure-JS Synthetic x86-64 ELF64 + USTAR Tar Helpers for POST /api/eval Tests
+// ============================================================================
+
+function buildSyntheticElf64(codeBytes, dataBytes = new Uint8Array(0)) {
+  const BASE_VADDR = 0x400000;
+  const HEADER_SIZE = 64 + 56; // ELF64 header + 1 PT_LOAD phdr = 0x78
+  const codeAligned = Math.ceil(codeBytes.length / 16) * 16;
+  const totalLen = HEADER_SIZE + codeAligned + dataBytes.length;
+
+  const buf = new Uint8Array(totalLen);
+  const view = new DataView(buf.buffer);
+
+  // ELF64 header
+  buf.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0], 0);
+  view.setUint16(16, 2, true); // ET_EXEC
+  view.setUint16(18, 62, true); // EM_X86_64
+  view.setUint32(20, 1, true); // EV_CURRENT
+  view.setBigUint64(24, BigInt(BASE_VADDR + HEADER_SIZE), true); // e_entry
+  view.setBigUint64(32, 64n, true); // e_phoff
+  view.setUint16(52, 64, true); // e_ehsize
+  view.setUint16(54, 56, true); // e_phentsize
+  view.setUint16(56, 1, true); // e_phnum
+
+  // PT_LOAD program header at offset 64
+  view.setUint32(64, 1, true); // PT_LOAD
+  view.setUint32(68, 5, true); // PF_R | PF_X
+  view.setBigUint64(72, 0n, true); // p_offset
+  view.setBigUint64(80, BigInt(BASE_VADDR), true); // p_vaddr
+  view.setBigUint64(88, BigInt(BASE_VADDR), true); // p_paddr
+  view.setBigUint64(96, BigInt(totalLen), true); // p_filesz
+  view.setBigUint64(104, BigInt(totalLen), true); // p_memsz
+  view.setBigUint64(112, 0x1000n, true); // p_align
+
+  buf.set(codeBytes, HEADER_SIZE);
+  buf.set(dataBytes, HEADER_SIZE + codeAligned);
+  return {
+    elfBytes: buf,
+    dataBaseVaddr: BASE_VADDR + HEADER_SIZE + codeAligned,
+  };
+}
+
+function pushImm32(arr, val) {
+  arr.push(val & 0xff, (val >>> 8) & 0xff, (val >>> 16) & 0xff, (val >>> 24) & 0xff);
+}
+
+/**
+ * Build a real x86-64 static ELF that writes `stdoutText` to fd 1, optionally
+ * creates `filePath` with `fileContent`, and exits with `exitCode`.
+ */
+function makeWriteAndExitElf({ stdoutText = "", filePath = null, fileContent = "", exitCode = 0 }) {
+  const enc = new TextEncoder();
+  const stdoutBytes = enc.encode(stdoutText);
+  const pathBytes = filePath ? enc.encode(filePath + "\0") : new Uint8Array(0);
+  const contentBytes = filePath ? enc.encode(fileContent) : new Uint8Array(0);
+
+  const data = new Uint8Array(stdoutBytes.length + pathBytes.length + contentBytes.length);
+  data.set(stdoutBytes, 0);
+  data.set(pathBytes, stdoutBytes.length);
+  data.set(contentBytes, stdoutBytes.length + pathBytes.length);
+
+  // Two-pass to know exact dataBaseVaddr
+  const emitCode = (dataBase) => {
+    const stdoutAddr = dataBase;
+    const pathAddr = dataBase + stdoutBytes.length;
+    const contentAddr = pathAddr + pathBytes.length;
+    const code = [];
+
+    if (stdoutBytes.length > 0) {
+      // write(1, stdoutAddr, stdoutBytes.length)
+      code.push(0xb8); pushImm32(code, 1); // mov eax, 1 (SYS_write)
+      code.push(0xbf); pushImm32(code, 1); // mov edi, 1 (stdout)
+      code.push(0xbe); pushImm32(code, stdoutAddr); // mov esi, stdoutAddr
+      code.push(0xba); pushImm32(code, stdoutBytes.length); // mov edx, len
+      code.push(0x0f, 0x05); // syscall
+    }
+
+    if (filePath) {
+      // openat(AT_FDCWD=-100, pathAddr, O_WRONLY|O_CREAT|O_TRUNC=0x241, 0644)
+      code.push(0xb8); pushImm32(code, 257); // mov eax, 257 (SYS_openat)
+      code.push(0x48, 0xc7, 0xc7); pushImm32(code, -100); // mov rdi, -100
+      code.push(0xbe); pushImm32(code, pathAddr); // mov esi, pathAddr
+      code.push(0xba); pushImm32(code, 0x241); // mov edx, 0x241
+      code.push(0x41, 0xba); pushImm32(code, 0o644); // mov r10d, 0644
+      code.push(0x0f, 0x05); // syscall
+      // mov r12, rax (save fd)
+      code.push(0x49, 0x89, 0xc4);
+      // write(r12, contentAddr, contentBytes.length)
+      code.push(0xb8); pushImm32(code, 1);
+      code.push(0x4c, 0x89, 0xe7); // mov rdi, r12
+      code.push(0xbe); pushImm32(code, contentAddr);
+      code.push(0xba); pushImm32(code, contentBytes.length);
+      code.push(0x0f, 0x05);
+      // close(r12)
+      code.push(0xb8); pushImm32(code, 3);
+      code.push(0x4c, 0x89, 0xe7);
+      code.push(0x0f, 0x05);
+    }
+
+    // exit_group(exitCode)
+    code.push(0xb8); pushImm32(code, 231);
+    code.push(0xbf); pushImm32(code, exitCode);
+    code.push(0x0f, 0x05);
+    return new Uint8Array(code);
+  };
+
+  const pass1 = emitCode(0x400100);
+  const { dataBaseVaddr } = buildSyntheticElf64(pass1, data);
+  return buildSyntheticElf64(emitCode(dataBaseVaddr), data).elfBytes;
+}
+
+/**
+ * Build a real x86-64 static ELF that reads `filePath` (up to 256 bytes)
+ * and writes its contents to stdout.
+ */
+function makeReadAndPrintElf(filePath) {
+  const pathBytes = new TextEncoder().encode(filePath + "\0");
+  const emitCode = (dataBase) => {
+    const code = [];
+    // sub rsp, 256
+    code.push(0x48, 0x81, 0xec); pushImm32(code, 256);
+    // openat(-100, pathAddr, O_RDONLY=0, 0)
+    code.push(0xb8); pushImm32(code, 257);
+    code.push(0x48, 0xc7, 0xc7); pushImm32(code, -100);
+    code.push(0xbe); pushImm32(code, dataBase);
+    code.push(0x31, 0xd2); // xor edx, edx
+    code.push(0x45, 0x31, 0xd2); // xor r10d, r10d
+    code.push(0x0f, 0x05);
+    // mov r12, rax (fd)
+    code.push(0x49, 0x89, 0xc4);
+    // read(r12, rsp, 256)
+    code.push(0x31, 0xc0); // xor eax, eax (SYS_read = 0)
+    code.push(0x4c, 0x89, 0xe7); // mov rdi, r12
+    code.push(0x48, 0x89, 0xe6); // mov rsi, rsp
+    code.push(0xba); pushImm32(code, 256);
+    code.push(0x0f, 0x05);
+    // mov rdx, rax (bytes read)
+    code.push(0x48, 0x89, 0xc2);
+    // write(1, rsp, rdx)
+    code.push(0xb8); pushImm32(code, 1);
+    code.push(0xbf); pushImm32(code, 1);
+    code.push(0x48, 0x89, 0xe6);
+    code.push(0x0f, 0x05);
+    // close(r12)
+    code.push(0xb8); pushImm32(code, 3);
+    code.push(0x4c, 0x89, 0xe7);
+    code.push(0x0f, 0x05);
+    // exit_group(0)
+    code.push(0xb8); pushImm32(code, 231);
+    code.push(0x31, 0xff);
+    code.push(0x0f, 0x05);
+    return new Uint8Array(code);
+  };
+  const pass1 = emitCode(0x400100);
+  const { dataBaseVaddr } = buildSyntheticElf64(pass1, pathBytes);
+  return buildSyntheticElf64(emitCode(dataBaseVaddr), pathBytes).elfBytes;
+}
+
+/**
+ * Build a real x86-64 static ELF with an infinite loop (`jmp -2`).
+ */
+function makeInfiniteLoopElf() {
+  return buildSyntheticElf64(new Uint8Array([0xeb, 0xfe])).elfBytes;
+}
+
+/**
+ * Build a real x86-64 static ELF that calls getrandom(rsp, 8, 0), maps each
+ * byte's low nibble to 'a'..'p', writes the 8 ASCII chars to stdout, and exits 0.
+ * Exercises deterministic PRNG seeding via delaySeed + delayStddevMs.
+ */
+function makeGetrandomElf() {
+  const code = [];
+  // sub rsp, 32
+  code.push(0x48, 0x83, 0xec, 0x20);
+  // getrandom(rsp, 8, 0) -> syscall 318
+  code.push(0xb8); pushImm32(code, 318);
+  code.push(0x48, 0x89, 0xe7); // mov rdi, rsp
+  code.push(0xbe); pushImm32(code, 8); // mov esi, 8
+  code.push(0x31, 0xd2); // xor edx, edx
+  code.push(0x0f, 0x05);
+  // mov ecx, 8
+  code.push(0xb9); pushImm32(code, 8);
+  // loop (18 bytes):
+  //   mov al, [rsp + rcx - 1]   -> 8a 44 0c ff
+  //   and al, 0x0f              -> 24 0f
+  //   add al, 0x61              -> 04 61
+  //   mov [rsp + rcx - 1], al   -> 88 44 0c ff
+  //   dec ecx                   -> ff c9
+  //   jnz loop (-16)            -> 75 ee
+  code.push(0x8a, 0x44, 0x0c, 0xff);
+  code.push(0x24, 0x0f);
+  code.push(0x04, 0x61);
+  code.push(0x88, 0x44, 0x0c, 0xff);
+  code.push(0xff, 0xc9);
+  code.push(0x75, 0xf0); // -16: 4+2+2+4+2+2 = 16 bytes
+  // write(1, rsp, 8)
+  code.push(0xb8); pushImm32(code, 1);
+  code.push(0xbf); pushImm32(code, 1);
+  code.push(0x48, 0x89, 0xe6); // mov rsi, rsp
+  code.push(0xba); pushImm32(code, 8);
+  code.push(0x0f, 0x05);
+  // exit_group(0)
+  code.push(0xb8); pushImm32(code, 231);
+  code.push(0x31, 0xff);
+  code.push(0x0f, 0x05);
+  return buildSyntheticElf64(new Uint8Array(code)).elfBytes;
+}
+
+function buildTestTarGz(entries) {
+  const blocks = [];
+  for (const ent of entries) {
+    const header = Buffer.alloc(512, 0);
+    const nameBytes = Buffer.from(ent.path, "utf8");
+    nameBytes.copy(header, 0, 0, Math.min(100, nameBytes.length));
+    const mode = ent.mode ?? (ent.type === "5" ? 0o755 : 0o644);
+    header.write(mode.toString(8).padStart(7, "0") + "\0", 100, 8, "ascii");
+    header.write("0000000\0", 108, 8, "ascii");
+    header.write("0000000\0", 116, 8, "ascii");
+    const content =
+      ent.type === "5"
+        ? Buffer.alloc(0)
+        : Buffer.isBuffer(ent.content)
+          ? ent.content
+          : ent.content instanceof Uint8Array
+            ? Buffer.from(ent.content)
+            : Buffer.from(ent.content || "", "utf8");
+    header.write(content.length.toString(8).padStart(11, "0") + "\0", 124, 12, "ascii");
+    header.write("00000000000\0", 136, 12, "ascii");
+    header.fill(0x20, 148, 156);
+    header.write(ent.type || "0", 156, 1, "ascii");
+    header.write("ustar\0", 257, 6, "ascii");
+    header.write("00", 263, 2, "ascii");
+    let sum = 0;
+    for (let i = 0; i < 512; i++) sum += header[i];
+    header.write(sum.toString(8).padStart(6, "0") + "\0 ", 148, 8, "ascii");
+    blocks.push(header);
+    if (content.length > 0) {
+      blocks.push(content);
+      const rem = content.length % 512;
+      if (rem !== 0) blocks.push(Buffer.alloc(512 - rem, 0));
+    }
+  }
+  blocks.push(Buffer.alloc(1024, 0));
+  return zlib.gzipSync(Buffer.concat(blocks));
+}
+
+describe("Cloudflare Worker: POST /api/eval Remote Layer Evaluation", async () => {
+  const workerWasmPath = path.join(
+    REPO_ROOT,
+    "target",
+    "wasm32-unknown-unknown",
+    "release",
+    WORKER_WASM_FILE
+  );
+  const workerWasmModule = await WebAssembly.compile(await fs.readFile(workerWasmPath));
+
+  const writerElf = makeWriteAndExitElf({
+    stdoutText: "hello from remote wasmi\n",
+    filePath: "/workspace/out.txt",
+    fileContent: "artifact-v1\n",
+    exitCode: 0,
+  });
+  const readerElf = makeReadAndPrintElf("/workspace/out.txt");
+  const readGitElf = makeReadAndPrintElf("/workspace/README.md");
+  const loopElf = makeInfiniteLoopElf();
+  const randElf = makeGetrandomElf();
+
+  const baseLayerTarGz = buildTestTarGz([
+    { path: "bin/", type: "5", mode: 0o755 },
+    { path: "workspace/", type: "5", mode: 0o755 },
+    { path: "bin/writer", content: writerElf, mode: 0o755 },
+    { path: "bin/reader", content: readerElf, mode: 0o755 },
+    { path: "bin/readgit", content: readGitElf, mode: 0o755 },
+    { path: "bin/spin", content: loopElf, mode: 0o755 },
+    { path: "bin/rand", content: randElf, mode: 0o755 },
+  ]);
+  const baseLayerB64 = baseLayerTarGz.toString("base64");
+
+  it("evaluates a layer via JSON, returns VFS diff, and chains outputDiffTarGzBase64 into a second layer", async () => {
+    const worker = createWorkerHandler({ workerWasmModule });
+
+    // Layer 1: runs /bin/writer -> prints stdout & writes /workspace/out.txt
+    const res1 = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/eval`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          inputLayerDiffs: [baseLayerB64],
+          cmd: ["/bin/writer"],
+          cwd: "/workspace",
+        }),
+      })
+    );
+    assert.equal(res1.status, 200);
+    assert.equal(res1.headers.get("content-type"), "application/json; charset=utf-8");
+    assert.equal(res1.headers.get("cache-control"), "no-store");
+    const j1 = await res1.json();
+    assert.equal(j1.ok, true);
+    assert.equal(j1.executor, "remote-wasmi");
+    assert.equal(j1.exitCode, 0);
+    assert.equal(j1.stdout, "hello from remote wasmi\n");
+    assert.equal(j1.stderr, "");
+    assert.equal(j1.timedOut, false);
+    assert.equal(j1.error, null);
+    assert.match(j1.virtualTimeNs, /^\d+$/);
+    assert.equal(typeof j1.outputDiffTarGzBase64, "string");
+    assert.ok(j1.outputDiffTarGzBase64.length > 0);
+    assert.ok(
+      j1.modifiedFiles.some((f) => f.path === "/workspace/out.txt" && f.kind === "file" && f.size === 12),
+      `Expected /workspace/out.txt in modifiedFiles, got: ${JSON.stringify(j1.modifiedFiles)}`
+    );
+
+    // Layer 2: chains baseLayer + Layer 1's outputDiffTarGzBase64 and runs /bin/reader
+    const res2 = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/eval`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          inputLayerDiffs: [baseLayerB64, j1.outputDiffTarGzBase64],
+          cmd: ["/bin/reader"],
+          cwd: "/workspace",
+        }),
+      })
+    );
+    assert.equal(res2.status, 200);
+    const j2 = await res2.json();
+    assert.equal(j2.ok, true);
+    assert.equal(j2.exitCode, 0);
+    assert.equal(j2.stdout, "artifact-v1\n");
+  });
+
+  it("supports direct .tar.gz download via Accept: application/gzip and ?format=tar.gz", async () => {
+    const worker = createWorkerHandler({ workerWasmModule });
+    const reqBody = JSON.stringify({
+      inputLayerDiffs: [baseLayerB64],
+      cmd: ["/bin/writer"],
+      cwd: "/workspace",
+    });
+
+    for (const { url, headers, label } of [
+      {
+        url: `${WORKER_ORIGIN}/api/eval`,
+        headers: { "Content-Type": "application/json", Accept: "application/gzip" },
+        label: "Accept: application/gzip",
+      },
+      {
+        url: `${WORKER_ORIGIN}/api/eval?format=tar.gz`,
+        headers: { "Content-Type": "application/json" },
+        label: "?format=tar.gz",
+      },
+    ]) {
+      const res = await worker.fetch(new Request(url, { method: "POST", headers, body: reqBody }));
+      assert.equal(res.status, 200, label);
+      assert.equal(res.headers.get("content-type"), "application/gzip", label);
+      assert.equal(
+        res.headers.get("content-disposition"),
+        'attachment; filename="layer-output.tar.gz"',
+        label
+      );
+      assert.equal(res.headers.get("x-eval-exit-code"), "0", label);
+      assert.match(res.headers.get("x-eval-virtual-time-ns") || "", /^\d+$/, label);
+      assert.equal(res.headers.get("cache-control"), "no-store", label);
+
+      const gzBytes = Buffer.from(await res.arrayBuffer());
+      assert.equal(gzBytes[0], 0x1f, `${label}: gzip magic byte 0`);
+      assert.equal(gzBytes[1], 0x8b, `${label}: gzip magic byte 1`);
+      const tarText = zlib.gunzipSync(gzBytes).toString("utf8");
+      assert.ok(tarText.includes("workspace/out.txt"), `${label}: tar should contain workspace/out.txt`);
+      assert.ok(tarText.includes("artifact-v1\n"), `${label}: tar should contain artifact-v1`);
+    }
+  });
+
+  it("is deterministic for delayStddevMs + delaySeed and varies across different seeds", async () => {
+    const worker = createWorkerHandler({ workerWasmModule });
+    const runWithSeed = async (delaySeed) => {
+      const res = await worker.fetch(
+        new Request(`${WORKER_ORIGIN}/api/eval`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            inputLayerDiffs: [baseLayerB64],
+            cmd: ["/bin/rand"],
+            delayStddevMs: 5,
+            delaySeed,
+            returnOutputDiff: false,
+          }),
+        })
+      );
+      assert.equal(res.status, 200);
+      return res.json();
+    };
+
+    const a1 = await runWithSeed(42);
+    const a2 = await runWithSeed(42);
+    const b1 = await runWithSeed(99);
+
+    assert.match(a1.stdout, /^[a-p]{8}$/);
+    assert.equal(a1.stdout, a2.stdout, "Same seed must produce identical getrandom output");
+    assert.equal(a1.virtualTimeNs, a2.virtualTimeNs, "Same seed must produce identical virtualTimeNs");
+    assert.notEqual(
+      a1.stdout,
+      b1.stdout,
+      "Different delaySeed values must produce different deterministic PRNG output"
+    );
+  });
+
+  it("fetches baseImage + gitRepo internally through edgeCache with zero self-fetch", async () => {
+    const store = new Map();
+    const cache = {
+      async match(req) {
+        const entry = store.get(typeof req === "string" ? req : req.url);
+        if (!entry) return undefined;
+        return new Response(entry.body.slice(0), {
+          status: entry.status,
+          headers: new Headers(entry.headers),
+        });
+      },
+      async put(req, res) {
+        const buf = new Uint8Array(await res.arrayBuffer());
+        store.set(typeof req === "string" ? req : req.url, {
+          status: res.status,
+          headers: new Headers(res.headers),
+          body: buf,
+        });
+      },
+    };
+
+    const configDigest = "sha256:" + "1".repeat(64);
+    const layerDigest = "sha256:" + "2".repeat(64);
+    const amd64ManifestDigest = "sha256:" + "3".repeat(64);
+
+    const indexJson = JSON.stringify({
+      schemaVersion: 2,
+      mediaType: "application/vnd.oci.image.index.v1+json",
+      manifests: [
+        {
+          mediaType: "application/vnd.oci.image.manifest.v1+json",
+          digest: amd64ManifestDigest,
+          platform: { os: "linux", architecture: "amd64" },
+        },
+      ],
+    });
+    const manifestJson = JSON.stringify({
+      schemaVersion: 2,
+      mediaType: "application/vnd.oci.image.manifest.v1+json",
+      config: { mediaType: "application/vnd.oci.image.config.v1+json", digest: configDigest },
+      layers: [{ mediaType: "application/vnd.oci.image.layer.v1.tar+gzip", digest: layerDigest }],
+    });
+    const configJson = JSON.stringify({
+      config: { WorkingDir: "/workspace", Cmd: ["/bin/readgit"] },
+    });
+    const gitTarGz = buildTestTarGz([
+      { path: "demo-main/README.md", content: "hello from git repo\n" },
+    ]);
+
+    let upstreamFetches = 0;
+    const waitUntilPromises = [];
+    const ctx = { waitUntil: (p) => waitUntilPromises.push(p) };
+
+    const worker = createWorkerHandler({
+      workerWasmModule,
+      cache,
+      fetchImpl: async (url) => {
+        upstreamFetches++;
+        if (url.endsWith("/manifests/latest")) {
+          return new Response(indexJson, {
+            status: 200,
+            headers: { "Content-Type": "application/vnd.oci.image.index.v1+json" },
+          });
+        }
+        if (url.endsWith(`/manifests/${amd64ManifestDigest}`)) {
+          return new Response(manifestJson, {
+            status: 200,
+            headers: { "Content-Type": "application/vnd.oci.image.manifest.v1+json" },
+          });
+        }
+        if (url.endsWith(`/blobs/${configDigest}`)) {
+          return new Response(configJson, {
+            status: 200,
+            headers: { "Content-Type": "application/vnd.oci.image.config.v1+json" },
+          });
+        }
+        if (url.endsWith(`/blobs/${layerDigest}`)) {
+          return new Response(baseLayerTarGz, {
+            status: 200,
+            headers: { "Content-Type": "application/vnd.oci.image.layer.v1.tar+gzip" },
+          });
+        }
+        if (url === "https://codeload.github.com/octocat/demo/tar.gz/main") {
+          return new Response(gitTarGz, {
+            status: 200,
+            headers: { "Content-Type": "application/gzip" },
+          });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+
+    const evalPayload = JSON.stringify({
+      baseImage: "ghcr.io/test/app:latest",
+      gitRepo: { repo: "octocat/demo", ref: "main", mountPath: "/workspace" },
+    });
+
+    const r1 = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/eval`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: evalPayload,
+      }),
+      {},
+      ctx
+    );
+    assert.equal(r1.status, 200);
+    const j1 = await r1.json();
+    assert.equal(j1.ok, true);
+    assert.equal(j1.stdout, "hello from git repo\n");
+    await Promise.all(waitUntilPromises);
+    assert.equal(upstreamFetches, 5, "First eval fetches index, manifest, config, layer, and git archive");
+
+    // Second eval hits edgeCache with zero additional upstream fetches
+    const r2 = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/eval`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: evalPayload,
+      }),
+      {},
+      ctx
+    );
+    assert.equal(r2.status, 200);
+    const j2 = await r2.json();
+    assert.equal(j2.stdout, "hello from git repo\n");
+    assert.equal(upstreamFetches, 5, "Second eval must hit edgeCache with 0 upstream fetches");
+  });
+
+  it("handles OPTIONS CORS preflight, 405 methods, and structured 400/408/413/502/507 errors", async () => {
+    const worker = createWorkerHandler({
+      workerWasmModule,
+      allowedOrigins: "https://app.example.com",
+      maxEvalBodyBytes: 1024,
+      fetchImpl: async () => new Response("not found", { status: 404 }),
+    });
+
+    // OPTIONS allowed origin -> 204
+    const optOk = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/eval`, {
+        method: "OPTIONS",
+        headers: { Origin: "https://app.example.com" },
+      })
+    );
+    assert.equal(optOk.status, 204);
+    assert.equal(optOk.headers.get("access-control-allow-origin"), "https://app.example.com");
+    assert.ok((optOk.headers.get("access-control-allow-methods") || "").includes("POST"));
+    assert.ok((optOk.headers.get("access-control-allow-headers") || "").includes("Content-Type"));
+    const exposed = optOk.headers.get("access-control-expose-headers") || "";
+    assert.ok(exposed.includes("Content-Disposition"));
+    assert.ok(exposed.includes("X-Eval-Exit-Code"));
+    assert.ok(exposed.includes("X-Eval-Virtual-Time-Ns"));
+
+    // OPTIONS disallowed origin -> 403
+    const optBad = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/eval`, {
+        method: "OPTIONS",
+        headers: { Origin: "https://evil.example.com" },
+      })
+    );
+    assert.equal(optBad.status, 403);
+
+    // GET -> 405
+    const getRes = await worker.fetch(new Request(`${WORKER_ORIGIN}/api/eval`, { method: "GET" }));
+    assert.equal(getRes.status, 405);
+    assert.equal(getRes.headers.get("allow"), "POST, OPTIONS");
+
+    // 400 INVALID_REQUEST (malformed JSON)
+    const badJson = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/eval`, { method: "POST", body: "{not json" })
+    );
+    assert.equal(badJson.status, 400);
+    assert.equal((await badJson.json()).code, "INVALID_REQUEST");
+
+    // 413 payload too large
+    const tooLarge = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/eval`, {
+        method: "POST",
+        body: "x".repeat(2048),
+      })
+    );
+    assert.equal(tooLarge.status, 413);
+    assert.equal((await tooLarge.json()).code, "INVALID_REQUEST");
+
+    // 502 UPSTREAM_ERROR (upstream 404)
+    const upErr = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/eval`, {
+        method: "POST",
+        body: JSON.stringify({ baseImage: "ghcr.io/missing/img:latest", cmd: ["/bin/writer"] }),
+      })
+    );
+    assert.equal(upErr.status, 502);
+    assert.equal((await upErr.json()).code, "UPSTREAM_ERROR");
+
+    // Use default body limit for 408 and 507 tests
+    const fullWorker = createWorkerHandler({ workerWasmModule });
+
+    // 408 FUEL_EXHAUSTED (infinite loop ELF)
+    const fuelRes = await fullWorker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/eval`, {
+        method: "POST",
+        body: JSON.stringify({
+          inputLayerDiffs: [baseLayerB64],
+          cmd: ["/bin/spin"],
+          maxFuel: 5000,
+        }),
+      })
+    );
+    assert.equal(fuelRes.status, 408);
+    assert.equal((await fuelRes.json()).code, "FUEL_EXHAUSTED");
+
+    // 507 MEMORY_LIMIT
+    const memRes = await fullWorker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/eval`, {
+        method: "POST",
+        body: JSON.stringify({
+          inputLayerDiffs: [baseLayerB64],
+          cmd: ["/bin/writer"],
+          maxMemoryBytes: 65536,
+        }),
+      })
+    );
+    assert.equal(memRes.status, 507);
+    assert.equal((await memRes.json()).code, "MEMORY_LIMIT");
+  });
+});
+
 
 
 
