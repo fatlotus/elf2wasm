@@ -4466,6 +4466,85 @@ test("M4: WorkerBackend + container_worker.mjs runLayerPipeline RPC & pipelineEv
   }
 });
 
+test("M4 regression: relative WORKDIR resolution, downstream ENV after SWEEP precedence, remote Uint8Array stdin, and partial output on failed remote response", async () => {
+  const seenRequests = [];
+  const remoteFetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    seenRequests.push({ url: String(url), body });
+    if (body.cmd.join(" ").includes("fail_partial")) {
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          executor: "remote-wasmi",
+          exitCode: 124,
+          stdout: "partial-out\n",
+          stderr: "partial-err\n",
+          timedOut: true,
+          error: "Fuel exhausted",
+          code: "FUEL_EXHAUSTED",
+        }),
+        { status: 408, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    const modeEntry = (body.env || []).find((e) => e.startsWith("MODE=")) || "";
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        executor: "remote-wasmi",
+        exitCode: 0,
+        stdout: `cwd=${body.cwd} ${modeEntry} stdin=${body.stdin}\n`,
+        stderr: "",
+        virtualTimeNs: "100",
+        modifiedFiles: [],
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  };
+
+  // 1. Relative WORKDIR resolution + downstream ENV after SWEEP + Uint8Array stdin
+  const res = await runLayerPipeline(
+    [
+      { id: "l1", type: "from", image: "alpine:latest", executor: "remote" },
+      { id: "l2", type: "workdir", path: "/workspace" },
+      { id: "l3", type: "workdir", path: "sub" },
+      { id: "l4", type: "workdir", path: "../other" },
+      { id: "l5", type: "sweep", param: "env", envKey: "MODE", mode: "list", values: ["fast", "slow"] },
+      { id: "l6", type: "env", key: "MODE", value: "default" },
+      { id: "l7", type: "run", cmd: "echo $MODE", executor: "remote" },
+    ],
+    {
+      apiBase: "http://mock.local",
+      fetch: remoteFetch,
+      stdin: new TextEncoder().encode("hello-bytes"),
+    }
+  );
+
+  assert.equal(res.ok, true);
+  assert.equal(res.sweep.variations.length, 2);
+  assert.equal(seenRequests.length, 2);
+  assert.equal(seenRequests[0].body.cwd, "/workspace/other");
+  assert.equal(seenRequests[0].body.stdin, "hello-bytes");
+  assert.equal(res.sweep.variations[0].stdout.trim(), "cwd=/workspace/other MODE=fast stdin=hello-bytes");
+  assert.equal(res.sweep.variations[1].stdout.trim(), "cwd=/workspace/other MODE=slow stdin=hello-bytes");
+
+  // 2. Partial stdout/stderr emitted via onLayerOutput on failed remote response
+  const emitted = [];
+  const failRes = await runLayerPipeline(
+    [
+      { id: "f1", type: "from", image: "alpine:latest", executor: "remote" },
+      { id: "f2", type: "run", cmd: "fail_partial", executor: "remote" },
+    ],
+    {
+      apiBase: "http://mock.local",
+      fetch: remoteFetch,
+      onLayerOutput: (ev) => emitted.push(`${ev.stream}:${textDecoder.decode(ev.chunk).trim()}`),
+    }
+  );
+  assert.equal(failRes.ok, false);
+  assert.equal(failRes.layers[1].errorCode, "FUEL_EXHAUSTED");
+  assert.deepEqual(emitted, ["stdout:partial-out", "stderr:partial-err"]);
+});
+
 
 
 

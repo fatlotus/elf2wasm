@@ -2518,6 +2518,27 @@ function pipelineNeedsLocalEngine(layers, executorOverride) {
   return false;
 }
 
+function resolvePosixWorkdir(currentCwd, rawPath) {
+  const raw = String(rawPath || "").trim();
+  if (!raw) return currentCwd || "/";
+  const base = raw.startsWith("/")
+    ? "/"
+    : currentCwd && currentCwd.startsWith("/")
+      ? currentCwd
+      : "/";
+  const combined = raw.startsWith("/") ? raw : `${base}/${raw}`;
+  const segments = [];
+  for (const seg of combined.split("/")) {
+    if (!seg || seg === ".") continue;
+    if (seg === "..") {
+      if (segments.length > 0) segments.pop();
+    } else {
+      segments.push(seg);
+    }
+  }
+  return "/" + segments.join("/");
+}
+
 function resolveEvalUrl(apiBase) {
   if (typeof apiBase === "string" && apiBase.trim()) {
     return `${apiBase.trim().replace(/\/+$/, "")}/api/eval`;
@@ -2745,7 +2766,10 @@ async function executeLayerPipeline(layers, options = {}, engine = null) {
       if (typeof options.onLayerStart === "function") {
         options.onLayerStart({ layerIndex, layer, executor: null, variationIndex, variation });
       }
-      state.cwd = String(layer.path || "").trim();
+      const baseCwd =
+        state.cwd ||
+        (state.gitRepos.length > 0 ? state.gitRepos[state.gitRepos.length - 1].mountPath : "/");
+      state.cwd = resolvePosixWorkdir(baseCwd, layer.path);
       const res = {
         layerIndex,
         layerId,
@@ -2802,6 +2826,9 @@ async function executeLayerPipeline(layers, options = {}, engine = null) {
         : ["sh", "-c", String(layer.cmd ?? "")];
       const effectiveCwd =
         state.cwd || (state.gitRepos.length > 0 ? state.gitRepos[state.gitRepos.length - 1].mountPath : "");
+      const effectiveEnv = variation?.envOverride
+        ? mergeEnv(state.env, [], [`${variation.envOverride[0]}=${variation.envOverride[1]}`])
+        : state.env;
 
       if (target === "local") {
         const cid = await ensureLocalContainer();
@@ -2812,7 +2839,7 @@ async function executeLayerPipeline(layers, options = {}, engine = null) {
         try {
           execRes = await engine.execContainer(cid, {
             cmd: cmdArgv,
-            env: state.env,
+            env: effectiveEnv,
             cwd: effectiveCwd || undefined,
             tty: false,
             stdin: options.stdin !== undefined ? options.stdin : "",
@@ -2880,6 +2907,18 @@ async function executeLayerPipeline(layers, options = {}, engine = null) {
 
       // Remote execution via POST /api/eval
       const evalUrl = resolveEvalUrl(options.apiBase);
+      const remoteStdin =
+        typeof options.stdin === "string"
+          ? options.stdin
+          : ArrayBuffer.isView(options.stdin)
+            ? textDecoder.decode(
+                new Uint8Array(
+                  options.stdin.buffer,
+                  options.stdin.byteOffset,
+                  options.stdin.byteLength
+                )
+              )
+            : "";
       const reqBody = {
         baseImage: state.baseImage,
         ...(state.gitRepos.length > 0
@@ -2887,10 +2926,10 @@ async function executeLayerPipeline(layers, options = {}, engine = null) {
           : {}),
         inputLayerDiffs: state.inputLayerDiffs,
         cmd: cmdArgv,
-        env: state.env,
+        env: effectiveEnv,
         cwd: effectiveCwd,
         user: options.user ?? "",
-        stdin: typeof options.stdin === "string" ? options.stdin : "",
+        stdin: remoteStdin,
         delayStddevMs,
         delaySeed,
         timeoutMs: options.timeoutMs ?? 30000,
@@ -2940,6 +2979,30 @@ async function executeLayerPipeline(layers, options = {}, engine = null) {
       }
 
       if (!resp.ok || !data || data.ok === false) {
+        const failStdout = typeof data?.stdout === "string" ? data.stdout : "";
+        const failStderr = typeof data?.stderr === "string" ? data.stderr : "";
+        if (typeof options.onLayerOutput === "function") {
+          if (failStdout) {
+            options.onLayerOutput({
+              layerIndex,
+              layer,
+              stream: "stdout",
+              chunk: textEncoder.encode(failStdout),
+              variationIndex,
+              variation,
+            });
+          }
+          if (failStderr) {
+            options.onLayerOutput({
+              layerIndex,
+              layer,
+              stream: "stderr",
+              chunk: textEncoder.encode(failStderr),
+              variationIndex,
+              variation,
+            });
+          }
+        }
         const failRes = {
           layerIndex,
           layerId,
@@ -2947,8 +3010,8 @@ async function executeLayerPipeline(layers, options = {}, engine = null) {
           executor: data?.executor || "remote",
           ok: false,
           exitCode: typeof data?.exitCode === "number" ? data.exitCode : 1,
-          stdout: typeof data?.stdout === "string" ? data.stdout : "",
-          stderr: typeof data?.stderr === "string" ? data.stderr : "",
+          stdout: failStdout,
+          stderr: failStderr,
           virtualTimeNs: data?.virtualTimeNs ?? 0,
           ...(data?.timedOut ? { timedOut: true } : {}),
           error: data?.error || `Remote eval failed (HTTP ${resp.status})`,
