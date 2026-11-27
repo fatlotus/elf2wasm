@@ -5,6 +5,9 @@
 ## Commits
 - `6476d82` — `e2e: remove stale native-CLI/nushell refs and extend CDP, server & /api/eval helpers`
 - `39cff2d` — `e2e: add 4-tier v2 opaque-box E2E suite (F1-F14) and TEST_INFRA.md`
+- `e157ae8` — `e2e: publish TEST_READY.md for F16 v2 E2E suite`
+- `fff2627` — `e2e: fix template-literal regex escaping, deduplicate downloads, and add transparent-child self-test`
+- `7a1c851` — `e2e: harden Tiers 1-4 against silent passes, async polling races, and vacuous assertions`
 
 ## Exact Runner Commands
 
@@ -52,10 +55,10 @@ node e2e_docker_web/run_all.mjs --self-test
 1. **Syntax Validation (`node --check` on all `.mjs` files in `e2e_docker_web/` and `e2e_docker_web/helpers/`)**:
    - Result: `ALL_SYNTAX_OK` (exit 0)
 2. **v2 Harness Self-Test (`node e2e_docker_web/run_v2_e2e.mjs --self-test`)**:
-   - `PASS [V2-ST-1]` `tar_builder` & `eval_client` base64 tar.gz round-trip including OCI whiteouts (6ms)
-   - `PASS [V2-ST-2]` `eval_client` `postEvalJson` & `postEvalTarGz` against mock HTTP `/api/eval` (49ms)
-   - `PASS [V2-ST-3]` `mock_oci_registry` & `mock_git_server` startup & fixture serving (30ms)
-   - `PASS [V2-ST-4]` `cdp_browser` WCAG helpers, `setColorScheme('light'|'dark')`, `setViewport(390, 844)`, and real Chrome blob `.tar.gz` download capture (2848ms)
-   - Result: **4/4 PASS (2.9s, exit 0)**
+   - `PASS [V2-ST-1]` `tar_builder` & `eval_client` base64 tar.gz round-trip including OCI whiteouts (4ms)
+   - `PASS [V2-ST-2]` `eval_client` `postEvalJson` & `postEvalTarGz` against mock HTTP `/api/eval` (56ms)
+   - `PASS [V2-ST-3]` `mock_oci_registry` & `mock_git_server` startup & fixture serving (53ms)
+   - `PASS [V2-ST-4]` `cdp_browser` WCAG helpers, transparent-child `getEffectiveColors` ancestor walking, `setColorScheme('light'|'dark')`, `setViewport(390, 844)`, and real Chrome blob `.tar.gz` download capture (2917ms)
+   - Result: **4/4 PASS (3.0s, exit 0)**
 3. **Existing Harness Regression Self-Test (`node e2e_docker_web/run_all.mjs --self-test`)**:
-   - Result: **6/6 PASS (10.9s, exit 0)**
+   - Result: **6/6 PASS (3.5s, exit 0)**
