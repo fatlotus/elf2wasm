@@ -20,8 +20,19 @@ const GITHUB_SSH_RE = /^git@github\.com:([^/\s]+)\/([^/\s#?]+?)(?:\.git)?$/i;
 const OWNER_REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
 function round3(n) {
-  const r = Math.round(n * 1000) / 1000;
-  return r === 0 ? 0 : r;
+  if (!Number.isFinite(n)) return 0;
+  const scaled = n * 1000;
+  if (!Number.isFinite(scaled)) return Object.is(n, -0) ? 0 : n;
+  const r = Math.round(scaled) / 1000;
+  return Object.is(r, -0) ? 0 : r;
+}
+
+function hasTrailingContinuationBackslash(line) {
+  let count = 0;
+  for (let idx = line.length - 1; idx >= 0 && line[idx] === "\\"; idx--) {
+    count++;
+  }
+  return count % 2 === 1;
 }
 
 function normalizeZero(n) {
@@ -765,10 +776,47 @@ export function parseDockerfile(text) {
       continue;
     }
 
+    // Check for BuildKit heredoc syntax: RUN <<'DELIM' / RUN <<"DELIM" / RUN <<DELIM / RUN <<-DELIM
+    const heredocMatch = /^RUN\s+<<(-?)(?:'([^'\s]+)'|"([^"\s]+)"|([A-Za-z_][A-Za-z0-9_]*))\s*$/i.exec(
+      trimmed
+    );
+    if (heredocMatch) {
+      const stripTabs = heredocMatch[1] === "-";
+      const delim = heredocMatch[2] || heredocMatch[3] || heredocMatch[4];
+      const bodyLines = [];
+      let closed = false;
+      while (i < rawLines.length) {
+        const nextRaw = rawLines[i];
+        i++;
+        const checkLine = stripTabs ? nextRaw.replace(/^\t+/, "") : nextRaw;
+        if (checkLine === delim) {
+          closed = true;
+          break;
+        }
+        bodyLines.push(stripTabs ? nextRaw.replace(/^\t+/, "") : nextRaw);
+      }
+      if (!closed) {
+        warnings.push(`Line ${startLineNum}: Unterminated RUN heredoc <<${delim}`);
+      }
+      const executor = consumePendingExecutor();
+      const cmdStr = bodyLines.join("\n").trim();
+      if (!cmdStr) {
+        warnings.push(`Line ${startLineNum}: RUN directive is missing a command`);
+        continue;
+      }
+      layers.push({
+        id: makeId(),
+        type: "run",
+        cmd: cmdStr,
+        executor,
+      });
+      continue;
+    }
+
     // Non-comment Dockerfile instruction: handle trailing backslash continuations
     const parts = [];
     let currentLine = trimmed;
-    while (currentLine.endsWith("\\") && !currentLine.endsWith("\\\\")) {
+    while (hasTrailingContinuationBackslash(currentLine)) {
       parts.push(currentLine.slice(0, -1).replace(/[ \t]+$/, ""));
       // Skip intermediate blank lines and comments during continuation
       let nextFound = false;
@@ -798,26 +846,9 @@ export function parseDockerfile(text) {
     }
 
     const directive = dirMatch[1].toUpperCase();
-    let rest;
-    if (directive === "RUN" && parts.length > 1) {
-      const runParts = [dirMatch[2] ?? "", ...parts.slice(1)];
-      // Join continuation lines: preserve newlines for multi-line scripts,
-      // except when a continuation line begins with a shell chaining operator (`&&`, `||`, `|`, `;`).
-      let combined = runParts[0];
-      for (let p = 1; p < runParts.length; p++) {
-        const seg = runParts[p];
-        if (/^(?:&&|\|\||\||;)/.test(seg)) {
-          combined += (combined.endsWith(" ") ? "" : " ") + seg;
-        } else {
-          combined += "\n" + seg;
-        }
-      }
-      rest = combined.trim();
-    } else {
-      const joined = parts.join(" ");
-      const m2 = /^[A-Za-z]+(?:\s+([\s\S]*))?$/.exec(joined);
-      rest = (m2 && m2[1] ? m2[1] : "").trim();
-    }
+    const joined = parts.join(" ");
+    const m2 = /^[A-Za-z]+(?:\s+([\s\S]*))?$/.exec(joined);
+    const rest = (m2 && m2[1] ? m2[1] : "").trim();
 
     switch (directive) {
       case "FROM": {
@@ -1026,13 +1057,21 @@ export function serializeDockerfile(layers) {
       if (normalizeExecutor(rawLayer.executor) === "remote") {
         lines.push("# elf2wasm:executor=remote");
       }
-      const formatted = cmd.includes("\n")
-        ? cmd
-            .split("\n")
-            .map((seg) => seg.trim())
-            .join(" \\\n  ")
-        : cmd;
-      lines.push(`RUN ${formatted}`);
+      if (cmd.includes("\n")) {
+        const cmdLines = cmd.split("\n");
+        let delim = "ELF2WASM_EOF";
+        let suffix = 1;
+        while (cmdLines.some((l) => l === delim)) {
+          delim = `ELF2WASM_EOF_${suffix++}`;
+        }
+        lines.push(`RUN <<'${delim}'`);
+        for (const cl of cmdLines) {
+          lines.push(cl);
+        }
+        lines.push(delim);
+      } else {
+        lines.push(`RUN ${cmd}`);
+      }
       continue;
     }
 

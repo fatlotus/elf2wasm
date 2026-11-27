@@ -55,6 +55,7 @@ const MANAGED_QUERY_KEYS = Object.freeze([
   "cwd",
   "env",
   "stddev",
+  "delay",
   "seed",
   "sweep",
   "runs",
@@ -480,6 +481,15 @@ export function parseStateFromSearch(search, presets = null) {
     const executorMode = normalizeExecutorMode(params.get("executor"), inferredExecutor);
     const state = projectLayersToLegacyState(layers);
 
+    if (params.has("stddev")) {
+      state.stddev = parseNonNegNumber(params.get("stddev"), DEFAULT_UI_STATE.stddev);
+    } else if (params.has("delay")) {
+      state.stddev = parseNonNegNumber(params.get("delay"), DEFAULT_UI_STATE.stddev);
+    }
+    if (params.has("seed")) {
+      state.seed = parseNonNegInt(params.get("seed"), DEFAULT_UI_STATE.seed);
+    }
+
     const sweepLayer = layers.find((l) => l.type === "sweep") || null;
     const sweepCount = sweepLayer ? expandSweepValues(sweepLayer).length : 0;
     const rawSelected =
@@ -601,45 +611,55 @@ export function parseStateFromSearch(search, presets = null) {
 
   if (params.has("stddev")) {
     state.stddev = parseNonNegNumber(params.get("stddev"), DEFAULT_UI_STATE.stddev);
+  } else if (params.has("delay")) {
+    state.stddev = parseNonNegNumber(params.get("delay"), DEFAULT_UI_STATE.stddev);
   }
   if (params.has("seed")) {
     state.seed = parseNonNegInt(params.get("seed"), DEFAULT_UI_STATE.seed);
   }
+  let hasLegacySweepOverride = false;
   if (params.has("sweep")) {
     state.sweep = parseBoolFlag(params.get("sweep"));
+    hasLegacySweepOverride = true;
   }
   if (params.has("runs")) {
     state.runs = parseNonNegInt(params.get("runs"), DEFAULT_UI_STATE.runs, {
       min: 1,
       max: MAX_SWEEP_RUNS,
     });
+    hasLegacySweepOverride = true;
   } else if (params.has("sweepCount")) {
     state.runs = parseNonNegInt(params.get("sweepCount"), DEFAULT_UI_STATE.runs, {
       min: 1,
       max: MAX_SWEEP_RUNS,
     });
+    hasLegacySweepOverride = true;
   }
   if (params.has("stddevStart")) {
     state.stddevStart = parseNonNegNumber(
       params.get("stddevStart"),
       DEFAULT_UI_STATE.stddevStart
     );
+    hasLegacySweepOverride = true;
   } else if (params.has("sweepStart")) {
     state.stddevStart = parseNonNegNumber(
       params.get("sweepStart"),
       DEFAULT_UI_STATE.stddevStart
     );
+    hasLegacySweepOverride = true;
   }
   if (params.has("stddevStep")) {
     state.stddevStep = parseNonNegNumber(
       params.get("stddevStep"),
       DEFAULT_UI_STATE.stddevStep
     );
+    hasLegacySweepOverride = true;
   } else if (params.has("sweepStep")) {
     state.stddevStep = parseNonNegNumber(
       params.get("sweepStep"),
       DEFAULT_UI_STATE.stddevStep
     );
+    hasLegacySweepOverride = true;
   }
   if (state.sweep && (params.has("selectedRun") || params.has("selectedSweepRun"))) {
     state.selectedRun = parseSelectedRun(
@@ -650,8 +670,46 @@ export function parseStateFromSearch(search, presets = null) {
     state.selectedRun = null;
   }
 
-  const layers =
-    presetLayers && !hasLegacyFieldOverride ? presetLayers : legacyStateToLayers(state);
+  let layers;
+  if (presetLayers && !hasLegacyFieldOverride) {
+    if (hasLegacySweepOverride) {
+      const updated = presetLayers.filter((l) => l.type !== "sweep");
+      if (state.sweep) {
+        const sweepLayer = {
+          id: "layer-sweep",
+          type: "sweep",
+          param: "delay",
+          mode: "range",
+          start: state.stddevStart,
+          step: state.stddevStep,
+          count: state.runs,
+        };
+        const existingSweepIdx = presetLayers.findIndex((l) => l.type === "sweep");
+        if (existingSweepIdx >= 0) {
+          const insertIdx = Math.min(existingSweepIdx, updated.length);
+          updated.splice(insertIdx, 0, sweepLayer);
+        } else {
+          let lastRunIdx = -1;
+          for (let idx = updated.length - 1; idx >= 0; idx--) {
+            if (updated[idx].type === "run") {
+              lastRunIdx = idx;
+              break;
+            }
+          }
+          if (lastRunIdx >= 0) {
+            updated.splice(lastRunIdx, 0, sweepLayer);
+          } else {
+            updated.push(sweepLayer);
+          }
+        }
+      }
+      layers = parseDockerfile(serializeDockerfile(updated)).layers;
+    } else {
+      layers = presetLayers;
+    }
+  } else {
+    layers = legacyStateToLayers(state);
+  }
   const dockerfile = serializeDockerfile(layers);
   const executorMode = normalizeExecutorMode(params.get("executor"), inferExecutorMode(layers));
   const selectedSweepRun = state.selectedRun;
@@ -852,6 +910,57 @@ export function buildRunSearch(state, runParams = {}, options = {}) {
 
   const stddev = parseNonNegNumber(runParams?.stddev ?? runParams?.stddevMs, 0);
   const seed = parseNonNegInt(runParams?.seed, 0);
+
+  if (Array.isArray(state?.layers) || typeof state?.dockerfile === "string") {
+    const rawDf = Array.isArray(state.layers)
+      ? serializeDockerfile(state.layers)
+      : String(state.dockerfile ?? "");
+    const parsedLayers = parseDockerfile(rawDf).layers;
+
+    const filtered = [];
+    let insertAt = -1;
+    for (const l of parsedLayers) {
+      if (l.type === "sweep") {
+        if (insertAt === -1) insertAt = filtered.length;
+        continue;
+      }
+      filtered.push(l);
+    }
+
+    let envPair = null;
+    if (Array.isArray(runParams?.envOverride) && runParams.envOverride.length >= 2) {
+      const k = cleanSingleLine(runParams.envOverride[0]);
+      if (k) envPair = [k, String(runParams.envOverride[1] ?? "")];
+    } else if (runParams?.envOverride && typeof runParams.envOverride === "object") {
+      const k = cleanSingleLine(runParams.envOverride.key);
+      if (k) envPair = [k, String(runParams.envOverride.value ?? "")];
+    }
+
+    if (envPair) {
+      const [k, v] = envPair;
+      const pos = insertAt >= 0 ? insertAt : filtered.length;
+      const before = filtered.slice(0, pos);
+      const after = filtered.slice(pos).filter((l) => !(l.type === "env" && l.key === k));
+      filtered.length = 0;
+      filtered.push(...before, { id: "layer-env-override", type: "env", key: k, value: v }, ...after);
+    }
+
+    const baseSearch = serializeStateToSearch(
+      {
+        ...state,
+        layers: filtered,
+        dockerfile: undefined,
+        selectedSweepRun: null,
+        selectedRun: null,
+      },
+      { existingSearch }
+    );
+
+    const params = new URLSearchParams(baseSearch);
+    params.set("stddev", String(stddev));
+    params.set("seed", String(seed));
+    return `?${params.toString()}`;
+  }
 
   const baseSearch = serializeStateToSearch(
     {

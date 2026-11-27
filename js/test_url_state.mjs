@@ -758,5 +758,69 @@ describe("web/url_state.mjs: M4 Dockerfile layer stack, executorMode, theme & se
     const reparsed = parseStateFromSearch(serialized, dfPresets);
     assert.equal(reparsed.activePresetId, "express");
   });
+
+  it("synthesizes or strips sweep layer when Dockerfile preset has legacy sweep overrides", () => {
+    const presets = {
+      flask: {
+        dockerfile: "FROM python:3.12-slim\nRUN echo build\nRUN echo flask",
+      },
+      flaskSweep: {
+        dockerfile:
+          "FROM python:3.12-slim\n# elf2wasm:sweep param=delay mode=range start=1 step=1 count=3\nRUN echo flask",
+      },
+    };
+
+    const withSweep = parseStateFromSearch(
+      "?preset=flask&sweep=1&runs=5&stddevStart=2&stddevStep=0.5",
+      presets
+    );
+    assert.equal(withSweep.state.sweep, true);
+    assert.equal(withSweep.state.runs, 5);
+    assert.equal(withSweep.layers.length, 4);
+    assert.equal(withSweep.layers[1].cmd, "echo build");
+    assert.deepEqual(withSweep.layers[2], {
+      id: "layer-3",
+      type: "sweep",
+      param: "delay",
+      mode: "range",
+      start: 2,
+      step: 0.5,
+      count: 5,
+    });
+    assert.equal(withSweep.layers[3].cmd, "echo flask");
+
+    const disabledSweep = parseStateFromSearch("?preset=flaskSweep&sweep=0", presets);
+    assert.equal(disabledSweep.state.sweep, false);
+    assert.equal(disabledSweep.layers.some((l) => l.type === "sweep"), false);
+    assert.equal(disabledSweep.layers.length, 2);
+  });
+
+  it("supports buildRunSearch() in Dockerfile mode (strips sweep, injects envOverride, hydrates stddev/seed/delay)", () => {
+    const parsed = parseStateFromSearch(
+      "?dockerfile=FROM+alpine%3Alatest%0A%23+elf2wasm%3Asweep+param%3Ddelay+mode%3Drange+start%3D1+step%3D1+count%3D5%0AENV+MODE%3Ddefault%0ARUN+echo+hi"
+    );
+    assert.equal(parsed.layers.some((l) => l.type === "sweep"), true);
+
+    const runUrl = buildRunSearch(
+      { ...parsed.state, layers: parsed.layers },
+      { stddev: 3, seed: 42, envOverride: ["MODE", "fast"] },
+      { existingSearch: "?utm=keep" }
+    );
+    assert.match(runUrl, /utm=keep/);
+    const reparsed = parseStateFromSearch(runUrl);
+    assert.equal(reparsed.layers.some((l) => l.type === "sweep"), false);
+    assert.equal(reparsed.state.stddev, 3);
+    assert.equal(reparsed.state.seed, 42);
+    const modeEnvs = reparsed.layers.filter((l) => l.type === "env" && l.key === "MODE");
+    assert.equal(modeEnvs.length, 1);
+    assert.equal(modeEnvs[0].value, "fast");
+
+    // delay alias in Dockerfile and legacy modes
+    const delayDf = parseStateFromSearch("?dockerfile=FROM+alpine%3Alatest%0ARUN+echo+ok&delay=2.5&seed=7");
+    assert.equal(delayDf.state.stddev, 2.5);
+    assert.equal(delayDf.state.seed, 7);
+    const delayLegacy = parseStateFromSearch("?image=alpine:latest&delay=4.25");
+    assert.equal(delayLegacy.state.stddev, 4.25);
+  });
 });
 

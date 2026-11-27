@@ -232,20 +232,38 @@ FROM alpine:latest
     ]);
   });
 
-  it("handles backslash line continuations across blank and comment lines", () => {
+  it("handles backslash line continuations across blank and comment lines with single-space joining", () => {
     const df = `
 FROM alpine:latest
 RUN echo first \\
   # intermediate comment
 
   && echo second
-RUN echo line1 \\
-  echo line2
+RUN apk add --no-cache \\
+  curl \\
+  jq
+RUN git clone \\
+  --branch main \\
+  https://github.com/org/repo /app
+RUN echo foo\\\\\\
+  && echo bar
 `;
     const { layers, warnings } = parseDockerfile(df);
     assert.deepEqual(warnings, []);
+    assert.equal(layers[1].type, "run");
     assert.equal(layers[1].cmd, "echo first && echo second");
-    assert.equal(layers[2].cmd, "echo line1\necho line2");
+    assert.equal(layers[2].type, "run");
+    assert.equal(layers[2].cmd, "apk add --no-cache curl jq");
+    assert.deepEqual(layers[3], {
+      id: "layer-4",
+      type: "git",
+      repo: "org/repo",
+      ref: "main",
+      mountPath: "/app",
+      executor: "local",
+    });
+    assert.equal(layers[4].type, "run");
+    assert.equal(layers[4].cmd, "echo foo\\\\ && echo bar");
   });
 
   it("emits line-numbered warnings for unsupported directives, non-amd64 platform, and multi-stage AS", () => {
@@ -393,5 +411,33 @@ describe("web/dockerfile.mjs: expandSweepValues", () => {
       expandSweepValues({ type: "sweep", param: "delay", mode: "range", start: 0, step: 1, count: 5000 }).length,
       MAX_SWEEP_COUNT
     );
+  });
+
+  it("round-trips multi-line literal-newline RUN scripts losslessly via BuildKit heredoc", () => {
+    const input = [
+      { id: "layer-1", type: "from", image: "alpine:latest", executor: "local" },
+      { id: "layer-2", type: "run", cmd: "echo line1\necho ELF2WASM_EOF\nELF2WASM_EOF\necho line2", executor: "remote" },
+    ];
+    const text = serializeDockerfile(input);
+    assert.match(text, /# elf2wasm:executor=remote\nRUN <<'ELF2WASM_EOF_1'/);
+    const { layers, warnings } = parseDockerfile(text);
+    assert.deepEqual(warnings, []);
+    assert.deepEqual(layers, input);
+  });
+
+  it("keeps huge finite env sweep range values finite without round3() Infinity overflow", () => {
+    const df = "# elf2wasm:sweep param=env envKey=BIG mode=range start=1e306 step=1 count=2";
+    const { layers, warnings } = parseDockerfile(df);
+    assert.deepEqual(warnings, []);
+    assert.equal(layers.length, 1);
+    assert.equal(Number.isFinite(layers[0].start), true);
+    assert.equal(layers[0].start, 1e306);
+    const serialized = serializeDockerfile(layers);
+    const reparsed = parseDockerfile(serialized);
+    assert.deepEqual(reparsed.warnings, []);
+    assert.deepEqual(reparsed.layers, layers);
+    const expanded = expandSweepValues(layers[0]);
+    assert.equal(expanded.length, 2);
+    assert.equal(expanded[0].envOverride[1], String(1e306));
   });
 });
