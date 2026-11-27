@@ -36,7 +36,6 @@ import { launchCdpBrowser } from "./helpers/cdp_browser.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const PROBE_CACHE_DIR = "/tmp/elf2wasm-e2e-cache/delay-sweep";
-export const NATIVE_CLI_BIN = path.join(REPO_ROOT, "target", "release", "elf2wasm");
 export const JS_CLI_PATH = path.join(REPO_ROOT, "js", "cli.mjs");
 
 // Compact static x86-64 C probe exercising real non-blocking IPv4 TCP loopback,

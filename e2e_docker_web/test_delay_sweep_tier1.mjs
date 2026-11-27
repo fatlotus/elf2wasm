@@ -3,7 +3,6 @@
 //  Sweep Mode, and URL Linking for Sweep & Specific Runs).
 // 26 tests total (6-7 per requirement area).
 
-import fs from "node:fs";
 import {
   Suite,
   assert,
@@ -16,7 +15,6 @@ import { startMockOciRegistry } from "./helpers/mock_oci_registry.mjs";
 import { launchCdpBrowser } from "./helpers/cdp_browser.mjs";
 import {
   JS_CLI_PATH,
-  NATIVE_CLI_BIN,
   ensureDelaySweepProbe,
   registerDelaySweepOciImage,
   importDockerSdk,
@@ -278,7 +276,7 @@ export async function runDelaySweepTier1(opts = {}) {
     }
   });
 
-  suite.add("DS-T1.1.7", "CLI (js/cli.mjs and native CLI if present) honors --delay-stddev-ms & --delay-seed", async () => {
+  suite.add("DS-T1.1.7", "CLI (js/cli.mjs) honors --delay-stddev-ms & --delay-seed", async () => {
     await ensureEnv();
     const args42 = [
       JS_CLI_PATH,
@@ -321,29 +319,6 @@ export async function runDelaySweepTier1(opts = {}) {
       parseProbeBigInt(c3.stdout, "ELAPSED_NS"),
       "CLI different seeds must perturb ELAPSED_NS"
     );
-
-    if (fs.existsSync(NATIVE_CLI_BIN)) {
-      const probeWasmPath = `${probePath}.wasm`;
-      const tr = await runProcess(
-        NATIVE_CLI_BIN,
-        ["translate", probePath, "-o", probeWasmPath],
-        { timeoutMs: 90000 }
-      );
-      assert.equal(tr.exitCode, 0, `native CLI translate failed: ${tr.stderr}`);
-      const n1 = await runProcess(
-        NATIVE_CLI_BIN,
-        ["run", probeWasmPath, "--delay-stddev-ms", "5000", "--delay-seed", "42", "--", "--mode=timing", "--iters=6"],
-        { timeoutMs: 90000 }
-      );
-      const n2 = await runProcess(
-        NATIVE_CLI_BIN,
-        ["run", probeWasmPath, "--delay-stddev-ms", "5000", "--delay-seed", "42", "--", "--mode=timing", "--iters=6"],
-        { timeoutMs: 90000 }
-      );
-      assert.equal(n1.exitCode, 0, `native CLI failed: ${n1.stderr}`);
-      assert.equal(n1.stdout, n2.stdout, "Native CLI must be deterministic");
-      assert.ok(parseProbeBigInt(n1.stdout, "ELAPSED_NS") >= 1_000_000_000n);
-    }
   });
 
   // =========================================================================

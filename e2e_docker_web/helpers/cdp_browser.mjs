@@ -13,8 +13,106 @@ import { sleep, stripAnsi, waitFor } from "./test_runner.mjs";
 export { findChromeBinary };
 
 /**
+ * Parse a CSS color string (`rgb(...)`, `rgba(...)`, `color(srgb ...)`, `#rgb`, `#rrggbb`)
+ * into `{ r, g, b, a }` with r/g/b in [0, 255] and a in [0, 1]. Returns null if invalid.
+ * @param {string} colorStr
+ * @returns {{ r: number, g: number, b: number, a: number } | null}
+ */
+export function parseRgb(colorStr) {
+  if (typeof colorStr !== "string") return null;
+  const s = colorStr.trim().toLowerCase();
+  if (!s || s === "transparent" || s === "none") return null;
+
+  const rgbaMatch = s.match(
+    /^rgba?\(\s*([\d.]+)\s*[,\s]\s*([\d.]+)\s*[,\s]\s*([\d.]+)(?:\s*[,/]\s*([\d.]+%?))?\s*\)$/
+  );
+  if (rgbaMatch) {
+    const r = Number(rgbaMatch[1]);
+    const g = Number(rgbaMatch[2]);
+    const b = Number(rgbaMatch[3]);
+    let a = 1;
+    if (rgbaMatch[4] !== undefined) {
+      a = rgbaMatch[4].endsWith("%")
+        ? Number(rgbaMatch[4].slice(0, -1)) / 100
+        : Number(rgbaMatch[4]);
+    }
+    if ([r, g, b, a].some((n) => !Number.isFinite(n))) return null;
+    return { r, g, b, a };
+  }
+
+  const srgbMatch = s.match(
+    /^color\(\s*srgb\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*([\d.]+%?))?\s*\)$/
+  );
+  if (srgbMatch) {
+    const r = Number(srgbMatch[1]) * 255;
+    const g = Number(srgbMatch[2]) * 255;
+    const b = Number(srgbMatch[3]) * 255;
+    let a = 1;
+    if (srgbMatch[4] !== undefined) {
+      a = srgbMatch[4].endsWith("%")
+        ? Number(srgbMatch[4].slice(0, -1)) / 100
+        : Number(srgbMatch[4]);
+    }
+    if ([r, g, b, a].some((n) => !Number.isFinite(n))) return null;
+    return { r, g, b, a };
+  }
+
+  const hexMatch = s.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/);
+  if (hexMatch) {
+    const hex = hexMatch[1];
+    if (hex.length === 3) {
+      return {
+        r: parseInt(hex[0] + hex[0], 16),
+        g: parseInt(hex[1] + hex[1], 16),
+        b: parseInt(hex[2] + hex[2], 16),
+        a: 1,
+      };
+    }
+    return {
+      r: parseInt(hex.slice(0, 2), 16),
+      g: parseInt(hex.slice(2, 4), 16),
+      b: parseInt(hex.slice(4, 6), 16),
+      a: 1,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Compute WCAG 2.1 relative luminance in [0, 1] for an RGB color (or CSS color string).
+ * @param {{ r: number, g: number, b: number } | string} color
+ * @returns {number}
+ */
+export function relativeLuminance(color) {
+  const rgb = typeof color === "string" ? parseRgb(color) : color;
+  if (!rgb) {
+    throw new Error(`Cannot compute relative luminance for color: ${JSON.stringify(color)}`);
+  }
+  const linear = [rgb.r, rgb.g, rgb.b].map((channel) => {
+    const c = Math.max(0, Math.min(255, channel)) / 255;
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  });
+  return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+}
+
+/**
+ * Compute WCAG 2.1 contrast ratio in [1, 21] between two colors or luminance values.
+ * @param {{ r: number, g: number, b: number } | string | number} a
+ * @param {{ r: number, g: number, b: number } | string | number} b
+ * @returns {number}
+ */
+export function contrastRatio(a, b) {
+  const lA = typeof a === "number" ? a : relativeLuminance(a);
+  const lB = typeof b === "number" ? b : relativeLuminance(b);
+  const lighter = Math.max(lA, lB);
+  const darker = Math.min(lA, lB);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+/**
  * Launch headless Chrome and return a connected CDP browser controller.
- * @param {{ chromePath?: string, timeoutMs?: number }} [opts]
+ * @param {{ chromePath?: string, timeoutMs?: number, colorScheme?: "light" | "dark" | null, viewport?: { width: number, height: number, mobile?: boolean, deviceScaleFactor?: number } }} [opts]
  */
 export async function launchCdpBrowser(opts = {}) {
   const chromePath = opts.chromePath || findChromeBinary();
@@ -92,6 +190,7 @@ export async function launchCdpBrowser(opts = {}) {
   });
 
   let ws = null;
+  const tempDownloadDirs = [];
 
   async function cleanup() {
     if (ws) {
@@ -135,6 +234,13 @@ export async function launchCdpBrowser(opts = {}) {
       fs.rmSync(userDataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     } catch {
       // ignore cleanup race
+    }
+    for (const dir of tempDownloadDirs) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      } catch {
+        // ignore cleanup race
+      }
     }
   }
 
@@ -313,6 +419,165 @@ export async function launchCdpBrowser(opts = {}) {
       flatten: true,
     });
 
+    async function setColorScheme(scheme) {
+      const features = scheme ? [{ name: "prefers-color-scheme", value: scheme }] : [];
+      await send("Emulation.setEmulatedMedia", { features });
+    }
+
+    async function setViewport(width, height, mobile = false, deviceScaleFactor = 1) {
+      await send("Emulation.setDeviceMetricsOverride", {
+        width,
+        height,
+        deviceScaleFactor,
+        mobile: Boolean(mobile),
+      });
+    }
+
+    if (opts.colorScheme) {
+      await setColorScheme(opts.colorScheme);
+    }
+    if (opts.viewport && Number.isFinite(opts.viewport.width) && Number.isFinite(opts.viewport.height)) {
+      await setViewport(
+        opts.viewport.width,
+        opts.viewport.height,
+        Boolean(opts.viewport.mobile),
+        opts.viewport.deviceScaleFactor || 1
+      );
+    }
+
+    // Download tracking state
+    let activeDownloadDir = null;
+    const downloadMetaByGuid = new Map();
+    const completedDownloads = [];
+    const downloadWaiters = [];
+    let downloadListenersInstalled = false;
+
+    function resolveDownloadFile(dir, guid, suggestedFilename) {
+      const candidates = [];
+      if (suggestedFilename) {
+        candidates.push(path.join(dir, suggestedFilename));
+      }
+      if (guid) {
+        candidates.push(path.join(dir, guid));
+      }
+      for (const candidate of candidates) {
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+          return candidate;
+        }
+      }
+      const entries = fs.readdirSync(dir)
+        .filter((name) => !name.endsWith(".crdownload") && !name.endsWith(".tmp"))
+        .map((name) => {
+          const full = path.join(dir, name);
+          const stat = fs.statSync(full);
+          return { full, mtimeMs: stat.mtimeMs, isFile: stat.isFile() };
+        })
+        .filter((e) => e.isFile)
+        .sort((a, b) => b.mtimeMs - a.mtimeMs);
+      return entries.length > 0 ? entries[0].full : null;
+    }
+
+    function handleDownloadWillBegin(params) {
+      const guid = params.guid || `dl-${Date.now()}`;
+      downloadMetaByGuid.set(guid, {
+        guid,
+        suggestedFilename: params.suggestedFilename || "",
+        url: params.url || "",
+      });
+    }
+
+    function handleDownloadProgress(params) {
+      const guid = params.guid || "";
+      if (params.state === "completed") {
+        const meta = downloadMetaByGuid.get(guid) || { guid, suggestedFilename: "" };
+        const dir = activeDownloadDir;
+        let filePath = dir ? resolveDownloadFile(dir, guid, meta.suggestedFilename) : null;
+        let bytes = new Uint8Array(0);
+        if (filePath && fs.existsSync(filePath)) {
+          const buf = fs.readFileSync(filePath);
+          bytes = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+        }
+        const record = {
+          guid,
+          suggestedFilename: meta.suggestedFilename || (filePath ? path.basename(filePath) : ""),
+          filePath,
+          bytes,
+        };
+        if (downloadWaiters.length > 0) {
+          const waiter = downloadWaiters.shift();
+          waiter.resolve(record);
+        } else {
+          completedDownloads.push(record);
+        }
+      } else if (params.state === "canceled") {
+        if (downloadWaiters.length > 0) {
+          const waiter = downloadWaiters.shift();
+          waiter.reject(new Error(`Browser download canceled (guid=${guid})`));
+        }
+      }
+    }
+
+    async function enableDownloads(downloadDir) {
+      let dir = downloadDir;
+      if (!dir) {
+        dir = fs.mkdtempSync(path.join(os.tmpdir(), "elf2wasm-downloads-"));
+        tempDownloadDirs.push(dir);
+      } else {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      activeDownloadDir = dir;
+      completedDownloads.length = 0;
+
+      if (!downloadListenersInstalled) {
+        downloadListenersInstalled = true;
+        on("Browser.downloadWillBegin", handleDownloadWillBegin);
+        on("Page.downloadWillBegin", handleDownloadWillBegin);
+        on("Browser.downloadProgress", handleDownloadProgress);
+        on("Page.downloadProgress", handleDownloadProgress);
+      }
+
+      try {
+        await send("Browser.setDownloadBehavior", {
+          behavior: "allow",
+          downloadPath: dir,
+          eventsEnabled: true,
+        });
+      } catch {
+        await send("Page.setDownloadBehavior", {
+          behavior: "allow",
+          downloadPath: dir,
+        });
+      }
+      return dir;
+    }
+
+    async function waitForDownload(timeoutMs = 15000) {
+      if (!activeDownloadDir) {
+        throw new Error("enableDownloads() must be called before waitForDownload()");
+      }
+      if (completedDownloads.length > 0) {
+        return completedDownloads.shift();
+      }
+      return new Promise((resolve, reject) => {
+        const waiter = {
+          resolve(val) {
+            clearTimeout(timer);
+            resolve(val);
+          },
+          reject(err) {
+            clearTimeout(timer);
+            reject(err);
+          },
+        };
+        const timer = setTimeout(() => {
+          const idx = downloadWaiters.indexOf(waiter);
+          if (idx !== -1) downloadWaiters.splice(idx, 1);
+          reject(new Error(`Timed out after ${timeoutMs}ms waiting for browser download in ${activeDownloadDir}`));
+        }, timeoutMs);
+        downloadWaiters.push(waiter);
+      });
+    }
+
     async function evaluate(expression, evalOpts = {}) {
       const { awaitPromise = true, returnByValue = true } = evalOpts;
       const result = await send("Runtime.evaluate", {
@@ -411,6 +676,23 @@ export async function launchCdpBrowser(opts = {}) {
           const el = document.querySelector(${JSON.stringify(selector)});
           if (!el) return "";
           return el.innerText || el.textContent || "";
+        })()`,
+        { awaitPromise: false }
+      );
+    }
+
+    async function getComputedStyles(selector, props = ["backgroundColor", "color"]) {
+      return evaluate(
+        `(() => {
+          const el = document.querySelector(${JSON.stringify(selector)});
+          if (!el) return null;
+          const cs = window.getComputedStyle(el);
+          const out = {};
+          for (const prop of ${JSON.stringify(props)}) {
+            const val = cs.getPropertyValue(prop) || cs[prop] || "";
+            out[prop] = val;
+          }
+          return out;
         })()`,
         { awaitPromise: false }
       );
@@ -600,6 +882,11 @@ export async function launchCdpBrowser(opts = {}) {
       setInputValue,
       getInputValue,
       getText,
+      getComputedStyles,
+      setColorScheme,
+      setViewport,
+      enableDownloads,
+      waitForDownload,
       focusSelector,
       typeIntoTerminal,
       getPresetChips,

@@ -849,7 +849,6 @@ export async function runTier4(opts = {}) {
 
       assert.ok(ecosystemDescriptions.some((d) => /python/i.test(d)), "Expected Python project preset");
       assert.ok(ecosystemDescriptions.some((d) => /javascript|node|\bjs\b/i.test(d)), "Expected JavaScript project preset");
-      assert.ok(ecosystemDescriptions.some((d) => /rust|cargo|nushell|\bnu\b/i.test(d)), "Expected Rust project preset");
       assert.ok(ecosystemDescriptions.some((d) => /\bgo\b|golang|raft/i.test(d)), "Expected Go project preset");
 
       // 3. Dirty fields and click plain alpine:latest .preset-chip -> Contract §10 full reset

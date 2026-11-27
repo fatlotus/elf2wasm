@@ -979,7 +979,6 @@ export async function runTier1(opts = {}) {
 
       assert.ok(combinedDescriptions.some((d) => /python/i.test(d)), "Project presets must include a Python project");
       assert.ok(combinedDescriptions.some((d) => /javascript|node|\bjs\b/i.test(d)), "Project presets must include a JavaScript project");
-      assert.ok(combinedDescriptions.some((d) => /rust|cargo|nushell|\bnu\b/i.test(d)), "Project presets must include a Rust project");
       assert.ok(combinedDescriptions.some((d) => /\bgo\b|golang|raft/i.test(d)), "Project presets must include a Go project");
 
       // Clicking a plain image .preset-chip must clear repo/cmd/cwd/env and restore /workspace

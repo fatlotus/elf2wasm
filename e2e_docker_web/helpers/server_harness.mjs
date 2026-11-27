@@ -15,8 +15,10 @@ export const REPO_ROOT = path.resolve(__dirname, "../..");
 export const REQUIRED_ARTIFACTS = {
   compilerWasm: path.join(REPO_ROOT, "target/wasm32-unknown-unknown/release/elf2wasm_compiler_wasm.wasm"),
   runtimeWasm: path.join(REPO_ROOT, "target/wasm32-unknown-unknown/release/elf2wasm_runtime_wasm.wasm"),
+  workerWasm: path.join(REPO_ROOT, "target/wasm32-unknown-unknown/release/elf2wasm_worker_wasm.wasm"),
   serverEntry: path.join(REPO_ROOT, "server/server.mjs"),
   dockerSdk: path.join(REPO_ROOT, "js/docker_sdk.mjs"),
+  dockerfileModule: path.join(REPO_ROOT, "web/dockerfile.mjs"),
   webIndex: path.join(REPO_ROOT, "web/index.html"),
 };
 
@@ -44,14 +46,29 @@ export function findChromeBinary() {
 
 /**
  * Verify required built artifacts (and Chrome if required) exist.
- * @param {{ requireChrome?: boolean }} [opts]
+ * @param {{ requireChrome?: boolean, requireWorkerWasm?: boolean, requireDockerfile?: boolean }} [opts]
  * @returns {{ ok: boolean, missing: string[], chromePath: string | null, paths: typeof REQUIRED_ARTIFACTS }}
  */
 export function checkPrerequisites(opts = {}) {
-  const { requireChrome = false } = opts;
+  const {
+    requireChrome = false,
+    requireWorkerWasm = false,
+    requireDockerfile = false,
+  } = opts;
   const missing = [];
 
-  for (const [key, filePath] of Object.entries(REQUIRED_ARTIFACTS)) {
+  const keysToCheck = [
+    "compilerWasm",
+    "runtimeWasm",
+    "serverEntry",
+    "dockerSdk",
+    "webIndex",
+  ];
+  if (requireWorkerWasm) keysToCheck.push("workerWasm");
+  if (requireDockerfile) keysToCheck.push("dockerfileModule");
+
+  for (const key of keysToCheck) {
+    const filePath = REQUIRED_ARTIFACTS[key];
     if (!fs.existsSync(filePath)) {
       missing.push(`${key}: ${path.relative(REPO_ROOT, filePath)}`);
     }

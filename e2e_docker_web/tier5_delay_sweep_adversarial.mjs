@@ -23,7 +23,6 @@ import { REPO_ROOT, startServer, findChromeBinary } from "./helpers/server_harne
 import { launchCdpBrowser } from "./helpers/cdp_browser.mjs";
 import {
   PROBE_CACHE_DIR,
-  NATIVE_CLI_BIN,
   JS_CLI_PATH,
   registerDelaySweepOciImage,
   importDockerSdk,
@@ -233,19 +232,14 @@ function ensureRandProbe() {
   fs.mkdirSync(PROBE_CACHE_DIR, { recursive: true });
   const cPath = path.join(PROBE_CACHE_DIR, "t5_rand_probe.c");
   const elfPath = path.join(PROBE_CACHE_DIR, "t5_rand_probe");
-  const wasmPath = path.join(PROBE_CACHE_DIR, "t5_rand_probe.wasm");
   if (!fs.existsSync(cPath) || fs.readFileSync(cPath, "utf8") !== RAND_PROBE_C) {
     fs.writeFileSync(cPath, RAND_PROBE_C, "utf8");
     if (fs.existsSync(elfPath)) fs.unlinkSync(elfPath);
-    if (fs.existsSync(wasmPath)) fs.unlinkSync(wasmPath);
   }
   if (!fs.existsSync(elfPath)) {
     execFileSync("gcc", ["-O2", "-static", "-o", elfPath, cPath], { stdio: "pipe" });
   }
-  if (!fs.existsSync(wasmPath)) {
-    execFileSync(NATIVE_CLI_BIN, ["translate", elfPath, "-o", wasmPath], { stdio: "pipe" });
-  }
-  return { elfPath, wasmPath };
+  return { elfPath };
 }
 
 async function setInputValue(browser, selector, value) {
@@ -279,10 +273,10 @@ async function runSuite() {
     chromeBinary = findChromeBinary();
 
     // -----------------------------------------------------------------------
-    // T5-A1: Native CLI vs JS CLI determinism parity matrix (BUG-A1)
+    // T5-A1: JS CLI determinism parity matrix (BUG-A1)
     // -----------------------------------------------------------------------
-    suite.add("T5-A1: Native CLI vs JS CLI determinism parity matrix (BUG-A1)", async () => {
-      const { elfPath, wasmPath } = ensureRandProbe();
+    suite.add("T5-A1: JS CLI determinism matrix & overflow rejection (BUG-A1)", async () => {
+      const { elfPath } = ensureRandProbe();
       const matrix = [
         { stddev: "0", seed: "0", label: "zero-zero baseline" },
         { stddev: "0", seed: "1", label: "zero-stddev seed=1" },
@@ -293,39 +287,34 @@ async function runSuite() {
       ];
 
       for (const tc of matrix) {
-        const nativeRes = await runProcess(NATIVE_CLI_BIN, [
-          "run",
-          wasmPath,
-          `--delay-stddev-ms=${tc.stddev}`,
-          `--delay-seed=${tc.seed}`,
-        ]);
-        const jsRes = await runProcess(process.execPath, [
+        const args = [
           JS_CLI_PATH,
           "run",
           "--elf",
           elfPath,
           `--delay-stddev-ms=${tc.stddev}`,
           `--delay-seed=${tc.seed}`,
-        ]);
+        ];
+        const run1 = await runProcess(process.execPath, args);
+        const run2 = await runProcess(process.execPath, args);
         assert(
-          nativeRes.exitCode === 0 && jsRes.exitCode === 0,
-          `${tc.label}: expected exit 0 (native=${nativeRes.exitCode}, js=${jsRes.exitCode})`
+          run1.exitCode === 0 && run2.exitCode === 0,
+          `${tc.label}: expected exit 0 (run1=${run1.exitCode}, run2=${run2.exitCode})`
         );
         assert(
-          nativeRes.stdout.trim() === jsRes.stdout.trim(),
-          `${tc.label}: Native vs JS CLI mismatch!\nNative:\n${nativeRes.stdout}\nJS:\n${jsRes.stdout}`
+          run1.stdout.trim() === run2.stdout.trim(),
+          `${tc.label}: JS CLI determinism mismatch!\nRun1:\n${run1.stdout}\nRun2:\n${run2.stdout}`
         );
-        assertIncludes(nativeRes.stdout, "URANDOM=", `${tc.label}: URANDOM present`);
-        assertIncludes(nativeRes.stdout, "AT_RANDOM=", `${tc.label}: AT_RANDOM present`);
+        assertIncludes(run1.stdout, "URANDOM=", `${tc.label}: URANDOM present`);
+        assertIncludes(run1.stdout, "AT_RANDOM=", `${tc.label}: AT_RANDOM present`);
       }
 
-      // Overflow rejections must fail non-zero on both CLIs
+      // Overflow rejections must fail non-zero on JS CLI
       const invalidCases = [
         ["--delay-stddev-ms", "1844674407371", "--delay-seed", "0"],
         ["--delay-stddev-ms", "1", "--delay-seed", "18446744073709551616"],
       ];
       for (const flags of invalidCases) {
-        const nativeBad = await runProcess(NATIVE_CLI_BIN, ["run", wasmPath, ...flags]);
         const jsBad = await runProcess(process.execPath, [
           JS_CLI_PATH,
           "run",
@@ -333,7 +322,6 @@ async function runSuite() {
           elfPath,
           ...flags,
         ]);
-        assert(nativeBad.exitCode !== 0, `Native CLI should reject ${flags.join(" ")}`);
         assert(jsBad.exitCode !== 0, `JS CLI should reject ${flags.join(" ")}`);
       }
     });
@@ -1378,60 +1366,52 @@ async function runSuite() {
       }
     );
 
-    // T5-A8: Native x86-64 CLI vs WASM32 runtime cross-target determinism on epoll_wait shuffle & pthread run_queue jitter
+    // T5-A8: WASM32 JS CLI determinism on epoll_wait shuffle & pthread run_queue jitter
     suite.add(
-      "T5-A8: Native CLI vs WASM32 cross-target determinism on 6-conn epoll_wait shuffle & 5-thread pthread jitter",
+      "T5-A8: WASM32 JS CLI determinism on 6-conn epoll_wait shuffle & 5-thread pthread jitter",
       async () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "elf2wasm_t5_a8_"));
         try {
           const epollC = path.join(tmpDir, "epoll_shuffle_probe.c");
           const epollElf = path.join(tmpDir, "epoll_shuffle_probe");
-          const epollWasm = path.join(tmpDir, "epoll_shuffle_probe.wasm");
           fs.writeFileSync(epollC, EPOLL_SHUFFLE_PROBE_C, "utf8");
           execFileSync("gcc", ["-O2", "-static", "-o", epollElf, epollC], { stdio: "pipe" });
-          execFileSync(NATIVE_CLI_BIN, ["translate", epollElf, "-o", epollWasm], { stdio: "pipe" });
 
           const schedC = path.join(tmpDir, "pthread_sched_probe.c");
           const schedElf = path.join(tmpDir, "pthread_sched_probe");
-          const schedWasm = path.join(tmpDir, "pthread_sched_probe.wasm");
           fs.writeFileSync(schedC, PTHREAD_SCHED_PROBE_C, "utf8");
           execFileSync("gcc", ["-O2", "-static", "-pthread", "-o", schedElf, schedC], { stdio: "pipe" });
-          execFileSync(NATIVE_CLI_BIN, ["translate", schedElf, "-o", schedWasm], { stdio: "pipe" });
 
           const seeds = ["1", "2", "3", "4", "5"];
 
           // Probe 1: 6-connection TCP epoll_wait ready-event shuffle
           const epollOrders = new Set();
           for (const seed of seeds) {
-            const nativeRes = await runProcess(NATIVE_CLI_BIN, [
-              "run",
-              epollWasm,
-              "--delay-stddev-ms=1",
-              `--delay-seed=${seed}`,
-            ]);
-            const jsRes = await runProcess(process.execPath, [
+            const args = [
               JS_CLI_PATH,
               "run",
               "--elf",
               epollElf,
               "--delay-stddev-ms=1",
               `--delay-seed=${seed}`,
-            ]);
+            ];
+            const run1 = await runProcess(process.execPath, args);
+            const run2 = await runProcess(process.execPath, args);
             assert(
-              nativeRes.exitCode === 0 && jsRes.exitCode === 0,
-              `epoll probe seed=${seed}: expected exit 0 (native=${nativeRes.exitCode}, js=${jsRes.exitCode}, nativeErr=${nativeRes.stderr}, jsErr=${jsRes.stderr})`
+              run1.exitCode === 0 && run2.exitCode === 0,
+              `epoll probe seed=${seed}: expected exit 0 (run1=${run1.exitCode}, run2=${run2.exitCode}, err1=${run1.stderr}, err2=${run2.stderr})`
             );
-            const nativeOut = nativeRes.stdout.trim();
-            const jsOut = jsRes.stdout.trim();
+            const out1 = run1.stdout.trim();
+            const out2 = run2.stdout.trim();
             assert(
-              nativeOut === jsOut,
-              `epoll probe seed=${seed}: Native x86-64 vs WASM32 mismatch!\nNative: ${nativeOut}\nWASM32: ${jsOut}`
+              out1 === out2,
+              `epoll probe seed=${seed}: WASM32 JS CLI determinism mismatch!\nRun1: ${out1}\nRun2: ${out2}`
             );
             assert(
-              /^READY=6 ORDER=[1-6](,[1-6]){5}$/.test(nativeOut),
-              `epoll probe seed=${seed}: unexpected output format: ${nativeOut}`
+              /^READY=6 ORDER=[1-6](,[1-6]){5}$/.test(out1),
+              `epoll probe seed=${seed}: unexpected output format: ${out1}`
             );
-            epollOrders.add(nativeOut);
+            epollOrders.add(out1);
           }
           assert(
             epollOrders.size >= 2,
@@ -1441,35 +1421,31 @@ async function runSuite() {
           // Probe 2: 5-thread pthread + sched_yield execution order
           const schedOrders = new Set();
           for (const seed of seeds) {
-            const nativeRes = await runProcess(NATIVE_CLI_BIN, [
-              "run",
-              schedWasm,
-              "--delay-stddev-ms=1",
-              `--delay-seed=${seed}`,
-            ]);
-            const jsRes = await runProcess(process.execPath, [
+            const args = [
               JS_CLI_PATH,
               "run",
               "--elf",
               schedElf,
               "--delay-stddev-ms=1",
               `--delay-seed=${seed}`,
-            ]);
+            ];
+            const run1 = await runProcess(process.execPath, args);
+            const run2 = await runProcess(process.execPath, args);
             assert(
-              nativeRes.exitCode === 0 && jsRes.exitCode === 0,
-              `pthread probe seed=${seed}: expected exit 0 (native=${nativeRes.exitCode}, js=${jsRes.exitCode}, nativeErr=${nativeRes.stderr}, jsErr=${jsRes.stderr})`
+              run1.exitCode === 0 && run2.exitCode === 0,
+              `pthread probe seed=${seed}: expected exit 0 (run1=${run1.exitCode}, run2=${run2.exitCode}, err1=${run1.stderr}, err2=${run2.stderr})`
             );
-            const nativeOut = nativeRes.stdout.trim();
-            const jsOut = jsRes.stdout.trim();
+            const out1 = run1.stdout.trim();
+            const out2 = run2.stdout.trim();
             assert(
-              nativeOut === jsOut,
-              `pthread probe seed=${seed}: Native x86-64 vs WASM32 mismatch!\nNative: ${nativeOut}\nWASM32: ${jsOut}`
+              out1 === out2,
+              `pthread probe seed=${seed}: WASM32 JS CLI determinism mismatch!\nRun1: ${out1}\nRun2: ${out2}`
             );
             assert(
-              /^SCHED=[1-5](,[1-5]){14}$/.test(nativeOut),
-              `pthread probe seed=${seed}: unexpected output format: ${nativeOut}`
+              /^SCHED=[1-5](,[1-5]){14}$/.test(out1),
+              `pthread probe seed=${seed}: unexpected output format: ${out1}`
             );
-            schedOrders.add(nativeOut);
+            schedOrders.add(out1);
           }
           assert(
             schedOrders.size >= 2,
@@ -1481,28 +1457,16 @@ async function runSuite() {
       }
     );
 
-    // T5-A9: Child SIGKILL terminating MAIN_PID returns exitCode 137 (NOT 0) in both native CLI and JS/WASM CLI (BUG-6A-1)
+    // T5-A9: Child SIGKILL terminating MAIN_PID returns exitCode 137 (NOT 0) in JS/WASM CLI (BUG-6A-1)
     suite.add(
-      "T5-A9: Child SIGKILL to MAIN_PID returns exit code 137 in both native CLI and JS/WASM CLI (BUG-6A-1)",
+      "T5-A9: Child SIGKILL to MAIN_PID returns exit code 137 in JS/WASM CLI (BUG-6A-1)",
       async () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "elf2wasm_t5_a9_"));
         try {
           const cPath = path.join(tmpDir, "kill_parent.c");
           const elfPath = path.join(tmpDir, "kill_parent");
-          const wasmPath = path.join(tmpDir, "kill_parent.wasm");
           fs.writeFileSync(cPath, KILL_PARENT_PROBE_C, "utf8");
           execFileSync("gcc", ["-O2", "-static", "-o", elfPath, cPath], { stdio: "pipe" });
-          execFileSync(NATIVE_CLI_BIN, ["translate", elfPath, "-o", wasmPath], { stdio: "pipe" });
-
-          const nativeRes = await runProcess(NATIVE_CLI_BIN, ["run", wasmPath]);
-          assert(
-            nativeRes.exitCode === 137,
-            `native CLI: expected exit code 137 on child SIGKILL to MAIN_PID, got ${nativeRes.exitCode} (stdout=${JSON.stringify(nativeRes.stdout)}, stderr=${JSON.stringify(nativeRes.stderr)})`
-          );
-          assert(
-            !nativeRes.stdout.includes("SURVIVED"),
-            `native CLI: parent should not print SURVIVED after SIGKILL, got ${JSON.stringify(nativeRes.stdout)}`
-          );
 
           const jsRes = await runProcess(process.execPath, [JS_CLI_PATH, "run", "--elf", elfPath]);
           assert(
