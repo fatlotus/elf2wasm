@@ -1,27 +1,11 @@
 [workspace]
 members = [
-    ".",
     "crates/elf2wasm-core",
     "crates/elf2wasm-compiler-wasm",
     "crates/elf2wasm-runtime-core",
     "crates/elf2wasm-runtime-wasm",
 ]
 resolver = "2"
-
-[package]
-name = "elf2wasm"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-elf2wasm-core = { path = "crates/elf2wasm-core" }
-elf2wasm-runtime-core = { path = "crates/elf2wasm-runtime-core" }
-anyhow = "1.0"
-clap = { version = "4.5", features = ["derive"] }
-wasmtime = "27"
-
-[dev-dependencies]
-wasm-encoder = "0.220"
 
 [profile.release]
 opt-level = 3
