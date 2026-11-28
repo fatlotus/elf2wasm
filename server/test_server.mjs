@@ -41,7 +41,12 @@ import {
   createMockGitServer,
 } from "./mock_git_server.mjs";
 import { Elf2WasmSystem } from "../js/elf2wasm_shim.mjs";
-import { DEFAULT_MAX_FUEL, MAX_FUEL_CAP } from "./eval_core.mjs";
+import {
+  DEFAULT_MAX_FUEL,
+  MAX_FUEL_CAP,
+  DEFAULT_MAX_MEMORY_BYTES,
+  MAX_MAX_MEMORY_BYTES,
+} from "./eval_core.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2305,9 +2310,14 @@ describe("M3: POST /api/eval Local Dev Server Parity", () => {
     assert.equal(noRootfsJson.ok, false);
     assert.equal(noRootfsJson.code, "INVALID_REQUEST");
 
-    // Verify DEFAULT_MAX_FUEL default and cap invariant
+    // Verify DEFAULT_MAX_FUEL and DEFAULT_MAX_MEMORY_BYTES defaults and cap invariants
     assert.equal(DEFAULT_MAX_FUEL, 2_000_000_000);
     assert.ok(DEFAULT_MAX_FUEL <= MAX_FUEL_CAP, "DEFAULT_MAX_FUEL must not exceed MAX_FUEL_CAP");
+    assert.equal(DEFAULT_MAX_MEMORY_BYTES, 96 * 1024 * 1024);
+    assert.ok(
+      DEFAULT_MAX_MEMORY_BYTES <= MAX_MAX_MEMORY_BYTES,
+      "DEFAULT_MAX_MEMORY_BYTES must not exceed MAX_MAX_MEMORY_BYTES"
+    );
 
     // 408 FUEL_EXHAUSTED
     const fuelRes = await fetch(`${srv.url}/api/eval`, {
