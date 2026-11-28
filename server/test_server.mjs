@@ -41,6 +41,7 @@ import {
   createMockGitServer,
 } from "./mock_git_server.mjs";
 import { Elf2WasmSystem } from "../js/elf2wasm_shim.mjs";
+import { DEFAULT_MAX_FUEL, MAX_FUEL_CAP } from "./eval_core.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2288,10 +2289,25 @@ describe("M3: POST /api/eval Local Dev Server Parity", () => {
     const getRes = await fetch(`${srv.url}/api/eval`, { method: "GET" });
     assert.equal(getRes.status, 405);
 
-    // 400 INVALID_REQUEST
+    // 400 INVALID_REQUEST (invalid JSON)
     const badRes = await fetch(`${srv.url}/api/eval`, { method: "POST", body: "not-json" });
     assert.equal(badRes.status, 400);
     assert.equal((await badRes.json()).code, "INVALID_REQUEST");
+
+    // 400 INVALID_REQUEST (missing baseImage / inputLayerDiffs / gitRepo)
+    const noRootfsRes = await fetch(`${srv.url}/api/eval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cmd: ["/bin/sh", "-c", "echo hi"] }),
+    });
+    assert.equal(noRootfsRes.status, 400);
+    const noRootfsJson = await noRootfsRes.json();
+    assert.equal(noRootfsJson.ok, false);
+    assert.equal(noRootfsJson.code, "INVALID_REQUEST");
+
+    // Verify DEFAULT_MAX_FUEL default and cap invariant
+    assert.equal(DEFAULT_MAX_FUEL, 2_000_000_000);
+    assert.ok(DEFAULT_MAX_FUEL <= MAX_FUEL_CAP, "DEFAULT_MAX_FUEL must not exceed MAX_FUEL_CAP");
 
     // 408 FUEL_EXHAUSTED
     const fuelRes = await fetch(`${srv.url}/api/eval`, {

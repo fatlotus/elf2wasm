@@ -24,7 +24,7 @@ export const DEFAULT_PATH_ENV =
   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 export const DEFAULT_MAX_EVAL_BODY_BYTES = 16 * 1024 * 1024; // 16 MiB
 export const DEFAULT_MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024; // 64 MiB
-export const DEFAULT_MAX_FUEL = 500_000_000;
+export const DEFAULT_MAX_FUEL = 2_000_000_000;
 export const MAX_FUEL_CAP = 2_000_000_000;
 export const DEFAULT_MAX_MEMORY_BYTES = 64 * 1024 * 1024; // 64 MiB
 export const MIN_MAX_MEMORY_BYTES = 65_536; // 64 KiB
@@ -756,6 +756,10 @@ export function parseAndValidateEvalRequest(rawInput) {
   let downloadPath = "";
   if (obj.downloadPath !== undefined && obj.downloadPath !== null && obj.downloadPath !== "") {
     downloadPath = normalizeVfsPath(obj.downloadPath, "downloadPath");
+  }
+
+  if (!baseImage && inputLayerDiffs.length === 0 && !gitRepo) {
+    throw new EvalError(400, "INVALID_REQUEST", "baseImage or inputLayerDiffs is required");
   }
 
   if (!baseImage && !cmd) {
