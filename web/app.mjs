@@ -836,14 +836,17 @@ function syncUrlFromState({ push = false } = {}) {
   }
 }
 
-function syncFromVisual({ pushUrl = false, rerenderVisual = false } = {}) {
+function syncFromVisual({ pushUrl = false, rerenderVisual = false, preserveWarnings = false } = {}) {
   if (isSyncing) return;
   isSyncing = true;
   try {
-    dockerfileText = serializeDockerfile(layers);
-    dockerfileWarnings = [];
-    if (dockerfileEditor) {
-      dockerfileEditor.value = dockerfileText;
+    const keepWarnings = preserveWarnings && dockerfileWarnings.length > 0;
+    if (!keepWarnings) {
+      dockerfileText = serializeDockerfile(layers);
+      dockerfileWarnings = [];
+      if (dockerfileEditor) {
+        dockerfileEditor.value = dockerfileText;
+      }
     }
     if (rerenderVisual) {
       renderLayerList();
@@ -1027,6 +1030,7 @@ function renderLayerList() {
       toggle.setAttribute("aria-label", `Layer ${idx + 1} execution target`);
 
       const currentExec = layer.executor === "remote" ? "remote" : "local";
+      toggle.dataset.layerTarget = currentExec;
 
       const localBtn = document.createElement("button");
       localBtn.type = "button";
@@ -1044,6 +1048,7 @@ function renderLayerList() {
 
       const setExec = (target) => {
         layer.executor = target;
+        toggle.dataset.layerTarget = target;
         localBtn.setAttribute("aria-pressed", target === "local" ? "true" : "false");
         remoteBtn.setAttribute("aria-pressed", target === "remote" ? "true" : "false");
         syncFromVisual({ pushUrl: false, rerenderVisual: false });
@@ -1950,6 +1955,14 @@ async function executePipeline({ executorOverride = null } = {}) {
     return;
   }
 
+  const hasFrom = effectiveLayers.some(
+    (l) => l.type === "from" && typeof l.image === "string" && l.image.trim().length > 0
+  );
+  if (!hasFrom) {
+    setStatus("Invalid Dockerfile: missing FROM base image layer", "error");
+    return;
+  }
+
   const hasRun = effectiveLayers.some((l) => l.type === "run" && l.cmd && l.cmd.trim().length > 0);
   const sweepLayer = getSweepLayer(effectiveLayers);
 
@@ -2251,6 +2264,7 @@ async function executePipeline({ executorOverride = null } = {}) {
             ? "remote"
             : "local";
         setStatus(`Completed (${execLabel}, exit code: ${exitCode})`, "idle");
+        terminal.write(`\r\n[elf2wasm] Completed (${execLabel}, exit code: ${exitCode})\r\n`);
       } else {
         const failedLayer = (result.layers || []).find((l) => !l.ok);
         const reason = failedLayer?.error
@@ -2259,6 +2273,7 @@ async function executePipeline({ executorOverride = null } = {}) {
           ? `Layer #${failedLayer.layerIndex + 1} failed (exit ${failedLayer.exitCode})`
           : "Pipeline failed";
         setStatus(`Failed: ${reason}`, "error");
+        terminal.write(`\r\n[elf2wasm] Failed (exit code: ${failedLayer?.exitCode ?? 1})\r\n`);
       }
     }
   } catch (err) {
@@ -2296,7 +2311,7 @@ function setAllLayersExecutor(target) {
       l.executor = target;
     }
   }
-  syncFromVisual({ pushUrl: false, rerenderVisual: true });
+  syncFromVisual({ pushUrl: false, rerenderVisual: true, preserveWarnings: true });
 }
 
 runAllLocalBtn?.addEventListener("click", () => {
