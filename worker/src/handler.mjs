@@ -30,9 +30,11 @@ import {
   parseStripComponentsHeader,
 } from "../../server/git_core.mjs";
 import {
+  DEFAULT_MAX_DECOMPRESSED_BYTES,
   DEFAULT_MAX_EVAL_BODY_BYTES,
   EvalError,
   createWorkerEvalRuntime,
+  readBoundedBody,
   wantsGzipResponse,
   formatEvalJsonResponse,
   buildGzipEvalHeaders,
@@ -386,9 +388,18 @@ export function createWorkerHandler(options = {}) {
     safetyMarginMs: options.tokenCacheSafetyMarginMs ?? 15_000,
   });
 
+  function buildFetchSignal(callerSignal) {
+    const timeoutSig = AbortSignal.timeout(requestTimeoutMs);
+    if (!callerSignal) return timeoutSig;
+    if (typeof AbortSignal.any === "function") {
+      return AbortSignal.any([timeoutSig, callerSignal]);
+    }
+    return callerSignal;
+  }
+
   async function requestWithRedirects(
     initialUrl,
-    { method, baseHeaders, authToken, allowLocalRegistries }
+    { method, baseHeaders, authToken, allowLocalRegistries, signal = undefined }
   ) {
     let currentUrl = initialUrl;
     const currentHeaders = new Headers(baseHeaders);
@@ -402,16 +413,24 @@ export function createWorkerHandler(options = {}) {
         requireLoopbackHostForHttp: true,
       });
 
+      if (signal?.aborted) {
+        throw new EvalError(408, "FUEL_EXHAUSTED", "Upstream request timed out");
+      }
+
       let upstreamRes;
       try {
         upstreamRes = await fetchImpl(currentUrl.toString(), {
           method,
           headers: currentHeaders,
           redirect: "manual",
-          signal: AbortSignal.timeout(requestTimeoutMs),
+          signal: buildFetchSignal(signal),
         });
       } catch (err) {
+        if (err instanceof EvalError) throw err;
         if (err instanceof ProxyError) throw err;
+        if (signal?.aborted) {
+          throw new EvalError(408, "FUEL_EXHAUSTED", "Upstream request timed out");
+        }
         if (err?.name === "TimeoutError" || err?.name === "AbortError") {
           throw new ProxyError(502, "Upstream request timed out");
         }
@@ -446,7 +465,7 @@ export function createWorkerHandler(options = {}) {
     throw new ProxyError(502, "Too many redirects from upstream registry");
   }
 
-  async function fetchBearerToken(wwwAuthHeader, allowLocalRegistries) {
+  async function fetchBearerToken(wwwAuthHeader, allowLocalRegistries, signal = undefined) {
     const challenge = parseWwwAuthenticate(wwwAuthHeader);
     if (!challenge) {
       throw new ProxyError(502, "Unsupported or malformed WWW-Authenticate challenge from registry");
@@ -474,6 +493,7 @@ export function createWorkerHandler(options = {}) {
       },
       authToken: null,
       allowLocalRegistries,
+      signal,
     });
 
     if (tokenRes.status !== 200) {
@@ -511,6 +531,7 @@ export function createWorkerHandler(options = {}) {
     method,
     baseHeaders,
     allowLocalRegistries,
+    signal = undefined,
   }) {
     const scheme = selectInitialScheme(hostname, allowLocalRegistries);
     const upstreamUrl = new URL(`${scheme}//${registry}/v2/${repo}/${kind}/${target}`);
@@ -522,6 +543,7 @@ export function createWorkerHandler(options = {}) {
       baseHeaders,
       authToken: cachedToken,
       allowLocalRegistries,
+      signal,
     });
 
     // Handle OCI v2 401 Bearer challenge with at most one retry.
@@ -534,7 +556,7 @@ export function createWorkerHandler(options = {}) {
         throw new ProxyError(502, "Upstream registry returned 401 without WWW-Authenticate header");
       }
 
-      const fetched = await fetchBearerToken(wwwAuth, allowLocalRegistries);
+      const fetched = await fetchBearerToken(wwwAuth, allowLocalRegistries, signal);
       tokenCache.set(cacheKey, fetched.token, fetched.expiresIn);
 
       upstreamRes = await requestWithRedirects(upstreamUrl, {
@@ -542,6 +564,7 @@ export function createWorkerHandler(options = {}) {
         baseHeaders,
         authToken: fetched.token,
         allowLocalRegistries,
+        signal,
       });
 
       if (upstreamRes.status === 401) {
@@ -554,7 +577,7 @@ export function createWorkerHandler(options = {}) {
     return upstreamRes;
   }
 
-  async function handleOciProxy(request, env, ctx, rawPathname, cors) {
+  async function handleOciProxy(request, env, ctx, rawPathname, cors, { signal = undefined } = {}) {
     const method = (request.method || "GET").toUpperCase();
     const headOnly = method === "HEAD";
 
@@ -640,6 +663,7 @@ export function createWorkerHandler(options = {}) {
           method,
           baseHeaders,
           allowLocalRegistries,
+          signal,
         });
       } else {
         let rateLimitedError = null;
@@ -653,6 +677,7 @@ export function createWorkerHandler(options = {}) {
             method,
             baseHeaders,
             allowLocalRegistries,
+            signal,
           });
         } catch (err) {
           if (canUseMirror && err instanceof ProxyError && err.statusCode === 429) {
@@ -677,6 +702,7 @@ export function createWorkerHandler(options = {}) {
             method,
             baseHeaders,
             allowLocalRegistries,
+            signal,
           });
         }
       }
@@ -747,6 +773,7 @@ export function createWorkerHandler(options = {}) {
 
       return new Response(upstreamRes.body, { status, headers: outHeaders });
     } catch (err) {
+      if (err instanceof EvalError) throw err;
       if (err instanceof ProxyError) {
         return jsonResponse({ error: err.message }, err.statusCode, cors, { headOnly });
       }
@@ -759,7 +786,7 @@ export function createWorkerHandler(options = {}) {
     }
   }
 
-  async function handleGitArchiveProxy(request, env, ctx, cors) {
+  async function handleGitArchiveProxy(request, env, ctx, cors, { signal = undefined } = {}) {
     const method = (request.method || "GET").toUpperCase();
     const headOnly = method === "HEAD";
 
@@ -830,6 +857,7 @@ export function createWorkerHandler(options = {}) {
         },
         authToken: null,
         allowLocalRegistries,
+        signal,
       });
 
       const status = upstreamRes.status || 502;
@@ -921,6 +949,7 @@ export function createWorkerHandler(options = {}) {
 
       return new Response(upstreamRes.body, { status, headers: outHeaders });
     } catch (err) {
+      if (err instanceof EvalError) throw err;
       if (err instanceof ProxyError) {
         return jsonResponse({ error: err.message }, err.statusCode, cors, { headOnly });
       }
@@ -959,6 +988,14 @@ export function createWorkerHandler(options = {}) {
       );
     }
 
+    if (cors.hasOrigin && !cors.allowed) {
+      return jsonResponse(
+        { ok: false, error: "Origin not allowed", code: "INVALID_REQUEST" },
+        403,
+        cors
+      );
+    }
+
     try {
       const bodyBytes = await readBoundedRequestBytes(request, maxEvalBodyBytes);
       const wantGzip = wantsGzipResponse(request.url, request.headers.get("accept") || "");
@@ -972,25 +1009,39 @@ export function createWorkerHandler(options = {}) {
 
       // Internal in-process OCI and Git fetchers reuse caches.default, tokenCache,
       // Docker Hub mirror fallback, and SSRF policy with zero Worker self-fetch.
-      const fetchOciResource = async ({ registry, repository, kind, target, accept }) => {
+      const fetchOciResource = async ({
+        registry,
+        repository,
+        kind,
+        target,
+        accept,
+        signal,
+        maxBytes,
+      }) => {
         const ociPath = `/api/v2/${registry}/${repository}/${kind}/${target}`;
         const internalReq = new Request(`${origin}${ociPath}`, {
           method: "GET",
           headers: accept ? { Accept: accept } : {},
         });
-        const res = await handleOciProxy(internalReq, env, ctx, ociPath, INTERNAL_CORS);
-        const bytes = new Uint8Array(await res.arrayBuffer());
+        const res = await handleOciProxy(internalReq, env, ctx, ociPath, INTERNAL_CORS, { signal });
+        const bytes = await readBoundedBody(res, maxBytes ?? DEFAULT_MAX_DECOMPRESSED_BYTES, {
+          signal,
+          label: `OCI ${kind} response`,
+        });
         return { status: res.status, headers: res.headers, bytes };
       };
 
-      const fetchGitArchive = async ({ repo, ref }) => {
+      const fetchGitArchive = async ({ repo, ref, signal, maxBytes }) => {
         const params = new URLSearchParams({ repo });
         if (ref) params.set("ref", ref);
         const internalReq = new Request(`${origin}/api/git/archive?${params.toString()}`, {
           method: "GET",
         });
-        const res = await handleGitArchiveProxy(internalReq, env, ctx, INTERNAL_CORS);
-        const bytes = new Uint8Array(await res.arrayBuffer());
+        const res = await handleGitArchiveProxy(internalReq, env, ctx, INTERNAL_CORS, { signal });
+        const bytes = await readBoundedBody(res, maxBytes ?? DEFAULT_MAX_DECOMPRESSED_BYTES, {
+          signal,
+          label: "Git archive response",
+        });
         return { status: res.status, headers: res.headers, bytes };
       };
 

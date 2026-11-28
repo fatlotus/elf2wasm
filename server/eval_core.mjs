@@ -31,6 +31,8 @@ export const MIN_MAX_MEMORY_BYTES = 65_536; // 64 KiB
 export const MAX_MAX_MEMORY_BYTES = 128 * 1024 * 1024; // 128 MiB
 export const DEFAULT_TIMEOUT_MS = 30_000;
 export const MAX_INPUT_LAYER_DIFFS = 16;
+export const MAX_MANIFEST_LAYERS = 64;
+export const MAX_GIT_REPOS = 16;
 export const MAX_MANIFEST_HOPS = 4;
 
 const REPO_RE =
@@ -292,6 +294,101 @@ export async function maybeGunzipBytes(
     );
   }
   return input;
+}
+
+/**
+ * Read a Fetch `Response` body into a `Uint8Array` with a strict byte cap,
+ * cancelling the stream and throwing `EvalError(507, "MEMORY_LIMIT", ...)`
+ * on overflow, or `EvalError(408, "FUEL_EXHAUSTED", ...)` on timeout/abort.
+ */
+export async function readBoundedBody(
+  response,
+  maxBytes = DEFAULT_MAX_DECOMPRESSED_BYTES,
+  {
+    statusCode = 507,
+    code = "MEMORY_LIMIT",
+    label = "Upstream response",
+    signal = undefined,
+  } = {}
+) {
+  const cancelSafely = async () => {
+    try {
+      if (response && response.body && typeof response.body.cancel === "function") {
+        await response.body.cancel();
+      }
+    } catch {
+      // Ignore cancel errors
+    }
+  };
+
+  if (signal?.aborted) {
+    await cancelSafely();
+    throw new EvalError(408, "FUEL_EXHAUSTED", `${label} timed out`);
+  }
+
+  const contentLengthHeader = response?.headers?.get?.("content-length") ?? null;
+  if (contentLengthHeader !== null && /^\d+$/.test(contentLengthHeader.trim())) {
+    const declared = Number(contentLengthHeader.trim());
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      await cancelSafely();
+      throw new EvalError(statusCode, code, `${label} exceeded limit of ${maxBytes} bytes`);
+    }
+  }
+
+  if (!response?.body) {
+    return new Uint8Array(0);
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      if (signal?.aborted) {
+        try {
+          await reader.cancel();
+        } catch {
+          // Ignore cancel errors
+        }
+        throw new EvalError(408, "FUEL_EXHAUSTED", `${label} timed out`);
+      }
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.byteLength > 0) {
+        totalBytes += value.byteLength;
+        if (totalBytes > maxBytes) {
+          try {
+            await reader.cancel();
+          } catch {
+            // Ignore cancel errors
+          }
+          throw new EvalError(statusCode, code, `${label} exceeded limit of ${maxBytes} bytes`);
+        }
+        chunks.push(value);
+      }
+    }
+  } catch (err) {
+    if (err instanceof EvalError) throw err;
+    if (signal?.aborted || err?.name === "TimeoutError" || err?.name === "AbortError") {
+      throw new EvalError(408, "FUEL_EXHAUSTED", `${label} timed out`);
+    }
+    throw new EvalError(502, "UPSTREAM_ERROR", `${label} stream error: ${err?.message || "read failed"}`);
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // Ignore release errors
+    }
+  }
+
+  const out = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 function validateRegistryHost(registry) {
@@ -577,32 +674,59 @@ export function parseAndValidateEvalRequest(rawInput) {
     baseImage = parseImageRef(obj.baseImage);
   }
 
-  // gitRepo
-  let gitRepo = null;
-  if (obj.gitRepo !== undefined && obj.gitRepo !== null) {
-    if (typeof obj.gitRepo !== "object" || Array.isArray(obj.gitRepo)) {
-      throw new EvalError(400, "INVALID_REQUEST", "gitRepo must be an object or null");
+  // gitRepo / gitRepos
+  const parseGitRepoEntry = (entry, fieldName) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new EvalError(400, "INVALID_REQUEST", `${fieldName} must be an object`);
     }
-    if (typeof obj.gitRepo.repo !== "string" || obj.gitRepo.repo.trim().length === 0) {
-      throw new EvalError(400, "INVALID_REQUEST", "gitRepo.repo must be a non-empty string");
+    if (typeof entry.repo !== "string" || entry.repo.trim().length === 0) {
+      throw new EvalError(400, "INVALID_REQUEST", `${fieldName}.repo must be a non-empty string`);
     }
     let ref = "HEAD";
-    if (obj.gitRepo.ref !== undefined && obj.gitRepo.ref !== null && obj.gitRepo.ref !== "") {
-      if (typeof obj.gitRepo.ref !== "string") {
-        throw new EvalError(400, "INVALID_REQUEST", "gitRepo.ref must be a string");
+    if (entry.ref !== undefined && entry.ref !== null && entry.ref !== "") {
+      if (typeof entry.ref !== "string") {
+        throw new EvalError(400, "INVALID_REQUEST", `${fieldName}.ref must be a string`);
       }
-      ref = obj.gitRepo.ref.trim() || "HEAD";
+      ref = entry.ref.trim() || "HEAD";
     }
     let mountPath = "/workspace";
     if (
-      obj.gitRepo.mountPath !== undefined &&
-      obj.gitRepo.mountPath !== null &&
-      obj.gitRepo.mountPath !== ""
+      entry.mountPath !== undefined &&
+      entry.mountPath !== null &&
+      entry.mountPath !== ""
     ) {
-      mountPath = normalizeVfsPath(obj.gitRepo.mountPath, "gitRepo.mountPath") || "/workspace";
+      mountPath = normalizeVfsPath(entry.mountPath, `${fieldName}.mountPath`) || "/workspace";
     }
-    gitRepo = { repo: obj.gitRepo.repo.trim(), ref, mountPath };
+    return { repo: entry.repo.trim(), ref, mountPath };
+  };
+
+  let gitRepos = [];
+  if (
+    obj.gitRepo !== undefined &&
+    obj.gitRepo !== null &&
+    obj.gitRepos !== undefined &&
+    obj.gitRepos !== null
+  ) {
+    throw new EvalError(400, "INVALID_REQUEST", "Specify either gitRepo or gitRepos, not both");
   }
+  if (obj.gitRepo !== undefined && obj.gitRepo !== null) {
+    gitRepos.push(parseGitRepoEntry(obj.gitRepo, "gitRepo"));
+  } else if (obj.gitRepos !== undefined && obj.gitRepos !== null) {
+    if (!Array.isArray(obj.gitRepos)) {
+      throw new EvalError(400, "INVALID_REQUEST", "gitRepos must be an array of git repo objects");
+    }
+    if (obj.gitRepos.length > MAX_GIT_REPOS) {
+      throw new EvalError(
+        400,
+        "INVALID_REQUEST",
+        `gitRepos exceeds maximum of ${MAX_GIT_REPOS} entries`
+      );
+    }
+    for (let i = 0; i < obj.gitRepos.length; i++) {
+      gitRepos.push(parseGitRepoEntry(obj.gitRepos[i], `gitRepos[${i}]`));
+    }
+  }
+  const gitRepo = gitRepos.length > 0 ? gitRepos[0] : null;
 
   // inputLayerDiffs
   const inputLayerDiffs = [];
@@ -758,7 +882,7 @@ export function parseAndValidateEvalRequest(rawInput) {
     downloadPath = normalizeVfsPath(obj.downloadPath, "downloadPath");
   }
 
-  if (!baseImage && inputLayerDiffs.length === 0 && !gitRepo) {
+  if (!baseImage && inputLayerDiffs.length === 0 && gitRepos.length === 0) {
     throw new EvalError(400, "INVALID_REQUEST", "baseImage or inputLayerDiffs is required");
   }
 
@@ -769,6 +893,7 @@ export function parseAndValidateEvalRequest(rawInput) {
   return {
     baseImage,
     gitRepo,
+    gitRepos,
     inputLayerDiffs,
     cmd,
     env,
@@ -803,22 +928,45 @@ function selectLinuxAmd64Manifest(manifests) {
   return fallback;
 }
 
-async function fetchBaseImageLayers(parsedImage, fetchOciResource) {
+async function callUpstreamWithTimeout(fn, signal, label) {
+  if (signal?.aborted) {
+    throw new EvalError(408, "FUEL_EXHAUSTED", `${label} timed out`);
+  }
+  try {
+    return await fn();
+  } catch (err) {
+    if (err instanceof EvalError) throw err;
+    if (signal?.aborted || err?.name === "TimeoutError" || err?.name === "AbortError") {
+      throw new EvalError(408, "FUEL_EXHAUSTED", `${label} timed out`);
+    }
+    throw err;
+  }
+}
+
+async function fetchBaseImageLayers(parsedImage, fetchOciResource, { budget, signal } = {}) {
   if (typeof fetchOciResource !== "function") {
     throw new EvalError(502, "UPSTREAM_ERROR", "OCI fetcher is not configured");
   }
 
+  const MAX_METADATA_BYTES = 4 * 1024 * 1024;
   let currentTarget = parsedImage.reference;
   let manifest = null;
 
   for (let hop = 0; hop < MAX_MANIFEST_HOPS; hop++) {
-    const res = await fetchOciResource({
-      registry: parsedImage.registry,
-      repository: parsedImage.repository,
-      kind: "manifests",
-      target: currentTarget,
-      accept: DEFAULT_MANIFEST_ACCEPT,
-    });
+    const res = await callUpstreamWithTimeout(
+      () =>
+        fetchOciResource({
+          registry: parsedImage.registry,
+          repository: parsedImage.repository,
+          kind: "manifests",
+          target: currentTarget,
+          accept: DEFAULT_MANIFEST_ACCEPT,
+          signal,
+          maxBytes: MAX_METADATA_BYTES,
+        }),
+      signal,
+      `OCI manifest fetch for ${parsedImage.canonical}`
+    );
     if (!res || res.status !== 200) {
       throw new EvalError(
         502,
@@ -860,13 +1008,20 @@ async function fetchBaseImageLayers(parsedImage, fetchOciResource) {
 
   let imageConfig = {};
   if (manifest.config && typeof manifest.config.digest === "string") {
-    const cfgRes = await fetchOciResource({
-      registry: parsedImage.registry,
-      repository: parsedImage.repository,
-      kind: "blobs",
-      target: manifest.config.digest,
-      accept: "*/*",
-    });
+    const cfgRes = await callUpstreamWithTimeout(
+      () =>
+        fetchOciResource({
+          registry: parsedImage.registry,
+          repository: parsedImage.repository,
+          kind: "blobs",
+          target: manifest.config.digest,
+          accept: "*/*",
+          signal,
+          maxBytes: MAX_METADATA_BYTES,
+        }),
+      signal,
+      `OCI image config fetch for ${parsedImage.canonical}`
+    );
     if (!cfgRes || cfgRes.status !== 200) {
       throw new EvalError(
         502,
@@ -886,15 +1041,37 @@ async function fetchBaseImageLayers(parsedImage, fetchOciResource) {
 
   const layers = [];
   const manifestLayers = Array.isArray(manifest.layers) ? manifest.layers : [];
+  if (manifestLayers.length > MAX_MANIFEST_LAYERS) {
+    throw new EvalError(
+      507,
+      "MEMORY_LIMIT",
+      `OCI image manifest has ${manifestLayers.length} layers, exceeding maximum of ${MAX_MANIFEST_LAYERS}`
+    );
+  }
   for (const layerDesc of manifestLayers) {
     if (!layerDesc || typeof layerDesc.digest !== "string") continue;
-    const blobRes = await fetchOciResource({
-      registry: parsedImage.registry,
-      repository: parsedImage.repository,
-      kind: "blobs",
-      target: layerDesc.digest,
-      accept: "*/*",
-    });
+    if (budget && budget.remaining <= 0) {
+      throw new EvalError(
+        507,
+        "MEMORY_LIMIT",
+        `Cumulative decompressed archive size exceeded limit of ${DEFAULT_MAX_DECOMPRESSED_BYTES} bytes`
+      );
+    }
+    const layerMaxBytes = budget ? budget.remaining : DEFAULT_MAX_DECOMPRESSED_BYTES;
+    const blobRes = await callUpstreamWithTimeout(
+      () =>
+        fetchOciResource({
+          registry: parsedImage.registry,
+          repository: parsedImage.repository,
+          kind: "blobs",
+          target: layerDesc.digest,
+          accept: "*/*",
+          signal,
+          maxBytes: layerMaxBytes,
+        }),
+      signal,
+      `OCI layer fetch for ${layerDesc.digest}`
+    );
     if (!blobRes || blobRes.status !== 200) {
       throw new EvalError(
         502,
@@ -904,9 +1081,12 @@ async function fetchBaseImageLayers(parsedImage, fetchOciResource) {
     }
     const tarBytes = await maybeGunzipBytes(blobRes.bytes, {
       mediaType: layerDesc.mediaType || "",
-      maxBytes: DEFAULT_MAX_DECOMPRESSED_BYTES,
+      maxBytes: layerMaxBytes,
       isUpstream: true,
     });
+    if (budget) {
+      budget.remaining -= tarBytes.byteLength;
+    }
     layers.push(tarBytes);
   }
 
@@ -1111,50 +1291,85 @@ export function createWorkerEvalRuntime(workerWasmModule) {
   ) {
     const req = parseAndValidateEvalRequest(rawRequest);
 
-    // 1. Fetch and decompress external resources (baseImage, gitRepo, inputLayerDiffs)
-    //    outside the WASM execution lock.
+    // 1. Fetch and decompress external resources (baseImage, gitRepos, inputLayerDiffs)
+    //    outside the WASM execution lock, enforcing a single cumulative byte budget
+    //    and propagating `timeoutMs` via AbortSignal to upstream fetches.
+    const budget = { remaining: DEFAULT_MAX_DECOMPRESSED_BYTES };
+    const timeoutSignal =
+      typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+        ? AbortSignal.timeout(req.timeoutMs)
+        : undefined;
+
     let imageConfig = {};
     let baseLayers = [];
     if (req.baseImage) {
-      const fetched = await fetchBaseImageLayers(req.baseImage, fetchOciResource);
+      const fetched = await fetchBaseImageLayers(req.baseImage, fetchOciResource, {
+        budget,
+        signal: timeoutSignal,
+      });
       imageConfig = fetched.imageConfig;
       baseLayers = fetched.layers;
     }
 
-    let gitArchive = null;
-    if (req.gitRepo) {
+    const gitArchives = [];
+    if (req.gitRepos.length > 0) {
       if (typeof fetchGitArchive !== "function") {
         throw new EvalError(502, "UPSTREAM_ERROR", "Git archive fetcher is not configured");
       }
-      const gitRes = await fetchGitArchive({
-        repo: req.gitRepo.repo,
-        ref: req.gitRepo.ref,
-      });
-      if (!gitRes || gitRes.status !== 200) {
-        throw new EvalError(
-          502,
-          "UPSTREAM_ERROR",
-          `Failed to fetch git archive for ${req.gitRepo.repo}@${req.gitRepo.ref} (HTTP ${gitRes?.status ?? "error"})`
+      for (const gitSpec of req.gitRepos) {
+        if (budget.remaining <= 0) {
+          throw new EvalError(
+            507,
+            "MEMORY_LIMIT",
+            `Cumulative decompressed archive size exceeded limit of ${DEFAULT_MAX_DECOMPRESSED_BYTES} bytes`
+          );
+        }
+        const gitRes = await callUpstreamWithTimeout(
+          () =>
+            fetchGitArchive({
+              repo: gitSpec.repo,
+              ref: gitSpec.ref,
+              signal: timeoutSignal,
+              maxBytes: budget.remaining,
+            }),
+          timeoutSignal,
+          `Git archive fetch for ${gitSpec.repo}@${gitSpec.ref}`
         );
+        if (!gitRes || gitRes.status !== 200) {
+          throw new EvalError(
+            502,
+            "UPSTREAM_ERROR",
+            `Failed to fetch git archive for ${gitSpec.repo}@${gitSpec.ref} (HTTP ${gitRes?.status ?? "error"})`
+          );
+        }
+        const stripComponents = parseStripComponentsHeader(
+          getHeader(gitRes.headers, "x-git-strip-components"),
+          1
+        );
+        const tarBytes = await maybeGunzipBytes(gitRes.bytes, {
+          mediaType: getHeader(gitRes.headers, "content-type") || "application/gzip",
+          maxBytes: budget.remaining,
+          isUpstream: true,
+        });
+        budget.remaining -= tarBytes.byteLength;
+        gitArchives.push({ tarBytes, mountPath: gitSpec.mountPath, stripComponents });
       }
-      const stripComponents = parseStripComponentsHeader(
-        getHeader(gitRes.headers, "x-git-strip-components"),
-        1
-      );
-      const tarBytes = await maybeGunzipBytes(gitRes.bytes, {
-        mediaType: getHeader(gitRes.headers, "content-type") || "application/gzip",
-        maxBytes: DEFAULT_MAX_DECOMPRESSED_BYTES,
-        isUpstream: true,
-      });
-      gitArchive = { tarBytes, mountPath: req.gitRepo.mountPath, stripComponents };
     }
 
     const inputLayerTars = [];
     for (let i = 0; i < req.inputLayerDiffs.length; i++) {
+      if (budget.remaining <= 0) {
+        throw new EvalError(
+          507,
+          "MEMORY_LIMIT",
+          `Cumulative decompressed archive size exceeded limit of ${DEFAULT_MAX_DECOMPRESSED_BYTES} bytes`
+        );
+      }
       const tarBytes = await maybeGunzipBytes(req.inputLayerDiffs[i], {
-        maxBytes: DEFAULT_MAX_DECOMPRESSED_BYTES,
+        maxBytes: budget.remaining,
         isUpstream: false,
       });
+      budget.remaining -= tarBytes.byteLength;
       inputLayerTars.push(tarBytes);
     }
 
@@ -1198,7 +1413,7 @@ export function createWorkerEvalRuntime(workerWasmModule) {
           callExtractTar(exports, layerTar, "/", 0, false, true);
         }
 
-        if (gitArchive) {
+        for (const gitArchive of gitArchives) {
           callExtractTar(
             exports,
             gitArchive.tarBytes,

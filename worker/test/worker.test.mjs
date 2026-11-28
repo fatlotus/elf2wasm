@@ -2527,7 +2527,200 @@ describe("Cloudflare Worker: POST /api/eval Remote Layer Evaluation", async () =
     assert.equal(memRes.status, 507);
     assert.equal((await memRes.json()).code, "MEMORY_LIMIT");
   });
+
+  it("blocks disallowed Origin on POST /api/eval (including text/plain) with 403 before running WASM", async () => {
+    let fetchCalled = false;
+    const worker = createWorkerHandler({
+      workerWasmModule,
+      allowedOrigins: "https://trusted.example.com",
+      fetchImpl: async () => {
+        fetchCalled = true;
+        return new Response("ok", { status: 200 });
+      },
+    });
+
+    const badPost = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/eval`, {
+        method: "POST",
+        headers: {
+          Origin: "https://evil.example.com",
+          "Content-Type": "text/plain",
+        },
+        body: JSON.stringify({
+          inputLayerDiffs: [baseLayerB64],
+          cmd: ["/bin/writer"],
+        }),
+      })
+    );
+    assert.equal(badPost.status, 403);
+    const badJson = await badPost.json();
+    assert.equal(badJson.ok, false);
+    assert.equal(badJson.code, "INVALID_REQUEST");
+    assert.equal(fetchCalled, false, "Disallowed Origin must be rejected before any upstream fetch");
+
+    // Same-origin / allowed origin still succeeds
+    const goodPost = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/eval`, {
+        method: "POST",
+        headers: {
+          Origin: "https://trusted.example.com",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          inputLayerDiffs: [baseLayerB64],
+          cmd: ["/bin/writer"],
+        }),
+      })
+    );
+    assert.equal(goodPost.status, 200);
+    assert.equal(goodPost.headers.get("access-control-allow-origin"), "https://trusted.example.com");
+  });
+
+  it("blocks cumulative multi-layer gzip bombs and oversized upstream responses with 507 MEMORY_LIMIT", async () => {
+    // 1. Cumulative multi-layer gzip bomb: 10 x 10 MiB = 100 MiB > 64 MiB cap
+    const tenMiB = Buffer.alloc(10 * 1024 * 1024, 0);
+    const tenMiBGzB64 = zlib.gzipSync(tenMiB, { level: 1 }).toString("base64");
+    const worker = createWorkerHandler({ workerWasmModule });
+
+    const bombRes = await worker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/eval`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          inputLayerDiffs: Array(10).fill(tenMiBGzB64),
+          cmd: ["/bin/nonexistent"],
+        }),
+      })
+    );
+    assert.equal(bombRes.status, 507);
+    const bombJson = await bombRes.json();
+    assert.equal(bombJson.ok, false);
+    assert.equal(bombJson.code, "MEMORY_LIMIT");
+
+    // 2. Oversized upstream git archive response (> 64 MiB declared Content-Length) cancels stream and returns 507
+    let streamCanceled = false;
+    const oversizedWorker = createWorkerHandler({
+      workerWasmModule,
+      fetchImpl: async () => {
+        const stream = new ReadableStream({
+          pull(controller) {
+            controller.enqueue(new Uint8Array(64 * 1024));
+          },
+          cancel() {
+            streamCanceled = true;
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/gzip",
+            "Content-Length": String(100 * 1024 * 1024),
+          },
+        });
+      },
+    });
+    const upBigRes = await oversizedWorker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/eval`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          gitRepo: { repo: "octocat/huge", ref: "main", mountPath: "/workspace" },
+          cmd: ["/bin/writer"],
+        }),
+      })
+    );
+    assert.equal(upBigRes.status, 507);
+    const upBigJson = await upBigRes.json();
+    assert.equal(upBigJson.ok, false);
+    assert.equal(upBigJson.code, "MEMORY_LIMIT");
+    assert.equal(streamCanceled, true, "Oversized upstream stream must be canceled");
+  });
+
+  it("enforces timeoutMs on stalled upstream fetches and supports gitRepos array", async () => {
+    // 1. Stalled upstream fetch honors short timeoutMs (100ms) -> 408
+    const stalledWorker = createWorkerHandler({
+      workerWasmModule,
+      fetchImpl: (_url, init) =>
+        new Promise((_resolve, reject) => {
+          const keepAlive = setTimeout(() => {
+            reject(new Error("Mock stalled fetch was not aborted"));
+          }, 10_000);
+          const onAbort = () => {
+            clearTimeout(keepAlive);
+            const err = new Error("Aborted");
+            err.name = "AbortError";
+            reject(err);
+          };
+          if (init?.signal?.aborted) {
+            onAbort();
+          } else {
+            init?.signal?.addEventListener("abort", onAbort, { once: true });
+          }
+        }),
+    });
+
+    const t0 = Date.now();
+    const timeoutRes = await stalledWorker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/eval`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          gitRepo: { repo: "octocat/stalled", ref: "main", mountPath: "/workspace" },
+          cmd: ["/bin/writer"],
+          timeoutMs: 100,
+        }),
+      })
+    );
+    const elapsed = Date.now() - t0;
+    assert.equal(timeoutRes.status, 408);
+    assert.equal((await timeoutRes.json()).code, "FUEL_EXHAUSTED");
+    assert.ok(elapsed < 5000, `Expected fast timeout (<5s), took ${elapsed}ms`);
+
+    // 2. Multiple gitRepos mounted into distinct paths
+    const repo1Gz = buildTestTarGz([
+      { path: "r1-main/a.txt", content: Buffer.from("from-r1\n"), mode: 0o644 },
+    ]);
+    const repo2Gz = buildTestTarGz([
+      { path: "r2-main/b.txt", content: Buffer.from("from-r2\n"), mode: 0o644 },
+    ]);
+    const multiGitWorker = createWorkerHandler({
+      workerWasmModule,
+      fetchImpl: async (url) => {
+        if (url.includes("octocat/r1")) {
+          return new Response(repo1Gz, {
+            status: 200,
+            headers: { "Content-Type": "application/gzip", "X-Git-Strip-Components": "1" },
+          });
+        }
+        if (url.includes("octocat/r2")) {
+          return new Response(repo2Gz, {
+            status: 200,
+            headers: { "Content-Type": "application/gzip", "X-Git-Strip-Components": "1" },
+          });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    const multiRes = await multiGitWorker.fetch(
+      new Request(`${WORKER_ORIGIN}/api/eval`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          inputLayerDiffs: [baseLayerB64],
+          gitRepos: [
+            { repo: "octocat/r1", ref: "main", mountPath: "/repo1" },
+            { repo: "octocat/r2", ref: "main", mountPath: "/repo2" },
+          ],
+          cmd: ["/bin/writer"],
+        }),
+      })
+    );
+    assert.equal(multiRes.status, 200);
+    const multiJson = await multiRes.json();
+    assert.equal(multiJson.ok, true);
+  });
 });
+
 
 
 

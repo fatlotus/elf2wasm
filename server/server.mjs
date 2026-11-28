@@ -6,9 +6,11 @@ import { fileURLToPath } from "node:url";
 import { createRegistryProxy } from "./registry_proxy.mjs";
 import { createGitProxy } from "./git_proxy.mjs";
 import {
+  DEFAULT_MAX_DECOMPRESSED_BYTES,
   DEFAULT_MAX_EVAL_BODY_BYTES,
   EvalError,
   createWorkerEvalRuntime,
+  readBoundedBody,
   wantsGzipResponse,
   formatEvalJsonResponse,
   buildGzipEvalHeaders,
@@ -370,23 +372,39 @@ export function createServer(options = {}) {
 
       const selfOrigin = handle.url;
 
-      const fetchOciResource = async ({ registry, repository, kind, target, accept }) => {
+      const fetchOciResource = async ({
+        registry,
+        repository,
+        kind,
+        target,
+        accept,
+        signal,
+        maxBytes,
+      }) => {
         const ociUrl = `${selfOrigin}/api/v2/${registry}/${repository}/${kind}/${target}`;
         const r = await fetch(ociUrl, {
           method: "GET",
           headers: accept ? { Accept: accept } : {},
+          signal,
         });
-        const bytes = new Uint8Array(await r.arrayBuffer());
+        const bytes = await readBoundedBody(r, maxBytes ?? DEFAULT_MAX_DECOMPRESSED_BYTES, {
+          signal,
+          label: `OCI ${kind} response`,
+        });
         return { status: r.status, headers: r.headers, bytes };
       };
 
-      const fetchGitArchive = async ({ repo, ref }) => {
+      const fetchGitArchive = async ({ repo, ref, signal, maxBytes }) => {
         const params = new URLSearchParams({ repo });
         if (ref) params.set("ref", ref);
         const r = await fetch(`${selfOrigin}/api/git/archive?${params.toString()}`, {
           method: "GET",
+          signal,
         });
-        const bytes = new Uint8Array(await r.arrayBuffer());
+        const bytes = await readBoundedBody(r, maxBytes ?? DEFAULT_MAX_DECOMPRESSED_BYTES, {
+          signal,
+          label: "Git archive response",
+        });
         return { status: r.status, headers: r.headers, bytes };
       };
 
@@ -411,11 +429,13 @@ export function createServer(options = {}) {
       sendJson(res, 200, formatEvalJsonResponse(result), method);
     } catch (err) {
       if (err instanceof EvalError) {
+        const extraHeaders = err.statusCode === 413 ? { Connection: "close" } : {};
         sendJson(
           res,
           err.statusCode,
           { ok: false, error: err.message, code: err.code },
-          method
+          method,
+          extraHeaders
         );
         return;
       }

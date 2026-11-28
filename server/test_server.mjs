@@ -46,6 +46,10 @@ import {
   MAX_FUEL_CAP,
   DEFAULT_MAX_MEMORY_BYTES,
   MAX_MAX_MEMORY_BYTES,
+  EvalError,
+  parseAndValidateEvalRequest,
+  maybeGunzipBytes,
+  createWorkerEvalRuntime,
 } from "./eval_core.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -2372,11 +2376,195 @@ describe("M3: POST /api/eval Local Dev Server Parity", () => {
       });
       assert.equal(r502.status, 502);
       assert.equal((await r502.json()).code, "UPSTREAM_ERROR");
+
+      // Chunked streaming HTTP 413 (no Content-Length) must return 413 with Connection: close
+      const chunked413 = await new Promise((resolve, reject) => {
+        const u = new URL(`${smallSrv.url}/api/eval`);
+        const req = http.request(
+          {
+            hostname: u.hostname,
+            port: u.port,
+            path: u.pathname,
+            method: "POST",
+            headers: { "Transfer-Encoding": "chunked", "Content-Type": "application/json" },
+          },
+          (res) => {
+            const chunks = [];
+            res.on("data", (c) => chunks.push(c));
+            res.on("end", () => {
+              resolve({
+                status: res.statusCode,
+                connection: res.headers.connection,
+                body: Buffer.concat(chunks).toString("utf8"),
+              });
+            });
+          }
+        );
+        req.on("error", () => {}); // Ignore EPIPE/ECONNRESET if server closes early
+        req.write("x".repeat(200));
+        req.write("y".repeat(200));
+        req.end();
+      });
+      assert.equal(chunked413.status, 413);
+      assert.equal(chunked413.connection, "close");
+      assert.equal(JSON.parse(chunked413.body).code, "INVALID_REQUEST");
     } finally {
       await smallSrv.stop();
     }
   });
+
+  test("Adversarial /api/eval validation, compression errors, timeoutMs, and WASM trap recovery", async () => {
+    const validBase = { baseImage: "alpine:latest", cmd: ["/bin/sh"] };
+
+    // 1. Request validation edge cases
+    const badPayloads = [
+      { ...validBase, inputLayerDiffs: Array(17).fill("") },
+      { ...validBase, inputLayerDiffs: [123] },
+      { ...validBase, inputLayerDiffs: ["!!!not-base64!!!"] },
+      { ...validBase, maxFuel: -1 },
+      { ...validBase, maxFuel: 1.5 },
+      { ...validBase, maxFuel: Number.NaN },
+      { ...validBase, maxFuel: Number.POSITIVE_INFINITY },
+      { ...validBase, maxMemoryBytes: 0 },
+      { ...validBase, maxMemoryBytes: -1024 },
+      { ...validBase, delayStddevMs: -0.1 },
+      { ...validBase, delayStddevMs: Number.NaN },
+      { ...validBase, delaySeed: -1 },
+      { ...validBase, delaySeed: 1.5 },
+      { ...validBase, timeoutMs: 0 },
+      { ...validBase, timeoutMs: -100 },
+      { ...validBase, timeoutMs: Number.POSITIVE_INFINITY },
+      { ...validBase, cmd: [] },
+      { ...validBase, cmd: [123] },
+      { ...validBase, env: ["NO_EQUALS"] },
+      { ...validBase, env: ["=LEADING_EQUALS"] },
+      { ...validBase, returnOutputDiff: "true" },
+      { ...validBase, gitRepo: ["not-an-object"] },
+      { ...validBase, gitRepo: "owner/repo" },
+      { ...validBase, cwd: "/tmp/\0bad" },
+      { ...validBase, downloadPath: "/workspace/\0bad" },
+      { ...validBase, gitRepo: { repo: "owner/repo", mountPath: "/ws/\0bad" } },
+    ];
+    for (const payload of badPayloads) {
+      assert.throws(
+        () => parseAndValidateEvalRequest(payload),
+        (err) => err instanceof EvalError && err.statusCode === 400 && err.code === "INVALID_REQUEST",
+        `Expected 400 INVALID_REQUEST for payload: ${JSON.stringify(payload)}`
+      );
+    }
+
+    // 2. Corrupt gzip and unsupported compression magic (zstd, xz, bzip2)
+    const corruptGzip = new Uint8Array([0x1f, 0x8b, 0x08, 0x00, 0xff, 0xff, 0xff]);
+    await assert.rejects(
+      () => maybeGunzipBytes(corruptGzip, { isUpstream: false }),
+      (err) => err instanceof EvalError && err.statusCode === 400 && err.code === "INVALID_REQUEST"
+    );
+
+    const unsupportedMagics = [
+      ["zstd", new Uint8Array([0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00])],
+      ["xz", new Uint8Array([0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00])],
+      ["bzip2", new Uint8Array([0x42, 0x5a, 0x68, 0x39, 0x00])],
+    ];
+    for (const [name, bytes] of unsupportedMagics) {
+      await assert.rejects(
+        () => maybeGunzipBytes(bytes, { isUpstream: false }),
+        (err) => err instanceof EvalError && err.statusCode === 400 && err.code === "INVALID_REQUEST",
+        `Expected 400 for client ${name}`
+      );
+      await assert.rejects(
+        () => maybeGunzipBytes(bytes, { isUpstream: true }),
+        (err) => err instanceof EvalError && err.statusCode === 502 && err.code === "UPSTREAM_ERROR",
+        `Expected 502 for upstream ${name}`
+      );
+    }
+
+    // 3. Single gzip bomb exceeding maxBytes -> 507 MEMORY_LIMIT
+    const bigZeroGz = zlib.gzipSync(Buffer.alloc(2 * 1024 * 1024, 0), { level: 1 });
+    await assert.rejects(
+      () => maybeGunzipBytes(bigZeroGz, { maxBytes: 1024 * 1024, isUpstream: false }),
+      (err) => err instanceof EvalError && err.statusCode === 507 && err.code === "MEMORY_LIMIT"
+    );
+
+    // 4. Stalled upstream git fetch honors timeoutMs -> 408 FUEL_EXHAUSTED
+    const slowGit = createMockGitServer();
+    slowGit.addRepo("sloworg/demo", "slow-ref", [{ path: "a.txt", content: "hi\n" }]);
+    slowGit.setRouteBehavior("sloworg/demo", "slow-ref", { delayMs: 800 });
+    await slowGit.start();
+    try {
+      const t0 = Date.now();
+      const timeoutRes = await fetch(`${srv.url}/api/eval`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          gitRepo: { repo: `${slowGit.url}/sloworg/demo`, ref: "slow-ref", mountPath: "/workspace" },
+          cmd: ["/bin/writer"],
+          timeoutMs: 120,
+        }),
+      });
+      const elapsed = Date.now() - t0;
+      assert.equal(timeoutRes.status, 408);
+      assert.equal((await timeoutRes.json()).code, "FUEL_EXHAUSTED");
+      assert.ok(elapsed < 4000, `Expected timeout to abort quickly, took ${elapsed}ms`);
+    } finally {
+      await slowGit.stop();
+    }
+
+    // 5. WASM instance trap recovery: after WebAssembly.RuntimeError triggers dropInstance(),
+    //    subsequent request cleanly re-instantiates and succeeds.
+    const workerWasmPath = path.join(
+      REPO_ROOT,
+      "target",
+      "wasm32-unknown-unknown",
+      "release",
+      "elf2wasm_worker_wasm.wasm"
+    );
+    const wasmBytes = await fsp.readFile(workerWasmPath);
+    const workerMod = await WebAssembly.compile(wasmBytes);
+    const runtime = createWorkerEvalRuntime(workerMod);
+    const origInstantiate = WebAssembly.instantiate;
+    let instantiateCount = 0;
+    try {
+      WebAssembly.instantiate = async (mod, imports) => {
+        instantiateCount++;
+        const inst = await origInstantiate.call(WebAssembly, mod, imports);
+        if (instantiateCount === 1) {
+          const fakeExports = {
+            ...inst.exports,
+            worker_run_command: () => {
+              throw new WebAssembly.RuntimeError("unreachable");
+            },
+          };
+          return { instance: { exports: fakeExports } };
+        }
+        return inst;
+      };
+
+      const layerTar = createTarGzLayer([{ path: "bin/writer", content: writerElf, mode: 0o755 }]);
+      const layerB64 = layerTar.gzipBytes.toString("base64");
+
+      await assert.rejects(
+        () =>
+          runtime.evaluateLayer({
+            inputLayerDiffs: [layerB64],
+            cmd: ["/bin/writer"],
+          }),
+        (err) => err instanceof EvalError && err.statusCode === 502 && err.code === "UPSTREAM_ERROR"
+      );
+
+      // Second call must re-instantiate cleanly and succeed
+      const recovered = await runtime.evaluateLayer({
+        inputLayerDiffs: [layerB64],
+        cmd: ["/bin/writer"],
+      });
+      assert.equal(recovered.ok, true);
+      assert.equal(recovered.exitCode, 0);
+      assert.equal(instantiateCount, 2, "Trap must drop instance and re-instantiate on next call");
+    } finally {
+      WebAssembly.instantiate = origInstantiate;
+    }
+  });
 });
+
 
 
 
