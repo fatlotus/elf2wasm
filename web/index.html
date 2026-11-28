@@ -3,8 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>elf2wasm — Client-Side Docker-on-WASM Web Shell</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b0e14'/%3E%3Ctext x='50%25' y='56%25' text-anchor='middle' dominant-baseline='middle' fill='%2338bdf8' font-family='monospace' font-size='15' font-weight='bold'%3E%24_%3C/text%3E%3C/svg%3E">
+  <meta name="color-scheme" content="light dark">
+  <title>elf2wasm — Deterministic Linux Container Runner in WebAssembly</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cstyle%3Erect%7Bfill:%23f6f8fa;stroke:%23d0d7de%7Dtext%7Bfill:%230969da%7D@media(prefers-color-scheme:dark)%7Brect%7Bfill:%230d1117;stroke:%2330363d%7Dtext%7Bfill:%2358a6ff%7D%7D%3C/style%3E%3Crect x='1' y='1' width='30' height='30' rx='6' stroke-width='2'/%3E%3Ctext x='50%25' y='55%25' text-anchor='middle' dominant-baseline='middle' font-family='monospace' font-size='14' font-weight='700'%3E%24_%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="/web/styles.css">
 </head>
 <body>
@@ -15,254 +16,142 @@
         <div class="brand-text">
           <h1>
             elf2wasm
-            <span class="brand-pill">100% Client-Side WASM</span>
+            <span class="brand-pill">WASM</span>
           </h1>
-          <p class="brand-subtitle">Run Linux x86-64 Docker images in your browser — unpack, compile &amp; execute locally in WebAssembly</p>
+          <p class="brand-subtitle">Deterministic Linux x86-64 containers — run locally in WebAssembly or remotely on Cloudflare Workers</p>
         </div>
       </div>
-      <div id="status-pill" class="status-pill" data-state="idle" role="status" aria-live="polite">
-        <span class="status-dot" aria-hidden="true"></span>
-        <span id="status-text">Idle — click Start Shell to boot alpine:latest</span>
-      </div>
-    </header>
 
-    <section class="control-panel" aria-label="Container controls">
-      <div class="control-grid">
-        <div class="field">
-          <label for="image-input">Docker Image</label>
-          <input
-            id="image-input"
-            name="image"
-            type="text"
-            value="alpine:latest"
-            placeholder="alpine:latest"
-            autocomplete="off"
-            spellcheck="false"
-          >
+      <div class="topbar-controls">
+        <div id="theme-switcher" class="segmented-control" role="radiogroup" aria-label="Color theme">
+          <button type="button" class="seg-btn" role="radio" data-theme-choice="system" aria-checked="true">System</button>
+          <button type="button" class="seg-btn" role="radio" data-theme-choice="light" aria-checked="false">Light</button>
+          <button type="button" class="seg-btn" role="radio" data-theme-choice="dark" aria-checked="false">Dark</button>
         </div>
 
-        <div class="actions">
-          <button id="start-btn" type="button" class="btn btn-primary">Start Shell</button>
+        <div id="global-executor-control" class="segmented-control" role="group" aria-label="Execution target for all layers">
+          <button id="run-all-local-btn" type="button" class="seg-btn" data-executor-all="local" aria-pressed="true">Run All Locally</button>
+          <button id="run-all-remote-btn" type="button" class="seg-btn" data-executor-all="remote" aria-pressed="false">Run All Remotely</button>
+        </div>
+
+        <div class="topbar-actions">
+          <button id="start-btn" type="button" class="btn btn-primary">Run</button>
           <button id="stop-btn" type="button" class="btn btn-danger" disabled>Stop</button>
           <button id="clear-btn" type="button" class="btn btn-secondary">Clear</button>
         </div>
       </div>
+    </header>
 
-      <div class="cmd-grid" role="group" aria-label="Build and run commands">
-        <div class="field">
-          <label for="build-cmd-input">Build Command (optional)</label>
-          <input
-            id="build-cmd-input"
-            name="build"
-            type="text"
-            placeholder="e.g. go build (runs once before run/sweep)"
-            autocomplete="off"
-            spellcheck="false"
-          >
+    <div class="status-bar">
+      <div id="status-pill" class="status-pill" data-state="idle" role="status" aria-live="polite">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="status-text">Idle — click Run to start alpine:latest</span>
+      </div>
+      <div class="executor-summary">
+        <span>Target:</span>
+        <span id="executor-mode-badge" class="executor-badge" data-mode="local">Local (Browser WASM)</span>
+      </div>
+    </div>
+
+    <section class="presets-section" aria-label="Example presets">
+      <div class="presets-header">
+        <span class="presets-label">Presets</span>
+      </div>
+      <div id="presets-list" class="presets-grid" role="group" aria-label="Example project presets">
+        <button type="button" class="preset-card" data-preset="js-express" data-language="javascript" data-image="mirror.gcr.io/library/mongo-express:1.0.2-20-alpine3.19" data-active="false">
+          <span class="lang-badge lang-js" aria-hidden="true">JS</span>
+          <span class="preset-card-body">
+            <span class="preset-title">Express.js</span>
+            <span class="preset-meta">Node.js HTTP server &amp; JSON API</span>
+          </span>
+        </button>
+
+        <button type="button" class="preset-card" data-preset="python-flask" data-language="python" data-image="quay.io/computesphere/computesphere-python-flask-example:latest" data-active="false">
+          <span class="lang-badge lang-python" aria-hidden="true">Py</span>
+          <span class="preset-card-body">
+            <span class="preset-title">Flask</span>
+            <span class="preset-meta">Python 3.13 web app &amp; test client</span>
+          </span>
+        </button>
+
+        <button type="button" class="preset-card" data-preset="go-raft-nodice" data-language="go" data-image="ghcr.io/fatlotus/golang-with-cache:1.27-alpine" data-active="false">
+          <span class="lang-badge lang-go" aria-hidden="true">Go</span>
+          <span class="preset-card-body">
+            <span class="preset-title">Go Raft (nodice)</span>
+            <span class="preset-meta">Git clone, go build &amp; consensus sim</span>
+          </span>
+        </button>
+
+        <button type="button" class="preset-card" data-preset="alpine-sweep" data-language="shell" data-image="mirror.gcr.io/library/alpine:latest" data-active="false">
+          <span class="lang-badge lang-shell" aria-hidden="true">Sh</span>
+          <span class="preset-card-body">
+            <span class="preset-title">Alpine Env Sweep</span>
+            <span class="preset-meta">Fast 3-variation SWEEP demo</span>
+          </span>
+        </button>
+      </div>
+    </section>
+
+    <section class="pipeline-panel" aria-label="Dockerfile and layer pipeline editor">
+      <div class="pipeline-header">
+        <div class="segmented-control" role="tablist" aria-label="Pipeline editor mode">
+          <button
+            id="tab-visual"
+            type="button"
+            class="seg-btn"
+            role="tab"
+            aria-selected="true"
+            aria-controls="panel-visual"
+          >Visual Layers</button>
+          <button
+            id="tab-dockerfile"
+            type="button"
+            class="seg-btn"
+            role="tab"
+            aria-selected="false"
+            aria-controls="panel-dockerfile"
+          >Dockerfile</button>
         </div>
 
-        <div class="field">
-          <label for="cmd-input">Run Command (optional)</label>
-          <input
-            id="cmd-input"
-            name="cmd"
-            type="text"
-            placeholder="/bin/sh (image default)"
-            autocomplete="off"
-            spellcheck="false"
-          >
+        <div class="pipeline-header-actions">
+          <span id="layer-count-badge" class="layer-count-badge">1 layer</span>
+          <button id="copy-pipeline-link-btn" type="button" class="btn btn-secondary btn-sm">Copy Link</button>
         </div>
       </div>
 
-      <div class="presets-row" aria-label="Quick image presets">
-        <span class="presets-label">Presets:</span>
-        <button type="button" class="preset-chip" data-image="alpine:latest">alpine:latest</button>
-        <button type="button" class="preset-chip" data-image="busybox:latest">busybox:latest</button>
-        <button type="button" class="preset-chip" data-image="debian:bookworm-slim">debian:bookworm-slim</button>
-        <button type="button" class="preset-chip" data-image="python:3.12-slim">python:3.12-slim</button>
-        <button type="button" class="preset-chip" data-image="node:22-slim">node:22-slim</button>
-        <button type="button" class="preset-chip" data-image="ghcr.io/fatlotus/golang-with-cache:1.27-alpine" title="ghcr.io/fatlotus/golang-with-cache:1.27-alpine">golang:1.27-alpine (cached)</button>
+      <div id="panel-visual" class="pipeline-body" role="tabpanel" aria-labelledby="tab-visual">
+        <div id="layer-list" class="layer-list" aria-label="Container layers"></div>
+        <div class="add-layer-bar" role="group" aria-label="Add a container layer">
+          <span class="add-layer-label">Add layer:</span>
+          <button type="button" class="btn btn-secondary btn-xs" data-add-layer="from">+ FROM</button>
+          <button type="button" class="btn btn-secondary btn-xs" data-add-layer="git">+ Git Clone</button>
+          <button type="button" class="btn btn-secondary btn-xs" data-add-layer="workdir">+ WORKDIR</button>
+          <button type="button" class="btn btn-secondary btn-xs" data-add-layer="env">+ ENV</button>
+          <button type="button" class="btn btn-secondary btn-xs" data-add-layer="run">+ RUN</button>
+          <button type="button" class="btn btn-secondary btn-xs" data-add-layer="sweep">+ SWEEP</button>
+        </div>
       </div>
 
-      <div class="repo-grid" role="group" aria-label="Git repository overlay">
+      <div id="panel-dockerfile" class="pipeline-body" role="tabpanel" aria-labelledby="tab-dockerfile" hidden>
         <div class="field">
-          <label for="repo-input">Git Repo Overlay (optional)</label>
-          <input
-            id="repo-input"
-            name="repo"
-            type="text"
-            placeholder="owner/repo or https://github.com/owner/repo"
-            autocomplete="off"
+          <label for="dockerfile-editor">Dockerfile (supports FROM, WORKDIR, ENV, RUN, RUN git clone, # elf2wasm:git, # elf2wasm:sweep, # elf2wasm:executor=remote)</label>
+          <textarea
+            id="dockerfile-editor"
+            class="dockerfile-editor"
+            rows="10"
             spellcheck="false"
-          >
+            placeholder="FROM alpine:latest&#10;RUN echo hello"
+          >FROM alpine:latest</textarea>
         </div>
-
-        <div class="field">
-          <label for="repo-ref-input">Branch / Tag / Commit</label>
-          <input
-            id="repo-ref-input"
-            name="repoRef"
-            type="text"
-            placeholder="HEAD (default)"
-            autocomplete="off"
-            spellcheck="false"
-          >
-        </div>
-
-        <div class="field">
-          <label for="repo-mount-input">Mount Path</label>
-          <input
-            id="repo-mount-input"
-            name="repoMount"
-            type="text"
-            value="/workspace"
-            placeholder="/workspace"
-            autocomplete="off"
-            spellcheck="false"
-          >
-        </div>
+        <div id="dockerfile-warnings" class="warnings-banner" role="alert" hidden></div>
       </div>
-
-      <div class="project-presets-row" role="group" aria-label="Project test suite presets">
-        <span class="presets-label">Project Tests:</span>
-        <button
-          type="button"
-          class="project-preset-chip"
-          data-preset="python-bottle"
-          data-language="python"
-        ><span class="lang-badge lang-python" aria-hidden="true">Py</span> Python: Bottle (359 tests)</button>
-        <button
-          type="button"
-          class="project-preset-chip"
-          data-preset="js-nanoid"
-          data-language="javascript"
-        ><span class="lang-badge lang-js" aria-hidden="true">JS</span> JavaScript: Nano ID (13 tests)</button>
-        <button
-          type="button"
-          class="project-preset-chip"
-          data-preset="rust-nushell"
-          data-language="rust"
-        ><span class="lang-badge lang-rust" aria-hidden="true">Rs</span> Rust: Nushell stdlib (35 tests)</button>
-        <button
-          type="button"
-          class="project-preset-chip"
-          data-preset="go-raft-nodice"
-          data-language="go"
-        ><span class="lang-badge lang-go" aria-hidden="true">Go</span> Go: Raft (nodice)</button>
-      </div>
-
-      <div class="delay-sweep-section" role="group" aria-label="Deterministic delay injection and sweep mode">
-        <div class="delay-sweep-grid">
-          <div class="field" id="delay-stddev-field">
-            <label for="delay-stddev-input">Delay Stddev (ms)</label>
-            <input
-              id="delay-stddev-input"
-              name="stddev"
-              type="number"
-              min="0"
-              step="any"
-              value="0"
-              placeholder="0"
-            >
-          </div>
-
-          <div class="field">
-            <label for="delay-seed-input">PRNG Seed</label>
-            <input
-              id="delay-seed-input"
-              name="seed"
-              type="number"
-              min="0"
-              step="1"
-              value="0"
-              placeholder="0"
-            >
-          </div>
-
-          <div class="field sweep-toggle-field">
-            <label class="sweep-toggle-label" for="sweep-mode-toggle">
-              <input id="sweep-mode-toggle" name="sweep" type="checkbox">
-              <span>Sweep Mode</span>
-            </label>
-          </div>
-        </div>
-
-        <div id="sweep-params-grid" class="sweep-params-grid" hidden>
-          <div class="field">
-            <label for="sweep-runs-input">Runs (N)</label>
-            <input
-              id="sweep-runs-input"
-              name="runs"
-              type="number"
-              min="1"
-              max="1000"
-              step="1"
-              value="20"
-              placeholder="20"
-            >
-          </div>
-
-          <div class="field">
-            <label for="sweep-stddev-start-input">Stddev Start (ms)</label>
-            <input
-              id="sweep-stddev-start-input"
-              name="stddevStart"
-              type="number"
-              min="0"
-              step="any"
-              value="1"
-              placeholder="1"
-            >
-          </div>
-
-          <div class="field">
-            <label for="sweep-stddev-step-input">Stddev Step (ms)</label>
-            <input
-              id="sweep-stddev-step-input"
-              name="stddevStep"
-              type="number"
-              min="0"
-              step="any"
-              value="1"
-              placeholder="1"
-            >
-          </div>
-        </div>
-      </div>
-
-      <details class="panel-drawer" id="advanced-options">
-        <summary>Advanced Options (Environment &amp; Working Directory)</summary>
-        <div class="advanced-grid">
-          <div class="field">
-            <label for="env-input">Environment Variables (one KEY=VALUE per line)</label>
-            <textarea
-              id="env-input"
-              name="env"
-              rows="2"
-              placeholder="FOO=bar&#10;MY_VAR=hello"
-              spellcheck="false"
-            ></textarea>
-          </div>
-          <div class="field">
-            <label for="cwd-input">Working Directory</label>
-            <input
-              id="cwd-input"
-              name="cwd"
-              type="text"
-              placeholder="/ (image default)"
-              autocomplete="off"
-              spellcheck="false"
-            >
-          </div>
-        </div>
-      </details>
 
       <div class="progress-wrap">
         <div
           id="progress-bar"
           class="progress-bar"
           role="progressbar"
-          aria-label="Client-side pipeline progress"
+          aria-label="Pipeline progress"
           aria-valuemin="0"
           aria-valuemax="100"
           aria-valuenow="0"
@@ -275,7 +164,7 @@
           <span class="stage-step" data-step="pull">1. Pull Image</span>
           <span class="stage-step" data-step="unpack">2. Unpack &amp; Overlay</span>
           <span class="stage-step" data-step="compile">3. Compile ELF &rarr; WASM</span>
-          <span class="stage-step" data-step="run">4. Run in Browser</span>
+          <span class="stage-step" data-step="run">4. Execute</span>
         </div>
       </div>
     </section>
@@ -284,8 +173,8 @@
       <div class="sweep-summary">
         <div class="sweep-summary-meta">
           <span id="sweep-outcome-badge" class="sweep-badge" data-outcome="idle">Idle</span>
-          <span id="sweep-build-status" class="sweep-meta-item">Build: —</span>
-          <span id="sweep-progress-text" class="sweep-meta-item">0 / 20 runs</span>
+          <span id="sweep-param-summary" class="sweep-meta-item">Varying: —</span>
+          <span id="sweep-progress-text" class="sweep-meta-item">0 / 0 variations</span>
         </div>
         <button id="copy-sweep-link-btn" type="button" class="btn btn-secondary btn-sm">Copy Sweep Link</button>
       </div>
@@ -294,11 +183,11 @@
           <thead>
             <tr>
               <th>#</th>
-              <th>Stddev (ms)</th>
-              <th>Seed</th>
+              <th id="sweep-varied-col-header">Value</th>
               <th>Status</th>
               <th>Exit</th>
               <th>Virtual Time</th>
+              <th>Outputs</th>
               <th>Link</th>
             </tr>
           </thead>
@@ -307,14 +196,12 @@
       </div>
     </section>
 
-    <section class="terminal-section" aria-label="Interactive terminal">
+    <section class="terminal-section" aria-label="Container terminal">
       <div class="terminal-header">
-        <div class="terminal-dots" aria-hidden="true">
-          <span class="terminal-dot red"></span>
-          <span class="terminal-dot yellow"></span>
-          <span class="terminal-dot green"></span>
+        <div class="terminal-header-left">
+          <span id="terminal-context-badge" class="term-context-badge">Ready</span>
+          <span id="terminal-title" class="terminal-title">alpine:latest</span>
         </div>
-        <span id="terminal-title" class="terminal-title">alpine:latest — /bin/sh</span>
         <div class="terminal-meta">
           <span class="terminal-hints">Ctrl+C interrupt &middot; Ctrl+D EOF &middot; Ctrl+L clear</span>
           <span id="terminal-size">80&times;24</span>
@@ -325,7 +212,7 @@
         class="terminal"
         tabindex="0"
         role="application"
-        aria-label="Interactive container shell"
+        aria-label="Interactive container shell and command output"
       ></div>
     </section>
 
