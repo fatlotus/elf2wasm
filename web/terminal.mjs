@@ -10,24 +10,24 @@
 const DEFAULT_FG = null;
 const DEFAULT_BG = null;
 
-// Standard 16 ANSI colors (dark developer-console palette)
+// Standard 16 ANSI colors mapped to theme-aware CSS custom properties
 const ANSI_16 = [
-  "#1e222a", // 0 black
-  "#f87171", // 1 red
-  "#4ade80", // 2 green
-  "#facc15", // 3 yellow
-  "#60a5fa", // 4 blue
-  "#c084fc", // 5 magenta
-  "#22d3ee", // 6 cyan
-  "#e2e8f0", // 7 white
-  "#64748b", // 8 bright black (gray)
-  "#fca5a5", // 9 bright red
-  "#86efac", // 10 bright green
-  "#fde047", // 11 bright yellow
-  "#93c5fd", // 12 bright blue
-  "#d8b4fe", // 13 bright magenta
-  "#67e8f9", // 14 bright cyan
-  "#ffffff", // 15 bright white
+  "var(--ansi-0, #24292f)",   // 0 black
+  "var(--ansi-1, #cf222e)",   // 1 red
+  "var(--ansi-2, #1a7f37)",   // 2 green
+  "var(--ansi-3, #9a6700)",   // 3 yellow
+  "var(--ansi-4, #0969da)",   // 4 blue
+  "var(--ansi-5, #8250df)",   // 5 magenta
+  "var(--ansi-6, #0e7490)",   // 6 cyan
+  "var(--ansi-7, #57606a)",   // 7 white
+  "var(--ansi-8, #6e7781)",   // 8 bright black (gray)
+  "var(--ansi-9, #a40e26)",   // 9 bright red
+  "var(--ansi-10, #116329)",  // 10 bright green
+  "var(--ansi-11, #7d4e00)",  // 11 bright yellow
+  "var(--ansi-12, #0550ae)",  // 12 bright blue
+  "var(--ansi-13, #6639ba)",  // 13 bright magenta
+  "var(--ansi-14, #155e75)",  // 14 bright cyan
+  "var(--ansi-15, #1f2328)",  // 15 bright white
 ];
 
 function ansi256ToCss(n) {
@@ -86,8 +86,8 @@ function styleKey(s) {
 
 function applyStyleToSpan(span, s) {
   if (s.inverse) {
-    span.style.color = s.bg || "var(--term-bg, #0b0f14)";
-    span.style.backgroundColor = s.fg || "var(--term-fg, #e6edf3)";
+    span.style.color = s.bg || "var(--term-bg, #ffffff)";
+    span.style.backgroundColor = s.fg || "var(--term-fg, #1f2328)";
   } else {
     if (s.fg) span.style.color = s.fg;
     if (s.bg) span.style.backgroundColor = s.bg;
