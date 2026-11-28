@@ -1,171 +1,247 @@
 # `elf2wasm`
 
-`elf2wasm` is a **deterministic, Linux-compatible operating system** that runs **unmodified x86/x86-64 programs** in WebAssembly.
+`elf2wasm` is a **deterministic, Linux-compatible container runtime** that executes **unmodified x86-64 OCI container images and GitHub repositories** in WebAssembly — both **locally in the browser** and **remotely on Cloudflare Workers** (`wasmi`) with identical deterministic output.
 
 ---
 
 ## Core Goal & Architecture
 
-`elf2wasm` translates unmodified Linux x86-64 ELF64 executables and their required `.so` shared libraries (including `ld-linux-x86-64.so.2` and `libc.so.6`) into self-contained, zero-import WebAssembly (`.wasm`) modules and executes them inside a deterministic virtual OS.
+`elf2wasm` translates unmodified Linux x86-64 ELF64 executables and their required `.so` shared libraries (including `ld-linux-x86-64.so.2` and `libc.so.6`) into self-contained, zero-import WebAssembly (`.wasm`) modules and executes them inside a deterministic virtual OS:
 
-- **CPS (Continuation-Passing Style) Execution Model**: Translated guest `.wasm` modules have **zero imports**. Instead of calling out through a synchronous host import on `syscall`, a guest sets `yield_flag = 3` (`YIELD_SYSCALL_PENDING`), saves `rcx = next_ip`, `r11 = rflags`, and `rip = next_ip`, and returns from `_start()`. Similarly, when the instruction/block quantum (`quantum`, default `128`) expires, the guest sets `yield_flag = 2` (`YIELD_QUANTUM`) and returns from `_start()`. The kernel/runtime inspects the exported register globals, executes the syscall or schedules another thread/process, updates CPU state, and resumes `_start()`.
-- **Deterministic Virtual Time**: Clocks (`clock_gettime`, `gettimeofday`, `rdtsc`) and timed waits (`nanosleep`, `clock_nanosleep`, `futex`, `poll`, `epoll_wait`) advance a deterministic monotonic virtual clock rather than reading wall-clock host time, ensuring reproducible execution across runs and platforms.
-- **Cooperative Preemption & Multi-Processing**: A cooperative scheduler manages threads (`clone`) and processes (`fork`/`vfork`/`execve`/`wait4`) using `save_ctx` / `load_ctx` into a 464-byte context buffer, enabling deterministic time-slicing and interleaving without host threads.
-- **Sandboxed Virtual Filesystem (VFS)**: Guest file I/O operates against an in-memory writable overlay (regular files, directories, symlinks, pipes, `/dev/null`, `/dev/urandom` deterministic PRNG) layered over optional read-only host mounts (`--vfs-ro`), with zero unintended host writes or network access.
+- **CPS (Continuation-Passing Style) Execution Model**: Translated guest `.wasm` modules have **zero imports**. On `syscall`, a guest sets `yield_flag = 3` (`YIELD_SYSCALL_PENDING`), saves `rcx = next_ip`, `r11 = rflags`, and `rip = next_ip`, and returns from `_start()`. When the block quantum (`quantum`, default `128`) expires, the guest sets `yield_flag = 2` (`YIELD_QUANTUM`) and returns. The runtime inspects exported globals, executes the syscall or schedules another thread/process, updates CPU state, and resumes `_start()`.
+- **Deterministic Virtual Time & Delay Injection**: Clocks (`clock_gettime`, `gettimeofday`, `rdtsc`) and timed waits (`nanosleep`, `futex`, `poll`, `epoll_wait`) advance a deterministic monotonic virtual clock rather than reading host wall-clock time. Configurable PRNG seeds and synthetic scheduling delays make race conditions and distributed-systems failures reproducible.
+- **Cooperative Preemption & Multi-Processing**: A cooperative scheduler manages threads (`clone`) and processes (`fork`/`vfork`/`execve`/`wait4`) using `save_ctx` / `load_ctx` into a 464-byte context buffer without host threads.
+- **Sandboxed Copy-on-Write VFS & `.tar.gz` Diff Export**: Guest file I/O operates against an in-memory CoW VFS overlay (regular files, directories, symlinks, pipes, `/dev/null`, deterministic `/dev/urandom`, plus optional host mounts in `js/cli.mjs`) with zero unintended host writes or outbound guest internet. Any layer's modified files can be exported as an OCI-compatible `.tar` / `.tar.gz` diff archive (with `.wh.<name>` whiteouts).
+- **Local Browser & Remote Cloudflare Worker Parity**: The same Rust compiler (`elf2wasm-core`) and runtime (`elf2wasm-runtime-core`) run in the browser (compiling to native V8 WASM) and on Cloudflare Workers via `elf2wasm-worker-wasm` (using the `wasmi` interpreter with SIMD and fuel metering, requiring zero dynamic `WebAssembly.compile()`).
+
+### Workspace & Repository Layout
+
+```text
+elf2wasm/
+├── Cargo.toml                         # Virtual Rust workspace
+├── crates/
+│   ├── elf2wasm-core/                 # x86-64 ELF64 loader, decoder, lifter, WASM emitter
+│   ├── elf2wasm-runtime-core/         # Deterministic Linux syscall/VFS/scheduler runtime + tar diff export
+│   ├── elf2wasm-compiler-wasm/        # Browser/Node compiler cdylib (wasm32-unknown-unknown)
+│   ├── elf2wasm-runtime-wasm/         # Browser/Node runtime cdylib (wasm32-unknown-unknown)
+│   └── elf2wasm-worker-wasm/          # Cloudflare Worker wasmi interpreter cdylib (wasm32-unknown-unknown)
+├── js/
+│   ├── docker_sdk.mjs                 # Multi-layer local/remote pipeline & sweep SDK
+│   ├── container_worker.mjs           # Persistent Dedicated Web Worker backend
+│   ├── elf2wasm_shim.mjs              # Low-level WASM compiler/runtime & VFS shim
+│   ├── oci_client.mjs                 # OCI Registry v2 client
+│   ├── git_client.mjs                 # GitHub / forge archive client
+│   └── cli.mjs                        # Interactive Node.js CLI for local ELF testing
+├── web/                               # Zero-build vanilla ESM Web UI (Dockerfile/Layer builder, VT100 terminal)
+├── server/                            # Zero-dependency local Node.js dev server (mirrors Worker /api/*)
+├── worker/                            # Cloudflare Worker (static assets + OCI/Git proxy + POST /api/eval)
+└── e2e_docker_web/                    # 4-tier automated E2E verification suite
+```
 
 ---
 
-## Installation & Building `.wasm` Modules
+## Quick Start (Local Dev Server & Web UI)
 
 ### Prerequisites
 
-- **Rust toolchain & `cargo`** (edition 2021)
-- **`wasm32-unknown-unknown` target**:
-  ```bash
-  rustup target add wasm32-unknown-unknown
-  ```
-- **Node.js v24+** (for the JavaScript ESM API, `js/cli.mjs`, and E2E test suite)
-- **`gcc` & Linux x86-64 shared libraries** (e.g., `/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2`, `/lib/x86_64-linux-gnu/libc.so.6`) when compiling or translating dynamically linked x86-64 ELF guests
+- **Rust toolchain & `cargo`** (edition 2021) with the `wasm32-unknown-unknown` target
+- **Node.js v22+** (for the local dev server, JS SDK tests, `js/cli.mjs`, and Cloudflare Worker tooling)
+- *(Optional)* `gcc` and Linux x86-64 shared libraries if compiling custom local ELF binaries for `js/cli.mjs`
 
-### Building the Native CLI
-
-```bash
-cargo build --release
-```
-
-This produces `target/release/elf2wasm`.
-
-### Building the `.wasm` Compiler and Runtime Modules
-
-```bash
-cargo build --release --target wasm32-unknown-unknown -p elf2wasm-compiler-wasm -p elf2wasm-runtime-wasm
-```
-
-Outputs:
-- `target/wasm32-unknown-unknown/release/elf2wasm_compiler_wasm.wasm`
-- `target/wasm32-unknown-unknown/release/elf2wasm_runtime_wasm.wasm`
-
-### Translating an ELF Executable to a Guest `.wasm` Module
-
-#### Native CLI
-
-```bash
-elf2wasm translate <elf> [--so <path>...] -o <output.wasm>
-```
-
-Example (dynamically linked x86-64 binary):
-
-```bash
-gcc -O2 hello.c -o hello
-./target/release/elf2wasm translate ./hello \
-  --so /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 \
-  --so /lib/x86_64-linux-gnu/libc.so.6 \
-  -o hello.wasm
-```
-
-#### Node.js CLI
-
-```bash
-node js/cli.mjs compile --elf <path> [--so <path>...] --out <out.wasm>
-```
-
-Example:
-
-```bash
-node js/cli.mjs compile --elf ./hello \
-  --so /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 \
-  --so /lib/x86_64-linux-gnu/libc.so.6 \
-  --out hello.wasm
-```
-
----
-
-## Running
-
-### Native CLI
-
-```bash
-elf2wasm run <wasm> [--vfs-ro <host:guest>...] [-- <args...>]
-```
-
-Example:
-
-```bash
-./target/release/elf2wasm run hello.wasm -- arg1 arg2
-```
-
-### Node.js CLI
-
-```bash
-node js/cli.mjs run --elf <path> [--so <path>...] [--vfs-ro <host:guest>...] [--vfs-rw <host:guest>...] [-- <args...>]
-```
-
-Optional flags: `--compiler <path>` and `--runtime <path>` override the default `target/wasm32-unknown-unknown/release/elf2wasm_{compiler,runtime}_wasm.wasm` paths.
-
-### JavaScript / Node.js ESM API (`js/elf2wasm_shim.mjs`)
-
-`js/elf2wasm_shim.mjs` is a zero-dependency ESM module compatible with both Node.js and browsers.
-
-#### `Elf2WasmSystem`
-
-- `await Elf2WasmSystem.create({ compilerWasm, runtimeWasm, vfsRo = [], vfsRw = [] })` — Instantiates the compiler and runtime WASM modules and mounts optional host directories.
-- `sys.compile(elfBytes, soEntries = [], options = {})` — Compiles an ELF64 binary and `soEntries` (`[{ path, name?, bytes }]`) into a guest `.wasm` `Uint8Array` (with in-memory caching).
-- `sys.writeVfsFile(guestPath, bytes, mode = 0o644)` — Writes a file into the in-memory VFS overlay.
-- `sys.writeVfsSymlink(guestPath, target)` — Creates a symbolic link in the VFS overlay.
-- `sys.readVfsLink(guestPath)` — Reads the target string of a VFS symlink, or `null`.
-- `sys.resolveVfsPath(guestPath, maxHops = 40)` — Resolves symlinks in the VFS and returns the canonical guest path.
-- `sys.readVfsFile(guestPath)` — Reads a file from the VFS as `Uint8Array`, or `null`.
-- `await sys.runElf(elfBytes, soEntries = [], args = [], options = {})` — Compiles (if needed) and runs an ELF binary, returning `{ exitCode, stdout, stderr, virtualTimeNs }`.
-- `await sys.runFromVfs(guestPath, args = [], options = {})` — Resolves an executable in the VFS (including symlinks and `PT_INTERP`/`DT_NEEDED` shared libraries), compiles, and runs it.
-
-#### Top-Level Helper Functions
-
-- `await compileElfToWasm(compilerWasm, elfBytes, soEntries = [], options = {})` — One-shot ELF-to-WASM compilation returning `Uint8Array`.
-- `await runElf({ compilerWasm, runtimeWasm, elfBytes, soEntries = [], args = [], ... })` — One-shot compile and run.
-- `await runFromVfs({ compilerWasm, runtimeWasm, vfs, command, args = [], env, vfsRo = [], vfsRw = [] })` — One-shot execution of an ELF from a VFS overlay (`{ files, symlinks }`).
-- `extractTarToVfs(systemOrBytes, maybeTarBytes)` — Extracts a `.tar` archive (files, directories, symlinks, and hardlinks) and returns `{ files, symlinks }`. Pass an `Elf2WasmSystem` as the first argument and tar bytes as the second to also populate its VFS, or pass `Uint8Array`/`ArrayBuffer` bytes directly as the first argument.
-- `await extractTarGzToVfs(systemOrBytes, maybeGzBytes)` — Decompresses `.tar.gz`/`.tgz` via `DecompressionStream("gzip")` and extracts it (same `(system, bytes)` or `(bytes)` calling convention, returning `{ files, symlinks }`).
-- `await extractZipToVfs(systemOrBytes, maybeZipBytes)` — Extracts a `.zip` archive (stored or deflate-compressed) (same `(system, bytes)` or `(bytes)` calling convention, returning `{ files, symlinks }`).
-- `await compileAndRunInVfs({ compilerWasm, runtimeWasm, ccBytes, ccPath = "/usr/bin/gcc", soEntries = [], vfsRo = [], vfsRw = [], sourceBytes, guestSourcePath, guestOutPath })` — Writes `sourceBytes` to `guestSourcePath` in a fresh VFS, runs the hosted C compiler `ccBytes` (`ccPath`) to compile `guestSourcePath` into `guestOutPath`, and executes `guestOutPath`.
-
-### Docker WASM Web Shell & Browser JS SDK (`server/server.mjs`, `web/index.html`)
-
-First build the compiler and runtime `.wasm` modules (required so `/wasm/*.wasm` is available):
+### 1. Build the `.wasm` Modules
 
 ```bash
 rustup target add wasm32-unknown-unknown
-cargo build --release --target wasm32-unknown-unknown -p elf2wasm-compiler-wasm -p elf2wasm-runtime-wasm
+cargo build --release --target wasm32-unknown-unknown \
+  -p elf2wasm-compiler-wasm \
+  -p elf2wasm-runtime-wasm \
+  -p elf2wasm-worker-wasm
 ```
 
-Then start the zero-dependency Node.js web server (which serves the static web UI, `/js/*`, `/wasm/*` with COOP/COEP headers, and the stateless OCI v2 streaming proxy):
+Outputs in `target/wasm32-unknown-unknown/release/`:
+- `elf2wasm_compiler_wasm.wasm`
+- `elf2wasm_runtime_wasm.wasm`
+- `elf2wasm_worker_wasm.wasm`
+
+### 2. Start the Local Dev Server
 
 ```bash
 node server/server.mjs --port 8080
 ```
 
-Open `http://127.0.0.1:8080/` in your browser:
-1. Click **Start Shell** to pull and boot `alpine:latest` client-side in WebAssembly inside a Dedicated Web Worker, or enter any other OCI/Docker image reference (e.g., `busybox:latest`).
-2. Run interactive shell commands in the built-in VT100 web terminal — all layer decompression, ELF64-to-WASM compilation, and execution happen 100% client-side.
-3. Call `window.Elf2WasmDocker` or `window.runDockerImage("alpine:latest", { cmd: ["/bin/sh", "-c", "uname -a"] })` directly from JavaScript (or import `/js/docker_sdk.mjs`).
+Open `http://127.0.0.1:8080/` in your browser. The dev server serves the static Web UI, `/js/*`, `/wasm/*` with COOP/COEP headers, the `/api/v2/*` OCI registry proxy, `/api/git/archive`, and `POST /api/eval`.
 
-#### URL Query-Parameter Deep-Linking
+---
 
-All shareable Web UI options automatically sync with the browser URL query string (`?query`) so you can copy and share a direct link to any container + Git repository coding project (for security, opening a deep link populates the form without auto-booting the container):
+## Web UI Features
+
+- **System-Default Light & Dark Mode**: Automatically follows your OS `prefers-color-scheme` (light or dark) with a **System / Light / Dark** switcher in the header persisted to `localStorage` and `?theme=`. Both UI chrome and the built-in VT100 terminal ANSI palette adapt cleanly.
+- **Dual-Mode Visual Layer Builder ↔ Dockerfile Text**:
+  - Build container stacks visually with **+ FROM**, **+ Git Clone**, **+ WORKDIR**, **+ ENV**, **+ RUN**, and **+ SWEEP** cards, or switch to the **Dockerfile** tab to paste/edit a complete Dockerfile directly. Both views stay bidirectionally synchronized.
+  - Supported Dockerfile directives: `FROM <image>`, `WORKDIR <path>`, `ENV KEY=VALUE`, `RUN <command>`, `RUN git clone [--branch <ref>] <repo> [<mount>]` (or `# elf2wasm:git repo=<r> ref=<ref> mount=<m>`), `# elf2wasm:sweep ...`, and `# elf2wasm:executor=remote|local`.
+- **Configurable Sweep**: Insert a `SWEEP` layer anywhere in the stack to snapshot the VFS at that point and fan out **all downstream layers** across a user-selected variable:
+  - **Delay Stddev (ms)** (`param=delay`)
+  - **PRNG Seed** (`param=seed`)
+  - **Environment Variable** (`param=env`, arbitrary `envKey`)
+  - Configured either as a numeric **Range** (`start`, `step`, `count`) or a **Values List** (`values=a,b,c`).
+  - Click any row in the Sweep Results table to inspect its downstream logs, download its `.tar.gz` outputs, or open a standalone deep link to that exact variation.
+- **Local vs. Remote Execution & Build Output Downloads**:
+  - Choose **Local** (in-browser WebAssembly) or **Remote** (Cloudflare Worker `POST /api/eval`) on each layer, or use the top-level **Run All Locally** / **Run All Remotely** controls.
+  - Pure-remote pipelines skip local WASM download and compilation entirely, making them fast on phones and constrained devices.
+  - Mixed local+remote pipelines automatically hand off `.tar.gz` VFS diffs between layers.
+  - Completed layers display modified file counts and a **Download `.tar.gz`** button to save build outputs.
+- **Interactive Shell & Manual Upload**: Pipelines without `RUN`/`SWEEP` layers boot an interactive VT100 shell in the browser. A collapsible **Manual Local Archive / ELF64 Upload** drawer supports dragging in `.tar.gz`, `.zip`, or raw ELF64 files.
+
+### Well-Known Presets
+
+| Preset ID | Name | Stack |
+|---|---|---|
+| `js-express` | **Express.js** | `mirror.gcr.io/library/mongo-express:1.0.2-20-alpine3.19` — starts a real Express.js HTTP server and queries `GET /api/hello` |
+| `python-flask` | **Flask** | `quay.io/computesphere/computesphere-python-flask-example:latest` — runs a Python 3.13 Flask app and verifies `GET /api/hello` via `test_client()` |
+| `go-raft-nodice` | **Go Raft (nodice)** | `ghcr.io/fatlotus/golang-with-cache:1.27-alpine` + `fatlotus/nodice` — clones from GitHub, compiles with `go build`, and runs `./raft` |
+| `alpine-sweep` | **Alpine Env Sweep** | `mirror.gcr.io/library/alpine:latest` — 3-variation `ENV` sweep (`GREETING=hello,bonjour,hola`) executing in ~1s |
+
+### URL Query-Parameter Deep-Linking
+
+UI state syncs with the URL query string (`?query`) without auto-executing on page load:
 
 | Parameter | Default (omitted) | Description |
 |---|---|---|
-| `image` | `alpine:latest` | Docker / OCI image reference (e.g. `python:3.12-slim`) |
-| `cmd` | *(image default)* | Optional command override |
-| `repo` | *(none)* | Git repository overlay (`owner/repo` or forge URL) |
-| `ref` | `HEAD` | Branch, tag, or commit SHA (only serialized when `repo` is set; `repoRef` also accepted on read) |
-| `mount` | `/workspace` | Guest mount path for the Git repo (only serialized when `repo` is set; `repoMount` also accepted on read) |
-| `cwd` | *(image default)* | Working directory (auto-opens Advanced Options on load) |
-| `env` | *(none)* | Repeatable `KEY=VALUE` parameter (e.g. `?env=FOO=1&env=BAR=2`; auto-opens Advanced Options on load) |
-| `preset` | *(none)* | Read-only shorthand (`python-bottle`, `js-nanoid`, `rust-nushell`) expanded on load; any explicit parameter overrides the preset |
+| `dockerfile` | `FROM alpine:latest` | URL-encoded Dockerfile text (including `# elf2wasm:git`, `# elf2wasm:sweep`, `# elf2wasm:executor=remote`) |
+| `executor` | `local` | Execution mode (`local`, `remote`, or `mixed`) |
+| `theme` | `system` | Color theme override (`light` or `dark`; omitted when following system mode) |
+| `preset` | *(none)* | Read-only shorthand (`js-express`, `python-flask`, `go-raft-nodice`, `alpine-sweep`) expanded on load |
+| `selectedRun` | *(none)* | 1-based variation index to highlight in the Sweep Results table |
+| Legacy params | *(none)* | `image`, `build`, `cmd`, `repo`, `ref`, `mount`, `cwd`, `env`, `stddev`, `seed`, `sweep`, `runs` remain supported for backward compatibility |
 
-Example shareable link:
+Example deep link:
+```text
+/?preset=python-flask&theme=light
 ```
-/?image=python:3.12-slim&repo=bottlepy/bottle&ref=0.13.4&cmd=python3+-m+unittest+discover+-s+test+-t+.&cwd=/workspace&env=PYTHONUNBUFFERED=1
+
+---
+
+## Cloudflare Worker & Remote Evaluation API (`POST /api/eval`)
+
+The Cloudflare Worker (`worker/src/index.mjs`) serves the static Web UI (`worker/dist/`) and exposes:
+
+- `GET /api/health` — Worker health & status check
+- `GET /api/v2/*` — Edge-cached OCI Registry v2 streaming proxy
+- `GET /api/git/archive` — Edge-cached GitHub/forge archive proxy
+- `POST /api/eval` — Remote deterministic layer evaluation via `elf2wasm-worker-wasm` (`wasmi`)
+
+### `POST /api/eval` Contract
+
+**Request (`application/json`)**:
+```json
+{
+  "baseImage": "mirror.gcr.io/library/alpine:latest",
+  "gitRepo": { "repo": "owner/repo", "ref": "main", "mountPath": "/workspace" },
+  "inputLayerDiffs": ["<base64 gzip-compressed tar>"],
+  "cmd": ["sh", "-c", "echo hello > /workspace/out.txt && cat /workspace/out.txt"],
+  "env": ["KEY=VALUE"],
+  "cwd": "/workspace",
+  "delayStddevMs": 0,
+  "delaySeed": 0,
+  "timeoutMs": 30000,
+  "returnOutputDiff": true
+}
+```
+
+**Default Response (`application/json`)**:
+```json
+{
+  "ok": true,
+  "executor": "remote-wasmi",
+  "exitCode": 0,
+  "stdout": "hello\n",
+  "stderr": "",
+  "virtualTimeNs": "123456",
+  "timedOut": false,
+  "error": null,
+  "outputDiffTarGzBase64": "<base64 gzip-compressed tar>",
+  "modifiedFiles": [{ "path": "/workspace/out.txt", "kind": "file", "size": 6 }]
+}
+```
+
+**Direct `.tar.gz` Download**: Pass `Accept: application/gzip` or `?format=tar.gz` to receive `200 OK` with `Content-Type: application/gzip`, `Content-Disposition: attachment; filename="layer-output.tar.gz"`, `X-Eval-Exit-Code`, `X-Eval-Virtual-Time-Ns`, and the raw `.tar.gz` body.
+
+**Structured Error Codes**: `INVALID_REQUEST` (`400`), `FUEL_EXHAUSTED` (`408`), `MEMORY_LIMIT` (`413` / `507`), `UPSTREAM_ERROR` (`502`).
+
+Example `curl` request against the local dev server:
+```bash
+curl -sS -X POST http://127.0.0.1:8080/api/eval \
+  -H 'Content-Type: application/json' \
+  -d '{"baseImage":"mirror.gcr.io/library/alpine:latest","cmd":["sh","-c","echo hi > /tmp/out.txt && cat /tmp/out.txt"],"returnOutputDiff":true}'
+```
+
+### Building & Deploying the Cloudflare Worker
+
+```bash
+cd worker
+npm ci
+npm run build:assets   # copies web/, js/, and all 3 release .wasm files into worker/dist & worker/src
+npm test               # runs Cloudflare Worker unit & /api/eval tests
+npm run deploy:dry-run # verifies wrangler bundle without deploying
+```
+
+---
+
+## JavaScript SDK & Interactive CLI
+
+### Multi-Layer Container SDK (`js/docker_sdk.mjs`)
+
+Exposed on `window` in the browser (`Elf2WasmDocker`, `runLayerPipeline`, `runDockerImage`, `runSweep`) and importable as ESM in Node.js or browsers:
+
+- `await runLayerPipeline(layers, options)` — Executes an ordered `Layer[]` stack (`from`, `git`, `workdir`, `env`, `run`, `sweep`) with per-layer `local` vs `remote` execution, automatic `.tar.gz` VFS diff handoff, and sweep fan-out. Pure-remote pipelines skip local WASM initialization.
+- `await docker.runLayerPipeline(layers, options)` — Runs on a persistent worker-backed `Elf2WasmDocker` instance to keep the compiled WASM module cache warm across runs.
+- `await runDockerImage(imageRef, options)` — One-shot container execution returning `{ exitCode, stdout, stderr, virtualTimeNs }`.
+- `await runSweep(imageRef, options)` — Runs an optional build step once, snapshots VFS, and sweeps delay/seed variations.
+
+### Low-Level WASM Shim (`js/elf2wasm_shim.mjs`)
+
+- `await Elf2WasmSystem.create({ compilerWasm, runtimeWasm, vfsRo = [], vfsRw = [] })`
+- `sys.compile(elfBytes, soEntries = [], options = {})`
+- `sys.writeVfsFile(guestPath, bytes, mode = 0o644)` / `sys.writeVfsSymlink(guestPath, target)` / `sys.readVfsFile(guestPath)` / `sys.readVfsLink(guestPath)` / `sys.resolveVfsPath(guestPath)`
+- `sys.exportVfsDiffTar({ baseSnapshotId?, pathPrefix? })` — Returns an OCI-compatible USTAR/PAX `.tar` `Uint8Array` of modified/deleted files.
+- `sys.listVfsDiff({ baseSnapshotId?, pathPrefix? })` — Returns `Array<{ path, kind, size }>`.
+- `await sys.runElf(...)` / `await sys.runFromVfs(...)`
+- Helpers: `compileElfToWasm`, `runElf`, `runFromVfs`, `extractTarToVfs`, `extractTarGzToVfs`, `extractZipToVfs`, `compileAndRunInVfs`.
+
+### Interactive Node.js CLI (`js/cli.mjs`)
+
+```bash
+# Compile an x86-64 ELF binary to a guest .wasm module
+node js/cli.mjs compile --elf ./hello \
+  --so /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 \
+  --so /lib/x86_64-linux-gnu/libc.so.6 \
+  --out hello.wasm
+
+# Compile and run directly via the WASM runtime
+node js/cli.mjs run --elf ./hello \
+  --so /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 \
+  --so /lib/x86_64-linux-gnu/libc.so.6 \
+  -- arg1 arg2
+```
+
+Optional flags: `--vfs-ro <host:guest>`, `--vfs-rw <host:guest>`, `--compiler <path>`, `--runtime <path>`.
+
+---
+
+## Testing
+
+```bash
+# Rust workspace unit tests
+cargo test --workspace
+
+# JS SDK, Dockerfile parser, URL state, and local dev server tests
+node --test js/test_dockerfile.mjs js/test_url_state.mjs js/test_docker_sdk.mjs server/test_server.mjs
+
+# Cloudflare Worker tests
+npm --prefix worker test
+
+# Automated 4-tier E2E suite (offline tiers)
+node e2e_docker_web/run_v2_e2e.mjs --tier all --skip-live
 ```
 
 ---
@@ -264,6 +340,8 @@ All multi-byte integers are little-endian `u32`; strings are UTF-8 (not NUL-term
 | `runtime_add_vfs_symlink` | Function | `(path_ptr: i32, path_len: i32, target_ptr: i32, target_len: i32) -> i32` | Adds a symbolic link at `path` pointing to `target` in the VFS overlay. Returns `0` on success, `-1` on error. |
 | `runtime_read_vfs_file` | Function | `(path_ptr: i32, path_len: i32, out_len_ptr: i32) -> i32` | Reads a file from the VFS into an allocated buffer, writing byte length to `*out_len_ptr`. Caller frees with `dealloc`. Returns `0` if not found. |
 | `runtime_read_vfs_link` | Function | `(path_ptr: i32, path_len: i32, out_len_ptr: i32) -> i32` | Reads a symlink target from the VFS into an allocated buffer, writing byte length to `*out_len_ptr`. Caller frees with `dealloc`. Returns `0` if not a symlink. |
+| `runtime_export_vfs_tar` | Function | `(base_snap_id: i32, use_base: i32, prefix_ptr: i32, prefix_len: i32, out_len_ptr: i32) -> i32` | Exports current VFS (or diff against `base_snap_id` when `use_base != 0`) as an OCI-compatible USTAR/PAX `.tar` buffer with `.wh.<name>` whiteouts. Caller frees with `dealloc`. |
+| `runtime_list_vfs_diff` | Function | `(base_snap_id: i32, use_base: i32, prefix_ptr: i32, prefix_len: i32, out_len_ptr: i32) -> i32` | Returns a UTF-8 JSON array of `{ path, kind, size }` entries describing VFS changes since `base_snap_id`. Caller frees with `dealloc`. |
 | `runtime_init_guest_stack` | Function | `(meta_ptr: i32, meta_len: i32, args_ptr: i32, args_len: i32) -> i32` | Decodes `elf2wasm_meta` and `E2WA` (or NUL-separated) args/env, resets runtime state for a new run, initializes guest stack (`argc`, `argv`, `envp`, `auxv`), and sets `rsp` and `rip`. Returns `0` on success (`< 0` on error). |
 | `runtime_handle_syscall` | Function | `(nr: i64, a0: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64) -> i64` | Directly dispatches a Linux x86-64 syscall on the current `HostState`. |
 | `runtime_on_yield` | Function | `() -> i32` | Handles a guest yield (`yield_flag` `1`, `2`, or `3`). See return codes and CPS flow below. |
@@ -304,13 +382,6 @@ All multi-byte integers are little-endian `u32`; strings are UTF-8 (not NUL-term
 | `3` | `NeedFork` | Clone the active guest instance, register it under `runtime_get_pending_child_pid()`, call `runtime_ack_fork(child_pid)`, then call `runtime_resume_active()`. |
 | `4` | `NeedExec` | Read `runtime_get_exec_info()` (`E2WE`), compile/instantiate the new guest `.wasm` for `pid`, call `runtime_complete_exec(...)`, and resume. |
 
-**CPS `yield_flag == 3` (`YIELD_SYSCALL_PENDING`) Flow:**
-1. When `runtime_on_yield()` sees `yield_flag == 3`, it reads `nr` from `GLOBAL_ID_RAX` and `a0..a5` from `GLOBAL_ID_RDI`, `GLOBAL_ID_RSI`, `GLOBAL_ID_RDX`, `GLOBAL_ID_R10`, `GLOBAL_ID_R8`, and `GLOBAL_ID_R9`.
-2. It invokes `handle_syscall(...)` and writes the return value back to `GLOBAL_ID_RAX`.
-3. If the main process exited or `exit_flag != 0` with no pending host action, it returns `0`.
-4. **Fast-path**: if `yield_flag` is still `3` and no other thread or process is currently runnable, it clears `yield_flag` to `0` (`host_set_global(GLOBAL_ID_YIELD_FLAG, 0)`) and returns `1` immediately without a context save/restore.
-5. Otherwise (if the syscall blocked, triggered `PendingHostAction::Fork` / `Exec`, or another thread/process is runnable), it delegates to `on_yield_multiproc(...)` to save context and preemptively switch to another runnable thread/process (returning `1`..`4`).
-
 ---
 
 ### Module 3: Translated Guest Executable (`.wasm`)
@@ -321,9 +392,9 @@ None (zero imports — no `env.syscall`).
 
 #### Exported `"memory"` & Virtual Address Map
 
-The guest exports a single fixed-size linear `"memory"` (`minimum = maximum = max(4096, ceil((DISPATCH_HASH_ADDR + table_slots * 8) / 65536))` pages, i.e. 256 MiB+ at 64 KiB/page).
+The guest exports a single fixed-size linear `"memory"` (`minimum = maximum = max(4096, ceil((DISPATCH_HASH_ADDR + table_slots * 8) / 65536))` pages, i.e. 256 MiB+ in standard browser layout, or compact 32 MiB layout in `elf2wasm-worker-wasm`).
 
-| Constant | Address | Purpose |
+| Constant | Standard Address | Purpose |
 |---|---|---|
 | `DISPATCH_TABLE_ADDR` | `0x0001_0000` | Legacy dispatch table region (64 KiB) |
 | `MAIN_PIE_BASE` | `0x0010_0000` | Default base address for PIE (`ET_DYN`) main executables (1 MiB) |
@@ -335,76 +406,13 @@ The guest exports a single fixed-size linear `"memory"` (`minimum = maximum = ma
 | `STACK_TOP` | `0x0BFF_0000` | Initial guest stack top (~192 MiB) |
 | `DISPATCH_HASH_ADDR` | `0x0C00_0000` | Open-addressed indirect-branch dispatch hash table (`8` bytes per slot, 192 MiB) |
 
-#### Exported Functions
+#### Exported Functions & Globals
 
-| Export Name | Signature | Description |
-|---|---|---|
-| `_start` | `() -> i32` | Executes translated x86-64 blocks starting from `rip` until exit (`exit_flag != 0`) or yield (`yield_flag != 0`). Returns `exit_code`. |
-| `save_ctx` | `(ctx_ptr: i32) -> ()` | Serializes all CPU registers, flags, `rip`, `fsbase`, `gsbase`, `tsc`, `mxcsr`, `x87_cw`, and `xmm0..xmm15` into `464` bytes at `ctx_ptr`. |
-| `load_ctx` | `(ctx_ptr: i32) -> ()` | Restores all CPU registers, flags, `rip`, `fsbase`, `gsbase`, `tsc`, `mxcsr`, `x87_cw`, and `xmm0..xmm15` from `464` bytes at `ctx_ptr`. |
+- Functions: `_start() -> i32`, `save_ctx(ctx_ptr: i32)`, `load_ctx(ctx_ptr: i32)` (464-byte `CTX_SIZE` buffer: `rax..r15`, `rip`, `fsbase`, `gsbase`, `tsc`, `cf..df`, `mxcsr`, `x87_cw`, `xmm0..xmm15`).
+- Globals (all mutable): `rax..r15` (`i64`), `rip` (`i64`), `fsbase` (`i64`), `gsbase` (`i64`), `exit_flag` (`i32`), `exit_code` (`i32`), `yield_flag` (`i32`), `quantum` (`i32`, default `128`).
 
-#### Exact 464-byte `CTX_SIZE` Layout (`save_ctx` / `load_ctx`)
+---
 
-| Byte Offset | Size | Type | Field(s) |
-|---|---|---|---|
-| `0..128` | 128 | `i64` x 16 | `rax` (+0), `rcx` (+8), `rdx` (+16), `rbx` (+24), `rsp` (+32), `rbp` (+40), `rsi` (+48), `rdi` (+56), `r8` (+64), `r9` (+72), `r10` (+80), `r11` (+88), `r12` (+96), `r13` (+104), `r14` (+112), `r15` (+120) |
-| `128..136` | 8 | `i64` | `rip` |
-| `136..144` | 8 | `i64` | `fsbase` |
-| `144..152` | 8 | `i64` | `gsbase` |
-| `152..160` | 8 | `i64` | `tsc` |
-| `160..188` | 28 | `i32` x 7 | `cf` (+160), `pf` (+164), `af` (+168), `zf` (+172), `sf` (+176), `of` (+180), `df` (+184) |
-| `188..192` | 4 | `i32` | `mxcsr` |
-| `192..196` | 4 | `i32` | `x87_cw` |
-| `196..208` | 12 | — | Padding |
-| `208..464` | 256 | `v128` x 16 | `xmm0` (+208), `xmm1` (+224), ..., `xmm15` (+448) |
+### Module 4: `elf2wasm-worker-wasm` (`elf2wasm_worker_wasm.wasm`)
 
-#### Exported Globals (all mutable)
-
-| Export Name | WASM Type | Initial Value | Description |
-|---|---|---|---|
-| `rax`, `rcx`, `rdx`, `rbx`, `rsp`, `rbp`, `rsi`, `rdi`, `r8`, `r9`, `r10`, `r11`, `r12`, `r13`, `r14`, `r15` | `i64` | `0` | 64-bit general-purpose x86-64 registers |
-| `rip` | `i64` | `entry_rip` | Guest instruction pointer |
-| `exit_flag` | `i32` | `0` | Non-zero when the guest has exited |
-| `exit_code` | `i32` | `0` | Guest exit status code |
-| `fsbase` | `i64` | `0` | x86-64 `%fs` segment base (TLS) |
-| `gsbase` | `i64` | `0` | x86-64 `%gs` segment base |
-| `yield_flag` | `i32` | `0` | Yield reason (`0`..`3`) |
-| `quantum` | `i32` | `128` | Remaining block dispatch budget (`DEFAULT_QUANTUM = 128`) |
-
-#### CPS Syscall & Quantum Preemption Convention
-
-- `yield_flag` values:
-  - `0`: `YIELD_NONE` (running / normal)
-  - `1`: `YIELD_BLOCKED` (blocked / explicit yield)
-  - `2`: `YIELD_QUANTUM` (quantum exhausted)
-  - `3`: `YIELD_SYSCALL_PENDING` (pending Linux syscall)
-- **On `syscall`**:
-  1. Guest sets `rcx = next_ip`.
-  2. Guest sets `r11 = rflags`, packed as `0x202 | cf | (pf << 2) | (af << 4) | (zf << 6) | (sf << 7) | (df << 10) | (of << 11)`.
-  3. Guest sets `rip = next_ip`.
-  4. Guest sets `yield_flag = 3` (`YIELD_SYSCALL_PENDING`) and returns from `_start()`.
-  5. Syscall number is in `rax`; arguments are in `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`.
-  6. The host executes the syscall, writes the return value to `rax`, resets `yield_flag = 0` (leaving `quantum` unchanged on the non-preempting syscall fast-path, or resetting `quantum = 128` on quantum exhaustion / context switch), and resumes `_start()`.
-- **On quantum preemption**:
-  - When `quantum <= 0` at a block transition, the guest sets `rip = target_va`, `yield_flag = 2` (`YIELD_QUANTUM`), and returns from `_start()`.
-
-#### `"elf2wasm_meta"` Custom Section Binary Layout
-
-All multi-byte integers are little-endian `u32`; strings are `u32` length-prefixed UTF-8:
-
-1. `magic`: `b"ELF2WASM"` (8 bytes)
-2. `entry_rip`: `u32`
-3. `at_phdr`: `u32`
-4. `at_phent`: `u32`
-5. `at_phnum`: `u32`
-6. `at_entry`: `u32`
-7. `at_base`: `u32`
-8. `max_code_addr`: `u32`
-9. `num_so`: `u32`, followed by `num_so` entries:
-   - `base_addr`: `u32`
-   - `num_gp`: `u32`, followed by `num_gp` entries of (`len: u32`, `guest_path: [u8; len]`)
-   - `bytes_len`: `u32`, `bytes`: `[u8; bytes_len]`
-10. `num_sym`: `u32`, followed by `num_sym` entries:
-    - `addr`: `u32`
-    - `name_len`: `u32`, `name`: `[u8; name_len]`
-11. `elf_path_len`: `u32`, `elf_path`: `[u8; elf_path_len]`
+Self-contained zero-import `wasm32-unknown-unknown` module statically bundled into the Cloudflare Worker (`worker/src/elf2wasm_worker_wasm.wasm`). It embeds `elf2wasm-core` (with compact Worker-friendly memory layout), `elf2wasm-runtime-core`, and the `wasmi` interpreter (with SIMD and fuel metering) so `POST /api/eval` can lift and execute x86-64 ELF64 binaries inside Cloudflare Workers without dynamic `WebAssembly.compile()`, exporting modified files as an OCI `.tar` diff archive.
