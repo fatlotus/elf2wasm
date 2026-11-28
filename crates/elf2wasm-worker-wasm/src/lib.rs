@@ -781,20 +781,20 @@ fn session_mut() -> &'static mut WorkerSession {
     }
 }
 
-fn export_owned_bytes(mut bytes: Vec<u8>, out_len_ptr: *mut usize) -> *mut u8 {
+fn export_owned_bytes(bytes: Vec<u8>, out_len_ptr: *mut usize) -> *mut u8 {
     if out_len_ptr.is_null() {
         return core::ptr::null_mut();
     }
-    bytes.shrink_to_fit();
-    let len = bytes.len();
+    let mut boxed = bytes.into_boxed_slice();
+    let len = boxed.len();
     unsafe {
         *out_len_ptr = len;
     }
     if len == 0 {
         return core::ptr::null_mut();
     }
-    let ptr = bytes.as_mut_ptr();
-    core::mem::forget(bytes);
+    let ptr = boxed.as_mut_ptr();
+    core::mem::forget(boxed);
     ptr
 }
 
@@ -1420,5 +1420,29 @@ mod tests {
             resp.error_code,
             resp.error
         );
+    }
+
+    #[test]
+    fn test_export_owned_bytes_with_excess_capacity_and_dealloc() {
+        let mut buf = Vec::with_capacity(1024);
+        buf.extend_from_slice(b"hello-wasm");
+        assert!(buf.capacity() >= 1024);
+
+        let mut out_len: usize = 0;
+        let ptr = export_owned_bytes(buf, &mut out_len as *mut usize);
+        assert!(!ptr.is_null());
+        assert_eq!(out_len, 10);
+        let exported = unsafe { core::slice::from_raw_parts(ptr, out_len) };
+        assert_eq!(exported, b"hello-wasm");
+
+        worker_dealloc(ptr, out_len);
+
+        // Empty Vec with excess capacity must return null and len 0 cleanly.
+        let empty_buf = Vec::with_capacity(512);
+        let mut empty_len: usize = 99;
+        let empty_ptr = export_owned_bytes(empty_buf, &mut empty_len as *mut usize);
+        assert!(empty_ptr.is_null());
+        assert_eq!(empty_len, 0);
+        worker_dealloc(empty_ptr, empty_len);
     }
 }

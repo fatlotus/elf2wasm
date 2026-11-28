@@ -929,17 +929,17 @@ pub extern "C" fn runtime_close_stdin() {
     }
 }
 
-fn export_owned_bytes(mut bytes: Vec<u8>, out_len_ptr: *mut usize) -> *mut u8 {
+fn export_owned_bytes(bytes: Vec<u8>, out_len_ptr: *mut usize) -> *mut u8 {
     if bytes.is_empty() {
         if !out_len_ptr.is_null() {
             unsafe { *out_len_ptr = 0 };
         }
         return core::ptr::null_mut();
     }
-    bytes.shrink_to_fit();
-    let len = bytes.len();
-    let ptr = bytes.as_mut_ptr();
-    core::mem::forget(bytes);
+    let mut boxed = bytes.into_boxed_slice();
+    let len = boxed.len();
+    let ptr = boxed.as_mut_ptr();
+    core::mem::forget(boxed);
     if !out_len_ptr.is_null() {
         unsafe { *out_len_ptr = len };
     }

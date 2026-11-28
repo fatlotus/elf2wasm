@@ -1094,7 +1094,12 @@ impl VirtualFs {
                     continue;
                 }
                 if let Some(target_name) = base.strip_prefix(".wh.") {
-                    if !target_name.is_empty() {
+                    if !target_name.is_empty()
+                        && target_name != "."
+                        && target_name != ".."
+                        && !target_name.contains('/')
+                        && !target_name.starts_with(".wh.")
+                    {
                         let target_path = if parent_dir == "/" {
                             format!("/{}", target_name)
                         } else {
@@ -1157,12 +1162,20 @@ impl VirtualFs {
         }
 
         let mut applied = 0usize;
+        let confine_mount = if mount != "/" {
+            Some(mount.as_str())
+        } else {
+            None
+        };
 
         // 1. Apply whiteouts before this layer's entries.
         for wh in whiteouts {
             match wh {
                 TarWhiteout::Opaque(dir) => {
                     if dir == "/" {
+                        if confine_mount.is_some() {
+                            continue;
+                        }
                         let non_root: Vec<String> = self
                             .overlay
                             .keys()
@@ -1173,12 +1186,28 @@ impl VirtualFs {
                             self.overlay.remove(&k);
                         }
                     } else {
+                        if let Some(m) = confine_mount {
+                            let resolved = self
+                                .resolve_path(AT_FDCWD, &dir, false)
+                                .unwrap_or_else(|_| normalize_guest_path(&dir));
+                            if !path_within_mount(&resolved, m) {
+                                continue;
+                            }
+                        }
                         self.vfs_remove_path(&dir);
-                        self.vfs_add_dir(&dir, 0o755);
+                        self.vfs_add_dir_confined(&dir, 0o755, confine_mount);
                     }
                     applied += 1;
                 }
                 TarWhiteout::Remove(path) => {
+                    if let Some(m) = confine_mount {
+                        let resolved = self
+                            .resolve_path(AT_FDCWD, &path, false)
+                            .unwrap_or_else(|_| normalize_guest_path(&path));
+                        if !path_within_mount(&resolved, m) {
+                            continue;
+                        }
+                    }
                     self.vfs_remove_path(&path);
                     applied += 1;
                 }
@@ -1193,8 +1222,9 @@ impl VirtualFs {
             da.cmp(&db).then_with(|| a.0.cmp(&b.0))
         });
         for (path, mode) in sorted_dirs {
-            self.vfs_add_dir(&path, mode);
-            applied += 1;
+            if self.vfs_add_dir_confined(&path, mode, confine_mount) {
+                applied += 1;
+            }
         }
 
         // 3. Apply symlinks sorted by depth ascending.
@@ -1205,14 +1235,16 @@ impl VirtualFs {
             da.cmp(&db).then_with(|| a.0.cmp(&b.0))
         });
         for (path, target) in sorted_symlinks {
-            self.vfs_add_symlink(&path, &target);
-            applied += 1;
+            if self.vfs_add_symlink_confined(&path, &target, confine_mount) {
+                applied += 1;
+            }
         }
 
         // 4. Apply regular files.
         for (path, (bytes, mode)) in files {
-            self.vfs_write_file(&path, &bytes, mode);
-            applied += 1;
+            if self.vfs_write_file_confined(&path, &bytes, mode, confine_mount) {
+                applied += 1;
+            }
         }
 
         Ok(applied)
@@ -1297,7 +1329,11 @@ impl VirtualFs {
             .collect();
     }
 
-    fn resolve_and_ensure_parent(&mut self, path: &str) -> Option<String> {
+    fn resolve_and_ensure_parent_confined(
+        &mut self,
+        path: &str,
+        confine_mount: Option<&str>,
+    ) -> Option<String> {
         let norm = normalize_guest_path(path);
         if norm == "/" {
             return None;
@@ -1314,6 +1350,16 @@ impl VirtualFs {
                 Err(_) => parent_raw.to_string(),
             }
         };
+        let final_path = if resolved_parent == "/" {
+            format!("/{}", name)
+        } else {
+            format!("{}/{}", resolved_parent, name)
+        };
+        if let Some(mount) = confine_mount {
+            if !path_within_mount(&final_path, mount) {
+                return None;
+            }
+        }
         let mut cur = String::new();
         for part in resolved_parent.split('/').filter(|s| !s.is_empty()) {
             cur.push('/');
@@ -1323,17 +1369,18 @@ impl VirtualFs {
                 mtime_ns: crate::scheduler::INITIAL_REALTIME_BASE_NS,
             });
         }
-        let final_path = if resolved_parent == "/" {
-            format!("/{}", name)
-        } else {
-            format!("{}/{}", resolved_parent, name)
-        };
         Some(final_path)
     }
 
-    pub fn vfs_write_file(&mut self, path: &str, bytes: &[u8], mode: u32) {
-        let Some(final_path) = self.resolve_and_ensure_parent(path) else {
-            return;
+    fn vfs_write_file_confined(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        mode: u32,
+        confine_mount: Option<&str>,
+    ) -> bool {
+        let Some(final_path) = self.resolve_and_ensure_parent_confined(path, confine_mount) else {
+            return false;
         };
         self.overlay.insert(
             final_path,
@@ -1343,11 +1390,21 @@ impl VirtualFs {
                 mtime_ns: crate::scheduler::INITIAL_REALTIME_BASE_NS,
             },
         );
+        true
     }
 
-    pub fn vfs_add_symlink(&mut self, path: &str, target: &str) {
-        let Some(final_path) = self.resolve_and_ensure_parent(path) else {
-            return;
+    pub fn vfs_write_file(&mut self, path: &str, bytes: &[u8], mode: u32) {
+        self.vfs_write_file_confined(path, bytes, mode, None);
+    }
+
+    fn vfs_add_symlink_confined(
+        &mut self,
+        path: &str,
+        target: &str,
+        confine_mount: Option<&str>,
+    ) -> bool {
+        let Some(final_path) = self.resolve_and_ensure_parent_confined(path, confine_mount) else {
+            return false;
         };
         self.overlay.insert(
             final_path,
@@ -1356,11 +1413,24 @@ impl VirtualFs {
                 mtime_ns: crate::scheduler::INITIAL_REALTIME_BASE_NS,
             },
         );
+        true
     }
 
-    pub fn vfs_add_dir(&mut self, path: &str, mode: u32) {
+    pub fn vfs_add_symlink(&mut self, path: &str, target: &str) {
+        self.vfs_add_symlink_confined(path, target, None);
+    }
+
+    fn vfs_add_dir_confined(
+        &mut self,
+        path: &str,
+        mode: u32,
+        confine_mount: Option<&str>,
+    ) -> bool {
         let norm = normalize_guest_path(path);
         if norm == "/" {
+            if confine_mount.is_some() {
+                return false;
+            }
             self.overlay.insert(
                 "/".to_string(),
                 OverlayNode::Dir {
@@ -1368,10 +1438,10 @@ impl VirtualFs {
                     mtime_ns: crate::scheduler::INITIAL_REALTIME_BASE_NS,
                 },
             );
-            return;
+            return true;
         }
-        let Some(final_path) = self.resolve_and_ensure_parent(path) else {
-            return;
+        let Some(final_path) = self.resolve_and_ensure_parent_confined(path, confine_mount) else {
+            return false;
         };
         self.overlay.insert(
             final_path,
@@ -1380,6 +1450,11 @@ impl VirtualFs {
                 mtime_ns: crate::scheduler::INITIAL_REALTIME_BASE_NS,
             },
         );
+        true
+    }
+
+    pub fn vfs_add_dir(&mut self, path: &str, mode: u32) {
+        self.vfs_add_dir_confined(path, mode, None);
     }
 
     pub fn vfs_remove_path(&mut self, path: &str) -> bool {
@@ -4619,6 +4694,120 @@ mod tests {
         let mut vfs3 = VirtualFs::new_in_memory(&[]);
         let _ = vfs3.extract_tar(&tar_pax, "/", 0, false);
     }
+
+    #[test]
+    fn test_extract_tar_symlink_mount_escape_blocked() {
+        let mut vfs = VirtualFs::new_in_memory(&[]);
+        vfs.vfs_write_file("/etc/secret.txt", b"original", 0o644);
+
+        let mut tar = Vec::new();
+        write_tar_entry(&mut tar, "repo/escape", b'2', 0o777, 0, "/etc", &[]);
+        write_tar_entry(
+            &mut tar,
+            "repo/escape/secret.txt",
+            b'0',
+            0o644,
+            0,
+            "",
+            b"OVERWRITTEN",
+        );
+        write_tar_entry(
+            &mut tar,
+            "repo/escape/newfile.txt",
+            b'0',
+            0o644,
+            0,
+            "",
+            b"ESCAPED",
+        );
+        write_tar_entry(&mut tar, "repo/escape/subdir", b'5', 0o755, 0, "", &[]);
+        write_tar_entry(&mut tar, "repo/escape/sublink", b'2', 0o777, 0, "/bin", &[]);
+        write_tar_entry(&mut tar, "repo/safe.txt", b'0', 0o644, 0, "", b"inside");
+        tar.resize(tar.len() + 1024, 0);
+
+        vfs.extract_tar(&tar, "/workspace", 1, true).unwrap();
+
+        assert_eq!(
+            vfs.vfs_read_file("/etc/secret.txt").as_deref(),
+            Some(&b"original"[..]),
+            "symlink mount escape must not overwrite /etc/secret.txt"
+        );
+        assert_eq!(
+            vfs.vfs_read_file("/etc/newfile.txt"),
+            None,
+            "symlink mount escape must not create files outside /workspace"
+        );
+        assert!(
+            !vfs.overlay.contains_key("/etc/subdir"),
+            "symlink mount escape must not create dirs outside /workspace"
+        );
+        assert!(
+            !vfs.overlay.contains_key("/etc/sublink"),
+            "symlink mount escape must not create symlinks outside /workspace"
+        );
+        assert_eq!(
+            vfs.vfs_read_file("/workspace/safe.txt").as_deref(),
+            Some(&b"inside"[..])
+        );
+
+        // Verify mount == "/" still follows symlinks (usrmerge compatibility).
+        let mut usrmerge_vfs = VirtualFs::new_in_memory(&[]);
+        usrmerge_vfs.vfs_add_dir("/usr/bin", 0o755);
+        usrmerge_vfs.vfs_add_symlink("/bin", "usr/bin");
+        let mut root_tar = Vec::new();
+        write_tar_entry(&mut root_tar, "bin/hello", b'0', 0o755, 0, "", b"hi");
+        root_tar.resize(root_tar.len() + 1024, 0);
+        usrmerge_vfs.extract_tar(&root_tar, "/", 0, false).unwrap();
+        assert_eq!(
+            usrmerge_vfs.vfs_read_file("/usr/bin/hello").as_deref(),
+            Some(&b"hi"[..])
+        );
+    }
+
+    #[test]
+    fn test_extract_tar_whiteout_traversal_blocked() {
+        let mut vfs = VirtualFs::new_in_memory(&[]);
+        vfs.vfs_write_file("/keep/sibling.txt", b"stay", 0o644);
+        vfs.vfs_write_file("/keep/sub/a.txt", b"stay-sub", 0o644);
+        vfs.vfs_write_file("/keep/sub/delete_me.txt", b"bye", 0o644);
+
+        let mut tar = Vec::new();
+        // .wh... -> target_name ".." (must NOT delete /keep)
+        write_tar_entry(&mut tar, "keep/sub/.wh...", b'0', 0o644, 0, "", &[]);
+        // .wh.. -> target_name "." (must NOT delete /keep/sub)
+        write_tar_entry(&mut tar, "keep/sub/.wh..", b'0', 0o644, 0, "", &[]);
+        // .wh..wh.foo -> nested .wh. prefix (must be ignored)
+        write_tar_entry(&mut tar, "keep/sub/.wh..wh.foo", b'0', 0o644, 0, "", &[]);
+        // Legitimate whiteout must still work
+        write_tar_entry(
+            &mut tar,
+            "keep/sub/.wh.delete_me.txt",
+            b'0',
+            0o644,
+            0,
+            "",
+            &[],
+        );
+        tar.resize(tar.len() + 1024, 0);
+
+        vfs.extract_tar(&tar, "/", 0, false).unwrap();
+
+        assert_eq!(
+            vfs.vfs_read_file("/keep/sibling.txt").as_deref(),
+            Some(&b"stay"[..]),
+            ".wh... must not delete parent directory /keep"
+        );
+        assert_eq!(
+            vfs.vfs_read_file("/keep/sub/a.txt").as_deref(),
+            Some(&b"stay-sub"[..]),
+            ".wh.. must not delete current directory /keep/sub"
+        );
+        assert_eq!(
+            vfs.vfs_read_file("/keep/sub/delete_me.txt"),
+            None,
+            "legitimate whiteout must still remove target file"
+        );
+    }
 }
 
 fn utf8_truncate(s: &str, max_bytes: usize) -> &str {
@@ -4823,6 +5012,16 @@ fn resolve_tar_entry_path(
     } else {
         Some(format!("{}/{}", mount_path.trim_end_matches('/'), rel))
     }
+}
+
+fn path_within_mount(path: &str, mount: &str) -> bool {
+    if mount == "/" {
+        return true;
+    }
+    path == mount
+        || (path.len() > mount.len()
+            && path.starts_with(mount)
+            && path.as_bytes()[mount.len()] == b'/')
 }
 
 fn split_parent_base(norm_path: &str) -> (&str, &str) {
