@@ -163,7 +163,7 @@ export async function runV2Tier2(opts = {}) {
       await setDockerfileText(browser, `FROM ${alpineRef}\nRUN echo RECOVERED_OK\n`);
       const goodRun = await clickGlobalRun(browser, "local");
       assert.equal(goodRun.clicked, true, "Run All Locally must be clickable after fixing Dockerfile");
-      await waitForTerminalMatch(browser, "RECOVERED_OK", {
+      await waitForTerminalMatch(browser, /^RECOVERED_OK$/m, {
         timeoutMs: 90000,
         label: "recovery after fixing Dockerfile",
       });

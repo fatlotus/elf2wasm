@@ -348,7 +348,7 @@ export async function inspectLayerControls(browser) {
         "[data-layer-id], [data-layer-index], .layer-card, .layer-row, .layer-item"
       ));
       const targetControls = Array.from(document.querySelectorAll(
-        "select[data-executor], select[data-layer-executor], [data-layer-target], button[data-executor], .layer-executor-select"
+        "select[data-executor], select[data-layer-executor], [data-layer-target], button[data-executor], .layer-executor-select, .layer-executor-toggle"
       ));
       const allSelects = Array.from(document.querySelectorAll("select")).filter((sel) =>
         Array.from(sel.options).some((o) => /local/i.test(o.value + " " + o.textContent)) &&

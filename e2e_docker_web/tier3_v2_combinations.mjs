@@ -90,7 +90,7 @@ export async function runV2Tier3(opts = {}) {
       const clicked = await clickGlobalRun(browser, "local");
       assert.ok(clicked.clicked, "Could not trigger Run All Locally");
 
-      const termText = await waitForTerminalMatch(browser, "STACK_CHAIN_DONE", {
+      const termText = await waitForTerminalMatch(browser, /^STACK_CHAIN_DONE$/m, {
         timeoutMs: 120000,
         label: "multi-layer stack completion",
       });
@@ -236,6 +236,19 @@ export async function runV2Tier3(opts = {}) {
       // Configure Layer 1 (first RUN) -> Remote, Layer 2 (second RUN) -> Local
       const configured = await browser.evaluate(
         `(() => {
+          const toggles = Array.from(document.querySelectorAll(".layer-executor-toggle"));
+          if (toggles.length >= 2) {
+            const runToggles = toggles.slice(-2);
+            const clickTarget = (group, target) => {
+              const btn = group.querySelector('button[data-layer-executor="' + target + '"]');
+              if (!btn) return false;
+              btn.click();
+              return btn.getAttribute("aria-pressed") === "true";
+            };
+            const firstOk = clickTarget(runToggles[0], "remote");
+            const secondOk = clickTarget(runToggles[1], "local");
+            return { ok: firstOk && secondOk, count: runToggles.length, mode: "segmented" };
+          }
           const selects = Array.from(document.querySelectorAll("select")).filter((sel) =>
             Array.from(sel.options).some((o) => /local/i.test(o.value + " " + o.textContent)) &&
             Array.from(sel.options).some((o) => /remote/i.test(o.value + " " + o.textContent))
@@ -252,7 +265,7 @@ export async function runV2Tier3(opts = {}) {
           };
           setVal(runSelects[0], "remote");
           setVal(runSelects[1], "local");
-          return { ok: true, count: runSelects.length };
+          return { ok: true, count: runSelects.length, mode: "select" };
         })()`,
         { awaitPromise: false }
       );
@@ -264,7 +277,7 @@ export async function runV2Tier3(opts = {}) {
       const runClicked = await clickControlByLabel(browser, /^run(\s+stack|\s+all)?$|^execute$/i);
       assert.ok(runClicked.clicked, "Could not click Run stack button");
 
-      const termText = await waitForTerminalMatch(browser, "LAYER2_LOCAL_OK", {
+      const termText = await waitForTerminalMatch(browser, /^LAYER2_LOCAL_OK$/m, {
         timeoutMs: 120000,
         label: "mixed remote->local stack completion",
       });
