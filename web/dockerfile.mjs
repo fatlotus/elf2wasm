@@ -608,7 +608,11 @@ function unquoteSimple(raw) {
 function quoteShellArg(arg) {
   const s = String(arg ?? "");
   if (s === "" || /[\s"'\\$`|&;<>()!*?[\]{}]/.test(s)) {
-    return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+    return `"${s
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, '\\"')
+      .replace(/\$/g, "\\$")
+      .replace(/`/g, "\\`")}"`;
   }
   return s;
 }
@@ -889,7 +893,13 @@ export function parseDockerfile(text) {
 
       case "WORKDIR": {
         warnUnusedExecutor("cannot apply to WORKDIR");
-        const pathVal = unquoteSimple(rest);
+        const tokens = tokenizeShellArgs(rest);
+        const pathVal =
+          tokens && tokens.length === 1
+            ? tokens[0]
+            : tokens && tokens.length > 1
+            ? tokens.join(" ")
+            : unquoteSimple(rest);
         if (!pathVal) {
           warnings.push(`Line ${startLineNum}: WORKDIR directive is missing a path`);
           break;
@@ -1057,7 +1067,11 @@ export function serializeDockerfile(layers) {
       if (normalizeExecutor(rawLayer.executor) === "remote") {
         lines.push("# elf2wasm:executor=remote");
       }
-      if (cmd.includes("\n")) {
+      const needsHeredoc =
+        cmd.includes("\n") ||
+        hasTrailingContinuationBackslash(cmd) ||
+        /^<<(-?)(?:'[^'\s]+'|"[^"\s]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$/.test(cmd);
+      if (needsHeredoc) {
         const cmdLines = cmd.split("\n");
         let delim = "ELF2WASM_EOF";
         let suffix = 1;

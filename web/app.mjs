@@ -820,6 +820,8 @@ function syncUrlFromState({ push = false } = {}) {
       executorMode: inferExecutorMode(layers),
       theme: currentThemePref,
       selectedSweepRun,
+      stddev: baseDelayStddevMs,
+      seed: baseDelaySeed,
     },
     { existingSearch: window.location.search }
   );
@@ -841,9 +843,12 @@ function syncFromVisual({ pushUrl = false, rerenderVisual = false, preserveWarni
   isSyncing = true;
   try {
     const keepWarnings = preserveWarnings && dockerfileWarnings.length > 0;
-    if (!keepWarnings) {
+    const hasFromLayer = layers.some((l) => l && l.type === "from");
+    if (!keepWarnings || hasFromLayer) {
       dockerfileText = serializeDockerfile(layers);
-      dockerfileWarnings = [];
+      if (!keepWarnings) {
+        dockerfileWarnings = [];
+      }
       if (dockerfileEditor) {
         dockerfileEditor.value = dockerfileText;
       }
@@ -1537,6 +1542,8 @@ async function copyShareableUrl(buttonEl, defaultLabel) {
       executorMode: inferExecutorMode(layers),
       theme: currentThemePref,
       selectedSweepRun,
+      stddev: baseDelayStddevMs,
+      seed: baseDelaySeed,
     },
     { existingSearch: window.location.search }
   );
@@ -1627,6 +1634,14 @@ async function stopActiveSession({ updateUi = true } = {}) {
   if (updateUi) {
     if (stopBtn) stopBtn.disabled = true;
     if (startBtn) startBtn.disabled = false;
+    if (runAllLocalBtn) runAllLocalBtn.disabled = false;
+    if (runAllRemoteBtn) runAllRemoteBtn.disabled = false;
+    for (const [idx, status] of layerStatusByIndex.entries()) {
+      if (status === "running") {
+        layerStatusByIndex.set(idx, "idle");
+        updateLayerCardStatusUi(idx);
+      }
+    }
     setProgress(0, "idle");
     setStatus("Stopped", "idle");
     if (sweepOutcomeBadge && sweepOutcomeBadge.dataset.outcome === "running") {
@@ -2036,6 +2051,8 @@ async function executePipeline({ executorOverride = null } = {}) {
 
   if (stopBtn) stopBtn.disabled = false;
   if (startBtn) startBtn.disabled = true;
+  if (runAllLocalBtn) runAllLocalBtn.disabled = true;
+  if (runAllRemoteBtn) runAllRemoteBtn.disabled = true;
   terminal.reset();
   setProgress(5, "manifest");
 
@@ -2210,6 +2227,8 @@ async function executePipeline({ executorOverride = null } = {}) {
     containerExited = true;
     if (stopBtn) stopBtn.disabled = true;
     if (startBtn) startBtn.disabled = false;
+    if (runAllLocalBtn) runAllLocalBtn.disabled = false;
+    if (runAllRemoteBtn) runAllRemoteBtn.disabled = false;
 
     // Refresh final layer results (ensuring outputDiffTarGz buffers transferred from worker are stored)
     for (const lr of result.layers || []) {
@@ -2282,6 +2301,8 @@ async function executePipeline({ executorOverride = null } = {}) {
     containerExited = true;
     if (stopBtn) stopBtn.disabled = true;
     if (startBtn) startBtn.disabled = false;
+    if (runAllLocalBtn) runAllLocalBtn.disabled = false;
+    if (runAllRemoteBtn) runAllRemoteBtn.disabled = false;
 
     if (err?.name === "AbortError") {
       if (sweepOutcomeBadge) {

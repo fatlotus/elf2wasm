@@ -822,5 +822,41 @@ describe("web/url_state.mjs: M4 Dockerfile layer stack, executorMode, theme & se
     const delayLegacy = parseStateFromSearch("?image=alpine:latest&delay=4.25");
     assert.equal(delayLegacy.state.stddev, 4.25);
   });
+
+  it("preserves stddev and seed across buildRunSearch -> parseStateFromSearch -> serializeStateToSearch in Dockerfile mode", () => {
+    const repro = buildRunSearch(
+      {
+        layers: [
+          { type: "from", image: "alpine:latest" },
+          { type: "sweep", param: "delay", mode: "range", start: 1, step: 2, count: 3 },
+          { type: "run", cmd: "echo hi" },
+        ],
+      },
+      { stddev: 5, seed: 42 }
+    );
+    const parsed = parseStateFromSearch(repro);
+    assert.equal(parsed.state.stddev, 5);
+    assert.equal(parsed.state.seed, 42);
+
+    const reserialized = serializeStateToSearch(
+      {
+        layers: parsed.layers,
+        theme: "dark",
+        stddev: parsed.state.stddev,
+        seed: parsed.state.seed,
+      },
+      { existingSearch: repro }
+    );
+    const params = new URLSearchParams(reserialized);
+    assert.equal(params.get("stddev"), "5");
+    assert.equal(params.get("seed"), "42");
+    assert.equal(params.get("theme"), "dark");
+
+    const reparsed = parseStateFromSearch(reserialized);
+    assert.equal(reparsed.state.stddev, 5);
+    assert.equal(reparsed.state.seed, 42);
+    assert.equal(reparsed.theme, "dark");
+  });
 });
+
 

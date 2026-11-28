@@ -2703,6 +2703,18 @@ async function executeLayerPipeline(layers, options = {}, engine = null) {
       if (typeof options.onLayerStart === "function") {
         options.onLayerStart({ layerIndex, layer, executor: exec, variationIndex, variation });
       }
+      if (localContainerId !== null && engine) {
+        try {
+          await engine.stop(localContainerId);
+        } catch {
+          // Ignore stop errors when resetting container for a new FROM stage
+        }
+        localContainerId = null;
+      }
+      state.mountedLocalGitCount = 0;
+      state.gitRepos = [];
+      state.inputLayerDiffs = [];
+      state.pendingLocalDiffs = [];
       state.baseImage = String(layer.image || "alpine:latest").trim() || "alpine:latest";
       const res = {
         layerIndex,
@@ -2921,9 +2933,11 @@ async function executeLayerPipeline(layers, options = {}, engine = null) {
             : "";
       const reqBody = {
         baseImage: state.baseImage,
-        ...(state.gitRepos.length > 0
-          ? { gitRepo: state.gitRepos[state.gitRepos.length - 1] }
-          : {}),
+        ...(state.gitRepos.length === 1
+          ? { gitRepo: state.gitRepos[0] }
+          : state.gitRepos.length > 1
+            ? { gitRepos: state.gitRepos }
+            : {}),
         inputLayerDiffs: state.inputLayerDiffs,
         cmd: cmdArgv,
         env: effectiveEnv,

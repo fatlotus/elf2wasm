@@ -440,4 +440,70 @@ describe("web/dockerfile.mjs: expandSweepValues", () => {
     assert.equal(expanded.length, 2);
     assert.equal(expanded[0].envOverride[1], String(1e306));
   });
+
+  it("escapes $ and backtick in quoteShellArg for JSON exec-form RUN and git layer ref/mountPath", () => {
+    const parsedExec = parseDockerfile(
+      'FROM alpine:latest\nRUN ["echo", "$HOME", "$(id)", "`uname`"]'
+    );
+    assert.deepEqual(parsedExec.warnings, []);
+    assert.equal(parsedExec.layers[1].type, "run");
+    assert.equal(parsedExec.layers[1].cmd, 'echo "\\$HOME" "\\$(id)" "\\`uname\\`"');
+
+    // git layer with $, $(...), and backticks in ref & mountPath round-trips as type "git"
+    const gitLayers = [
+      { id: "layer-1", type: "from", image: "alpine:latest", executor: "local" },
+      {
+        id: "layer-2",
+        type: "git",
+        repo: "owner/repo",
+        ref: "v1$(id)`uname`$HOME",
+        mountPath: "/work/$dir/`sub`",
+        executor: "local",
+      },
+    ];
+    const serialized = serializeDockerfile(gitLayers);
+    const reparsed = parseDockerfile(serialized);
+    assert.deepEqual(reparsed.warnings, []);
+    assert.deepEqual(reparsed.layers, gitLayers);
+  });
+
+  it("round-trips single-line RUN ending with continuation backslash or heredoc syntax safely", () => {
+    const backslashLayers = [
+      { id: "layer-1", type: "from", image: "alpine:latest", executor: "local" },
+      { id: "layer-2", type: "run", cmd: "echo foo \\", executor: "local" },
+      { id: "layer-3", type: "run", cmd: "echo bar", executor: "local" },
+    ];
+    const bsText = serializeDockerfile(backslashLayers);
+    assert.match(bsText, /RUN <<'ELF2WASM_EOF'/);
+    const bsParsed = parseDockerfile(bsText);
+    assert.deepEqual(bsParsed.warnings, []);
+    assert.deepEqual(bsParsed.layers, backslashLayers);
+
+    const heredocCmdLayers = [
+      { id: "layer-1", type: "from", image: "alpine:latest", executor: "local" },
+      { id: "layer-2", type: "run", cmd: "<<'EOF'", executor: "local" },
+      { id: "layer-3", type: "run", cmd: "echo after", executor: "local" },
+    ];
+    const hdText = serializeDockerfile(heredocCmdLayers);
+    const hdParsed = parseDockerfile(hdText);
+    assert.deepEqual(hdParsed.warnings, []);
+    assert.deepEqual(hdParsed.layers, heredocCmdLayers);
+  });
+
+  it("round-trips WORKDIR paths containing spaces, quotes, and backslashes without double-escaping", () => {
+    const wdLayers = [
+      { id: "layer-1", type: "from", image: "alpine:latest", executor: "local" },
+      { id: "layer-2", type: "workdir", path: '/app/my "dir" \\ path' },
+    ];
+    const s1 = serializeDockerfile(wdLayers);
+    const p1 = parseDockerfile(s1);
+    assert.deepEqual(p1.warnings, []);
+    assert.deepEqual(p1.layers, wdLayers);
+
+    const s2 = serializeDockerfile(p1.layers);
+    const p2 = parseDockerfile(s2);
+    assert.deepEqual(p2.warnings, []);
+    assert.deepEqual(p2.layers, wdLayers);
+  });
 });
+

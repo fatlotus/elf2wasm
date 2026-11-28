@@ -4545,6 +4545,67 @@ test("M4 regression: relative WORKDIR resolution, downstream ENV after SWEEP pre
   assert.deepEqual(emitted, ["stdout:partial-out", "stderr:partial-err"]);
 });
 
+test("Adversarial: multiple git layers send gitRepos array remotely and subsequent FROM resets stage state", async () => {
+  const seenBodies = [];
+  const mockFetch = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    seenBodies.push(body);
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        executor: "remote-wasmi",
+        exitCode: 0,
+        stdout: "ok\n",
+        stderr: "",
+        virtualTimeNs: "50",
+        outputDiffTarGzBase64: "H4sIAAAAAAAAAwMAAAAAAAAAAAA=",
+        modifiedFiles: [],
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  };
+
+  // 1. Multiple git layers targeting remote execution send gitRepos array
+  const multiGitRes = await runLayerPipeline(
+    [
+      { id: "g0", type: "from", image: "alpine:latest", executor: "remote" },
+      { id: "g1", type: "git", repo: "org/repo1", ref: "main", mountPath: "/repo1", executor: "remote" },
+      { id: "g2", type: "git", repo: "org/repo2", ref: "v2", mountPath: "/repo2", executor: "remote" },
+      { id: "g3", type: "run", cmd: "ls /repo1 /repo2", executor: "remote" },
+    ],
+    { apiBase: "http://mock.local", fetch: mockFetch }
+  );
+  assert.equal(multiGitRes.ok, true);
+  assert.equal(seenBodies.length, 1);
+  assert.equal(seenBodies[0].gitRepo, undefined);
+  assert.deepEqual(seenBodies[0].gitRepos, [
+    { repo: "org/repo1", ref: "main", mountPath: "/repo1" },
+    { repo: "org/repo2", ref: "v2", mountPath: "/repo2" },
+  ]);
+
+  // 2. Subsequent FROM layer resets inputLayerDiffs and gitRepos for the new stage
+  seenBodies.length = 0;
+  const multiFromRes = await runLayerPipeline(
+    [
+      { id: "f1", type: "from", image: "alpine:3.19", executor: "remote" },
+      { id: "f2", type: "git", repo: "org/stage1", mountPath: "/s1", executor: "remote" },
+      { id: "f3", type: "run", cmd: "echo stage1", executor: "remote" },
+      { id: "f4", type: "from", image: "alpine:3.20", executor: "remote" },
+      { id: "f5", type: "run", cmd: "echo stage2", executor: "remote" },
+    ],
+    { apiBase: "http://mock.local", fetch: mockFetch }
+  );
+  assert.equal(multiFromRes.ok, true);
+  assert.equal(seenBodies.length, 2);
+  assert.equal(seenBodies[0].baseImage, "alpine:3.19");
+  assert.deepEqual(seenBodies[0].gitRepo, { repo: "org/stage1", mountPath: "/s1" });
+  assert.equal(seenBodies[1].baseImage, "alpine:3.20");
+  assert.equal(seenBodies[1].gitRepo, undefined, "Subsequent FROM must clear prior stage gitRepos");
+  assert.equal(seenBodies[1].gitRepos, undefined);
+  assert.deepEqual(seenBodies[1].inputLayerDiffs, [], "Subsequent FROM must clear prior stage inputLayerDiffs");
+});
+
+
 
 
 

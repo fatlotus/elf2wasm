@@ -776,6 +776,15 @@ export function serializeStateToSearch(state, { existingSearch = "" } = {}) {
       if (sel !== null) {
         params.append("selectedRun", String(sel));
       }
+    } else {
+      const stddev = parseNonNegNumber(state?.stddev, DEFAULT_UI_STATE.stddev);
+      const seed = parseNonNegInt(state?.seed, DEFAULT_UI_STATE.seed);
+      if (stddev > 0) {
+        params.append("stddev", String(stddev));
+      }
+      if (seed > 0 || stddev > 0) {
+        params.append("seed", String(seed));
+      }
     }
 
     const serialized = params.toString();
